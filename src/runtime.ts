@@ -39,6 +39,12 @@ export interface RlmEvalInput {
   timeout?: number
   /** Resolves an rlm_query(prompt) issued by the active cell. */
   onQuery?: (prompt: string) => Promise<string>
+  /**
+   * Caller-owned cancellation. When it aborts, the owning session's kernel is
+   * evicted and its process tree killed; the cell is rejected with
+   * `RlmError kind='cancel'`. A pre-aborted signal never starts a kernel.
+   */
+  signal?: AbortSignal
 }
 
 export interface RlmEvalOutput {
@@ -83,6 +89,7 @@ interface PendingEval {
   onQuery: ((prompt: string) => Promise<string>) | undefined
   queries: number
   timer: ReturnType<typeof setTimeout> | undefined
+  signal: AbortSignal | undefined
   resolve: (out: RlmEvalOutput) => void
   reject: (err: RlmError) => void
 }
@@ -109,6 +116,7 @@ class Kernel {
   private resolveReady!: () => void
   private rejectReady!: (err: RlmError) => void
   private readyDone = false
+  private abortBound: { signal: AbortSignal; onAbort: () => void } | null = null
   onExit: ((k: Kernel) => void) | null = null
 
   constructor(key: string, config: RlmRuntimeConfig) {
@@ -272,6 +280,7 @@ class Kernel {
       return
     }
     this.clearTimer(p)
+    this.detachAbort()
     this.pending = null
     const out: RlmEvalOutput = {
       stdout: String(frame.stdout ?? ''),
@@ -288,6 +297,7 @@ class Kernel {
       return
     }
     this.clearTimer(p)
+    this.detachAbort()
     this.pending = null
     const phase = frame.phase === 'query' ? 'query' : 'eval'
     const kind = phase === 'query' ? 'query' : 'eval'
@@ -297,6 +307,48 @@ class Kernel {
 
   private clearTimer(p: PendingEval): void {
     if (p.timer !== undefined) clearTimeout(p.timer)
+  }
+
+  /** Drop the pending cell's abort listener so a late signal cannot touch an idle kernel. */
+  private detachAbort(): void {
+    const bound = this.abortBound
+    this.abortBound = null
+    if (bound) bound.signal.removeEventListener('abort', bound.onAbort)
+  }
+
+  /**
+   * Attach the caller's signal to the pending cell. A signal that is already
+   * aborted cancels immediately; otherwise a single abort listener is bound and
+   * torn down on every settle path.
+   */
+  private attachAbort(p: PendingEval): void {
+    const signal = p.signal
+    if (!signal) return
+    const onAbort = (): void => this.cancelCell(p, String(signal.reason ?? 'cancelled'))
+    if (signal.aborted) {
+      this.cancelCell(p, String(signal.reason ?? 'cancelled'))
+      return
+    }
+    this.abortBound = { signal, onAbort }
+    signal.addEventListener('abort', onAbort, { once: true })
+  }
+
+  /**
+   * Active cancellation: evict the session kernel, kill its process tree, and
+   * reject the running cell with `kind='cancel'`. Only settles while the cell
+   * is still this kernel's pending eval, so a race with timeout/result/error
+   * settles exactly once.
+   */
+  private cancelCell(p: PendingEval, message: string): void {
+    if (this.pending !== p) return
+    this.clearTimer(p)
+    this.detachAbort()
+    this.pending = null
+    const err = new RlmError('cancel', message)
+    this.exited = true
+    this.kill()
+    this.onExit?.(this)
+    p.reject(err)
   }
 
   private handleExit(err: RlmError): void {
@@ -309,6 +361,7 @@ class Kernel {
     const p = this.pending
     if (p) {
       this.clearTimer(p)
+      this.detachAbort()
       this.pending = null
       p.reject(err)
     }
@@ -344,6 +397,7 @@ class Kernel {
       onQuery: input.onQuery,
       queries: 0,
       timer: undefined,
+      signal: input.signal,
       resolve,
       reject,
     }
@@ -351,6 +405,7 @@ class Kernel {
     p.timer = setTimeout(() => {
       if (this.pending !== p) return
       this.clearTimer(p)
+      this.detachAbort()
       this.pending = null
       const err = new RlmError('timeout', 'cell timed out after ' + timeout + 'ms')
       this.exited = true
@@ -358,6 +413,10 @@ class Kernel {
       this.onExit?.(this)
       reject(err)
     }, timeout)
+    this.attachAbort(p)
+    // A signal that was already aborted cancels the cell synchronously above;
+    // only send the eval frame if this cell is still pending.
+    if (this.pending !== p) return promise
     this.write({
       type: 'eval',
       id,
@@ -418,6 +477,7 @@ class Kernel {
     const p = this.pending
     if (p) {
       this.clearTimer(p)
+      this.detachAbort()
       this.pending = null
       p.reject(new RlmError('cancel', 'runtime disposed while a cell was running'))
     }
@@ -444,6 +504,10 @@ class RlmRuntimeImpl implements RlmRuntime {
   }
 
   async eval(sessionKey: string, input: RlmEvalInput): Promise<RlmEvalOutput> {
+    // A pre-aborted signal never starts a session kernel.
+    if (input.signal?.aborted) {
+      throw new RlmError('cancel', String(input.signal.reason ?? 'cancelled'))
+    }
     let kernel = this.kernels.get(sessionKey)
     if (!kernel) {
       kernel = new Kernel(sessionKey, this.config)
@@ -589,6 +653,7 @@ export function registerRlmPlugin(
       try {
         output = await runtime.eval(sessionKey, {
           code: args.code,
+          signal: exec.signal,
           onQuery: async (prompt: string) => runQuery(ctx, provider, parent, prompt, exec.signal),
         })
       } catch (error) {

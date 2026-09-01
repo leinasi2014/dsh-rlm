@@ -137,6 +137,20 @@ ready, eval, query, query_result, result, error
 
 V1 不承诺故障后恢复变量。恢复能力只有在真实使用需要时才添加。
 
+#### 取消状态机（M2）
+
+`rlm_eval` 的 `RlmEvalInput` 增加可选 `signal?: AbortSignal`，取自调用工具的
+`exec.signal`。父工具取消只终止所属 Session 的 kernel 进程树，立即以
+`RlmError kind=cancel` 拒绝当前 cell；其它 Session 的 kernel 与 globals 不变。
+
+- pre-abort（进入 `eval` 时 `signal.aborted`）：不启动 kernel，立即以 cancel 拒绝。
+- active abort（cell 运行中）：移除该 Session kernel 引用、标记不可复用、杀进程树，
+  以 cancel 拒绝当前 cell；下一次同 Session `eval` 新建干净 kernel。
+- abort handler 在 pending settle 前/后都竞态安全：仅当该 cell 仍是当前 pending 时生效
+  （先判 `this.pending === p` 再 settle），timeout/result/error/exit 四条 settle 路径都
+  `removeEventListener`，避免迟到的 abort 误杀已空闲的 kernel。
+- 取消复用 `Kernel` 的 kill/evict 路径，不新建抽象。
+
 ## 8. 最小配置
 
 V1 只需要：

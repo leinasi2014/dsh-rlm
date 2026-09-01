@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -530,5 +530,144 @@ test('M1C/M1D: plugin teardown unregisters the tool and cancels the in-flight ce
     )
   } finally {
     m.teardown?.()
+  }
+})// ---- M2: propagate tool cancellation (exec.signal) to the session kernel ----
+
+/** True when no Windows process owns `pid` (an orphan-free session kernel). */
+function isProcessGone(pid: number): boolean {
+  const probe = spawnSync('tasklist', ['/FI', 'PID eq ' + String(pid), '/NH'], { encoding: 'utf8' })
+  const out = String(probe.stdout ?? '')
+  return !out.includes(String(pid))
+}
+
+/** Poll until the kernel process is gone (taskkill settles asynchronously). */
+async function waitForPidGone(pid: number, timeoutMs = 6000): Promise<boolean> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (isProcessGone(pid)) return true
+    await new Promise((r) => setTimeout(r, 100))
+  }
+  return isProcessGone(pid)
+}
+
+const SHORT_DELAY = 400
+
+function runningCell(): string {
+  return 'import time\ntime.sleep(60)'
+}
+
+test('M2: a pre-aborted signal rejects with cancel and never starts a kernel', async () => {
+  const runtime = rt()
+  try {
+    const ctl = new AbortController()
+    ctl.abort('too-late')
+    const start = Date.now()
+    await assert.rejects(
+      runtime.eval('pre', { code: '1', signal: ctl.signal }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'cancel' && /too-late/.test(err.message),
+    )
+    // The rejection is immediate (no kernel spawn, no timeout wait).
+    assert.ok(Date.now() - start < 1000, 'pre-aborted eval must reject immediately')
+    // A later normal eval on the same session still starts a clean kernel.
+    const out = await runtime.eval('pre', { code: '2 * 3' })
+    assert.equal(out.result, '6')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: aborting a running pure-Python cell cancels fast, not at the default timeout', async () => {
+  const runtime = rt() // default per-cell timeout is 30s; a cancel must beat it
+  try {
+    const ctl = new AbortController()
+    const pending = runtime.eval('act', { code: runningCell(), signal: ctl.signal })
+    await new Promise((r) => setTimeout(r, SHORT_DELAY))
+    const start = Date.now()
+    ctl.abort('user-cancel')
+    await assert.rejects(pending, (err: unknown) => err instanceof RlmError && err.kind === 'cancel')
+    assert.ok(Date.now() - start < 5000, 'cancel should reject well before the 30s default timeout')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: cancelling a session evicts its kernel so the next eval is a fresh namespace', async () => {
+  const runtime = rt()
+  try {
+    await runtime.eval('gone', { code: 'marker = 1' })
+    const ctl = new AbortController()
+    const pending = runtime.eval('gone', { code: runningCell(), signal: ctl.signal })
+    await new Promise((r) => setTimeout(r, SHORT_DELAY))
+    ctl.abort('user-cancel')
+    await assert.rejects(pending, (err: unknown) => err instanceof RlmError && err.kind === 'cancel')
+    // The cancelled session's globals are gone: a fresh kernel has no `marker`.
+    await assert.rejects(
+      runtime.eval('gone', { code: 'marker' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+    // Yet the fresh kernel serves a normal cell.
+    const fresh = await runtime.eval('gone', { code: '2 + 2' })
+    assert.equal(fresh.result, '4')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: cancelling one session leaves another session globals intact', async () => {
+  const runtime = rt()
+  try {
+    await runtime.eval('keep', { code: 'keepvar = 42' })
+    const ctl = new AbortController()
+    const pending = runtime.eval('kill', { code: runningCell(), signal: ctl.signal })
+    await new Promise((r) => setTimeout(r, SHORT_DELAY))
+    ctl.abort('user-cancel')
+    await assert.rejects(pending, (err: unknown) => err instanceof RlmError && err.kind === 'cancel')
+    // The other session's kernel and globals survive untouched.
+    const out = await runtime.eval('keep', { code: 'keepvar' })
+    assert.equal(out.result, '42')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: rlm_eval forwards exec.signal so a parent cancel stops the cell', async () => {
+  const m = makeMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true })
+  const tool = m.registered[0]
+  const ctl = new AbortController()
+  try {
+    const exec = { agent: { id: 'sess-sig' }, signal: ctl.signal }
+    const pending = tool.execute({ code: runningCell() }, exec)
+    await new Promise((r) => setTimeout(r, SHORT_DELAY))
+    ctl.abort('user-cancel')
+    // The tool wraps the typed runtime cancel into a normal tool failure.
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof Error && /cancel/.test(err.message),
+    )
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M2: cancelling and disposing leaves no orphaned kernel process', async () => {
+  const runtime = rt()
+  const ctl = new AbortController()
+  try {
+    // Capture this session kernel's own OS pid.
+    const idOut = await runtime.eval('leak', { code: 'import os\nos.getpid()' })
+    const pid = Number(idOut.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + idOut.result)
+
+    const pending = runtime.eval('leak', { code: runningCell(), signal: ctl.signal })
+    await new Promise((r) => setTimeout(r, SHORT_DELAY))
+    ctl.abort('user-cancel')
+    await assert.rejects(pending, (err: unknown) => err instanceof RlmError && err.kind === 'cancel')
+    runtime.dispose()
+
+    const gone = await waitForPidGone(pid)
+    assert.ok(gone, 'kernel pid ' + pid + ' is still alive after cancel + dispose')
+  } finally {
+    runtime.dispose()
   }
 })
