@@ -10,5 +10,6 @@
 5. [后续扩展架构](future-extensions.zh-CN.md)：仅在真实触发条件成立后添加功能。
 6. [目录结构与语言](directory-structure.zh-CN.md)：最小 TypeScript/Python 布局。
 7. [参考项目取舍](reference-analysis.zh-CN.md)：两个固定参考源的采用与拒绝项。
-8. [交互式架构图](dsh-rlm-architecture.html)：核心闭环可视化；图源是
+8. [GitHub Issue 修复规范](issue-repair-playbook.zh-CN.md)：思考强度、修复流程、证据、审查、Git 和关单规则。
+9. [交互式架构图](dsh-rlm-architecture.html)：核心闭环可视化；图源是
    `dsh-rlm-architecture.archify.json`。

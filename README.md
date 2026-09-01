@@ -162,6 +162,7 @@ revision
 - [Project status: completed and incomplete work](docs/project-status.md)
 - [Reference analysis](docs/reference-analysis.md)
 - [Independent review reconciliation](docs/review-findings.md)
+- [GitHub Issue repair playbook](docs/issue-repair-playbook.md)
 - [Future extensions and their triggers](docs/future-extensions.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)

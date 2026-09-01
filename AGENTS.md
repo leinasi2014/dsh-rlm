@@ -62,6 +62,10 @@ a real clean DSH Profile.
 
 ## PTC / Multi-Agent Coordination
 
+- Follow the authoritative [GitHub Issue Repair Playbook](docs/issue-repair-playbook.md)
+  for Issue-based repair, candidate, review, integration, and closure. A Chinese
+  translation is available at
+  [docs/issue-repair-playbook.zh-CN.md](docs/issue-repair-playbook.zh-CN.md).
 - The coordinator owns `main`, integration, and final verification.
 - Development agents may work only on a clearly assigned milestone slice and
   must report changed files, checks run, and any unverified assumption.
@@ -69,6 +73,13 @@ a real clean DSH Profile.
   serially by the coordinator.
 - Use `DeepSeek-V4-Flash-Vision-Exp` through the configured vLLM/PTC path when
   dispatching implementation agents from the local DSH control surface.
+- Assign reasoning effort by semantic risk: `high` is the code default; use
+  `max` for architecture/root-cause decisions and final semantic review on
+  concurrency, lifecycle, protocol, or security work. After that approach is
+  frozen, bounded implementation normally returns to `high`. `medium` is
+  limited to bounded support work. `low` must not edit production code, design
+  tests, review, or issue acceptance verdicts. Never silently downgrade an
+  active assignment.
 - A model report is not completion. Completion needs committed code plus local
   checks and the clean Profile smoke required by the milestone.
 

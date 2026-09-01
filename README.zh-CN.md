@@ -147,6 +147,7 @@ revision
 - [核心架构](docs/architecture.zh-CN.md)
 - [项目状态](docs/project-status.zh-CN.md)
 - [审查结论](docs/review-findings.zh-CN.md)
+- [GitHub Issue 修复规范](docs/issue-repair-playbook.zh-CN.md)
 - [里程碑](docs/milestones.zh-CN.md)
 - [目录与语言边界](docs/directory-structure.zh-CN.md)
 - [参考项目取舍](docs/reference-analysis.zh-CN.md)
