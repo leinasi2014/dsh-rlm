@@ -211,3 +211,175 @@ test('M1A: protocol error terminates the kernel nonzero', async () => {
   const code = await k.exit
   assert.notEqual(code, 0)
 })
+
+// ---- M1B: TypeScript runtime process protocol ----
+
+import { createRlmRuntime, RlmError } from '../src/runtime.ts'
+
+function rt(config: Record<string, unknown> = {}) {
+  return createRlmRuntime(undefined, config)
+}
+
+test('M1B: starts a kernel, returns results and reuses it per session key', async () => {
+  const runtime = rt()
+  try {
+    const first = await runtime.eval('sess-a', { code: 'seed = 7' })
+    assert.equal(first.result, undefined)
+    const second = await runtime.eval('sess-a', { code: 'seed * 6' })
+    assert.equal(second.result, '42')
+    await assert.rejects(
+      runtime.eval('sess-b', { code: 'seed' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M1B: a cell error is typed and the same kernel keeps serving', async () => {
+  const runtime = rt()
+  try {
+    await assert.rejects(
+      runtime.eval('err', { code: 'raise ValueError("boom")' }),
+      (err: unknown) => {
+        assert.ok(err instanceof RlmError)
+        assert.equal(err.kind, 'eval')
+        assert.equal(err.phase, 'eval')
+        assert.match(err.message, /boom/)
+        return true
+      },
+    )
+    const next = await runtime.eval('err', { code: '5 + 5' })
+    assert.equal(next.result, '10')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M1B: rlm_query callbacks resume the running cell', async () => {
+  const runtime = rt()
+  try {
+    const prompts: string[] = []
+    const out = await runtime.eval('q', {
+      code: 'a = await rlm_query("first")\nb = await rlm_query("second")\na + "-" + b',
+      onQuery: async (prompt: string) => {
+        prompts.push(prompt)
+        return prompt.toUpperCase()
+      },
+    })
+    assert.deepEqual(prompts, ['first', 'second'])
+    assert.equal(out.result, 'FIRST-SECOND')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M1B: a failing query callback surfaces as a cell error', async () => {
+  const runtime = rt()
+  try {
+    await assert.rejects(
+      runtime.eval('qf', {
+        code: 'await rlm_query("anything")',
+        onQuery: async () => {
+          throw new Error('model down')
+        },
+      }),
+      (err: unknown) =>
+        err instanceof RlmError && err.kind === 'eval' && /model down/.test(err.message),
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M1B: rlm_query without a handler fails the cell explicitly', async () => {
+  const runtime = rt()
+  try {
+    await assert.rejects(
+      runtime.eval('noh', { code: 'await rlm_query("x")' }),
+      (err: unknown) => err instanceof RlmError && /no query handler/.test(err.message),
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M1B: a cell cannot exceed the per-cell query limit', async () => {
+  const runtime = rt({ maxQueries: 1 })
+  try {
+    await assert.rejects(
+      runtime.eval('lim', {
+        code: 'a = await rlm_query("one")\nb = await rlm_query("two")',
+        onQuery: async () => 'ok',
+      }),
+      (err: unknown) => err instanceof RlmError && /query limit exceeded/.test(err.message),
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M1B: stdout and result are byte-bounded and marked truncated', async () => {
+  const runtime = rt({ maxStdout: 32, maxResult: 8 })
+  try {
+    const out = await runtime.eval('st', { code: 'print("a" * 100)\n"0123456789"' })
+    assert.equal(out.stdout, 'a'.repeat(32))
+    assert.equal(out.result, '01234567')
+    assert.equal(out.truncated, true)
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M1B: a cell that runs past its timeout is terminated', async () => {
+  const runtime = rt({ timeout: 300 })
+  try {
+    await assert.rejects(
+      runtime.eval('t', { code: 'import time\ntime.sleep(5)\n1' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'timeout',
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M1B: after a timeout a later eval starts a fresh kernel', async () => {
+  const runtime = rt({ timeout: 300 })
+  try {
+    await assert.rejects(
+      runtime.eval('fresh', { code: 'import time\ntime.sleep(5)\nval = 1' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'timeout',
+    )
+    await assert.rejects(
+      runtime.eval('fresh', { code: 'val' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M1B: dispose cancels an in-flight cell and is idempotent', async () => {
+  const runtime = rt()
+  const pending = runtime.eval('c', { code: 'import time\ntime.sleep(5)' })
+  await new Promise((res) => setTimeout(res, 400))
+  runtime.dispose()
+  runtime.dispose()
+  await assert.rejects(
+    pending,
+    (err: unknown) => err instanceof RlmError && err.kind === 'cancel',
+  )
+})
+
+test('M1B: a bad python command is a spawn failure', async () => {
+  const runtime = createRlmRuntime(undefined, { python: 'dsh-rlm-no-such-interpreter' })
+  try {
+    await assert.rejects(
+      runtime.eval('sp', { code: '1' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'spawn',
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
