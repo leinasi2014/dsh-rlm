@@ -2,7 +2,21 @@
   "name": "dsh-rlm",
   "version": "0.0.0",
   "private": true,
-  "description": "Recursive Language Model capability plugin for DeepSeek Harness",
+  "description": "Minimal persistent Python RLM loop plugin for DeepSeek Harness",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/leinasi2014/dsh-rlm.git"
+  },
+  "homepage": "https://github.com/leinasi2014/dsh-rlm#readme",
+  "bugs": {
+    "url": "https://github.com/leinasi2014/dsh-rlm/issues"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "recursive-language-model",
+    "rlm"
+  ],
   "type": "module",
   "main": "lib/index.mjs",
   "types": "lib/types/index.d.ts",
@@ -19,7 +33,7 @@
     "docs",
     "python-runtime"
   ],
-  "license": "UNLICENSED",
+  "license": "MIT",
   "packageManager": "pnpm@9.15.9",
   "engines": {
     "node": "^22.19.0 || >=24"
