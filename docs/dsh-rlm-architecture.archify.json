@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "dsh-rlm 核心闭环",
+    "locale": "zh-CN",
+    "quality_profile": "showcase",
+    "viewBox": [1080, 620],
+    "views": [
+      {
+        "id": "rlm-loop",
+        "label": "RLM 闭环",
+        "focus": ["agentLoop", "rlmEval", "sessionKernel", "queryBridge", "subagent"],
+        "note": "一个 rlm_eval cell 可调用 one-shot Subagent，文本返回 Python 后继续计算。"
+      },
+      {
+        "id": "iteration-loop",
+        "label": "自我迭代",
+        "focus": ["agentLoop", "rlmEval", "sessionKernel"],
+        "note": "DSH Agent 可再次调用 rlm_eval；同一 Session 的 Python globals 继续存在。"
+      }
+    ]
+  },
+  "components": [
+    { "id": "agentLoop", "type": "external", "label": "DSH Agent Loop", "sublabel": "官方 turn 与 Session log", "pos": [35, 270], "size": [165, 70] },
+    { "id": "rlmEval", "type": "frontend", "label": "rlm_eval", "sublabel": "唯一模型工具", "pos": [300, 270], "size": [155, 70] },
+    { "id": "sessionKernel", "type": "security", "label": "Session Python Kernel", "sublabel": "persistent globals · trusted local", "pos": [585, 270], "size": [205, 70] },
+    { "id": "queryBridge", "type": "backend", "label": "rlm_query Bridge", "sublabel": "prompt → visible text", "pos": [585, 70], "size": [205, 68] },
+    { "id": "subagent", "type": "external", "label": "DSH One-shot Subagent", "sublabel": "RLM tools disabled", "pos": [890, 70], "size": [165, 68] },
+    { "id": "contextFile", "type": "external", "label": "Local Context File", "sublabel": "Python reads UTF-8 data", "pos": [585, 445], "size": [205, 68] }
+  ],
+  "connections": [
+    { "id": "agent-eval", "from": "agentLoop", "to": "rlmEval", "label": "eval / result", "variant": "emphasis" },
+    { "id": "eval-kernel", "from": "rlmEval", "to": "sessionKernel", "label": "cell / result", "variant": "emphasis" },
+    { "id": "kernel-query", "from": "sessionKernel", "to": "queryBridge", "label": "query / text", "variant": "security" },
+    { "id": "query-subagent", "from": "queryBridge", "to": "subagent", "label": "one-shot / text" },
+    { "id": "context-kernel", "from": "contextFile", "to": "sessionKernel", "label": "read file" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "V1 只有一条路径", "items": ["一个工具、一个 Session 内核、一个同步 query 回调", "不含 Service、Storage、snapshot、spawn 或递归子 RLM"] },
+    { "dot": "emerald", "title": "两个迭代层", "items": ["cell 内：Python 循环、查询、分支和修正", "跨 cell：Agent 再次 rlm_eval，复用同一 globals"] }
+  ]
+}

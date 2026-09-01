@@ -1,0 +1,10 @@
+node_modules/
+lib/
+coverage/
+*.log
+.DS_Store
+
+# Reference checkouts are reproducible evidence hosts, not vendored product code.
+ref/prime-agent/source/
+ref/rlm/source/
+

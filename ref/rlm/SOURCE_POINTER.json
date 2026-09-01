@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/alexzhang13/rlm",
+  "branch": "main",
+  "commit": "854e688fbba9d8f8989e3da9989812e4b6dfe270",
+  "tree": "d6aee42e0ece53161ceb4161633831f873e88f4e",
+  "recorded_at": "2026-09-01",
+  "license": "MIT",
+  "local_checkout": "source",
+  "purpose": [
+    "context and prompt as REPL variables",
+    "recursive sub-model call contract",
+    "REPL and sandbox provider abstractions",
+    "persistent multi-turn state and compaction",
+    "inference, training and visualization boundaries"
+  ]
+}
+

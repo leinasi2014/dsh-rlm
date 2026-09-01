@@ -1,0 +1,17 @@
+{
+  "repository": "https://github.com/PrimeIntellect-ai/prime-agent",
+  "branch": "main",
+  "commit": "6179a608f394d0858d463e40d648df0def6dbb7a",
+  "tree": "50425f1c4a637459d841dba15603bc30045f67bc",
+  "recorded_at": "2026-09-01",
+  "license": "MIT",
+  "local_checkout": "source",
+  "purpose": [
+    "persistent RLM kernel and host bridge",
+    "recursive child-agent lifecycle",
+    "durable sessions, compaction, goals and long-running execution",
+    "skills and model-facing programming surface",
+    "runtime ownership, cancellation and recovery boundaries"
+  ]
+}
+
