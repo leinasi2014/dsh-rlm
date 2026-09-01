@@ -3,7 +3,7 @@ import z from '@deepseek-ai/schemastery'
 import { registerRlmPlugin } from './runtime.js'
 
 export const name = 'rlm'
-export const inject = ['tools']
+export const inject = ['tools', 'subagents']
 
 export interface Config {
   /** When false, the plugin registers no tool and starts no runtime. */
