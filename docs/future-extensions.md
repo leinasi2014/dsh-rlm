@@ -1,41 +1,42 @@
-# 后续扩展架构
+# Future Extension Architecture
 
-本文件不是 V1 待办清单。只有 [核心架构](architecture.md) 的真实 Profile
-闭环通过后，且下表触发条件已经出现，才添加对应能力。
+> English | [简体中文](future-extensions.zh-CN.md)
 
-## 不变边界
+This document is not a V1 backlog. Add a capability only after the real Profile
+loop in [Core architecture](architecture.md) passes and the matching trigger
+below exists.
 
-无论增加什么功能，都保持：
+## Invariants
 
-- DSH Agent Loop 和 Session log 是模型交互权威；
-- Python 只执行代码，不持有模型凭据或 DSH 私有对象；
-- 一个 Session 的内核和变量不会泄漏给另一个 Session；
-- 新功能复用 `rlm_eval` 主路径，不复制第二套 RLM runtime；
-- 只有出现第二个 Consumer 才考虑公共 Service；
-- 只有出现第二个真实实现才考虑 Provider 接口。
+Every extension must preserve these boundaries:
 
-## 按证据添加
+- the DSH Agent Loop and Session log remain the model-interaction authority;
+- Python executes code but does not own model credentials or DSH-private objects;
+- one Session's kernel and variables never leak into another Session;
+- extensions reuse the `rlm_eval` path instead of creating a second RLM runtime;
+- consider a public Service only after a second consumer exists;
+- consider a Provider interface only after a second real implementation exists.
 
-| 能力 | 触发条件 | 最小增加 | 验收结果 |
+## Add only from evidence
+
+| Capability | Trigger | Minimal addition | Acceptance outcome |
 |---|---|---|---|
-| 手动 reset | 用户需要主动清空变量或释放内核 | 给 `rlm_eval` 增加 `reset` 操作，或增加一个 `rlm_reset` 工具 | 只清理当前 Session，其他 Session 不受影响 |
-| Snapshot/restore | 一个被接受的用例要求在超时、崩溃或宿主重启后保留变量 | Python 序列化支持的 globals；临时文件原子替换；失败时明确丢失 | kill 后重启能恢复支持的变量，并报告跳过项 |
-| 递归子 RLM | one-shot query 无法完成一个已复现的复杂子问题 | 允许子 Session 拥有自己的内核和 `rlm_eval`；按血缘限制深度 | `max_depth > 1` 的子 RLM 能独立迭代并向父 cell 返回文本 |
-| Continuable spawn | 一个任务必须在父 cell 结束后继续工作 | 使用官方 continuable Subagent 和 inbox；不把答案塞进 handle | 父 cell 结束后子 Session 继续，并由官方 Session 路径交付结果 |
-| 受管上下文来源 | 官方提供通用文本附件或工作区句柄，或本地路径不满足真实用例 | 在现有 runtime 前增加一个来源解析器，不建立 Context Domain | 大文本由稳定句柄进入 Python，不经过模型复制全文 |
-| 跨宿主持久 Session | 用户要求插件重启后继续同一 RLM 会话 | 只持久化恢复所需元数据和 snapshot 引用 | 重启后同一 Session 能恢复；版本不匹配明确失败 |
-| Batched query | 顺序 query 的实测延迟成为瓶颈 | 一个有并发上限的 `rlm_query_batched` | 批量结果保持输入顺序，取消能终止全部子调用 |
-| 第二个内核实现 | container 或 remote kernel 已开始实现 | 从现有 runtime 抽取最小 `KernelDriver` 接口 | 本地与第二实现通过同一闭环场景 |
-| Token/费用护栏 | 实际 Provider 暴露可靠用量，且发生可复现的费用控制问题 | 在 query 准入点读取已观测用量并拒绝后续调用 | 达到限制后停止新 query，不伪造未观测 token |
-| Jobs、UI、swarm | 有点名 Consumer 和端到端场景 | 作为现有 runtime 的 Consumer，不进入 Python core | 新 Consumer 不改变 `rlm_eval` 和 Session 权威 |
+| Manual reset | Users need to clear variables or release a kernel explicitly | Add a reset operation to `rlm_eval`, or one `rlm_reset` tool | Only the current Session resets |
+| Snapshot/restore | An accepted use case requires variables after timeout, crash, or host restart | Serialize supported globals and atomically replace a temporary file | Restart restores supported variables and reports skipped values |
+| Recursive child RLM | A reproduced subproblem cannot be completed by one-shot query | Give a child Session its own kernel and depth-bounded `rlm_eval` | A child with `max_depth > 1` iterates and returns text to its parent cell |
+| Continuable spawn | Work must continue after the parent cell exits | Use the official continuable Subagent and inbox | The child continues and delivers through the official Session path |
+| Managed context source | Official attachment/workspace handles exist, or local paths fail a real use case | Add one source resolver before the runtime, not a Context Domain | A stable handle loads large text into Python without model copying |
+| Cross-host persistence | Users require the same RLM Session after plugin restart | Persist only recovery metadata and snapshot references | The Session restores, while version mismatch fails explicitly |
+| Batched query | Measured sequential-query latency is a bottleneck | Add one concurrency-bounded `rlm_query_batched` | Results preserve input order and cancellation stops every child |
+| Second kernel | A container or remote kernel implementation has started | Extract the smallest `KernelDriver` interface | Local and second implementations pass the same loop |
+| Token/cost guard | A Provider exposes reliable usage and a reproducible cost problem exists | Read observed usage at query admission and reject later calls | New queries stop at the limit without inventing unobserved tokens |
+| Jobs, UI, swarm | A named consumer and end-to-end scenario exist | Consume the existing runtime without entering the Python core | The new consumer preserves `rlm_eval` and Session authority |
 
-## 添加新功能时的最小决策
+## Four questions before an extension
 
-每次只回答四个问题：
+1. Which running scenario proves V1 is insufficient?
+2. What is the smallest existing file or boundary that can change?
+3. Which existing end-to-end loop must remain unchanged?
+4. What executable result proves the extension complete?
 
-1. 哪个已运行场景证明当前 V1 不够？
-2. 最小改动落在现有哪一个文件或边界？
-3. 哪条现有闭环必须保持不变？
-4. 什么端到端结果证明功能完成？
-
-如果没有可运行触发场景，答案就是“不添加”。
+If there is no runnable trigger, do not add the feature.

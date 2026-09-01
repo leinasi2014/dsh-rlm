@@ -30,6 +30,7 @@
   "files": [
     "lib",
     "README.md",
+    "README.zh-CN.md",
     "docs",
     "python-runtime"
   ],

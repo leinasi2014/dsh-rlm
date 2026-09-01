@@ -1,5 +1,7 @@
 # dsh-rlm
 
+> English | [简体中文](README.zh-CN.md)
+
 `dsh-rlm` is a minimal Recursive Language Model (RLM) plugin for
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). It gives a
 DSH Agent one tool, `rlm_eval`, backed by a persistent Python namespace for the
@@ -163,6 +165,9 @@ revision
 - [Future extensions and their triggers](docs/future-extensions.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)
+
+Chinese counterparts are available from [README.zh-CN.md](README.zh-CN.md) and
+the language switch at the top of every core document.
 
 ## References
 

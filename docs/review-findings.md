@@ -1,81 +1,94 @@
-# 实现与架构审查结论
+# Implementation and Architecture Review
 
-## 结论
+> English | [简体中文](review-findings.zh-CN.md)
 
-当前实现与两个固定参考项目的核心方向基本一致：持久 Python namespace、Host
-侧模型权威、one-shot 子智能体、按 Session 隔离，并且没有引入第二 Agent Loop。
-M1 的代表性真实闭环成立，算法选择总体克制且正确。
+## Verdict
 
-它还不能被描述为“完全符合全部退出条件”：system prompt 尚未接入，M2 的
-串行化、有界协议、故障终止和子工作生命周期仍有真实缺口。
+The implementation follows the two pinned references in the dimensions that
+matter for this project: a persistent Python namespace, host-owned model
+authority, one-shot children, Session isolation, and no second Agent Loop. The
+representative real M1 loop works, and the core algorithm choices are restrained
+and generally sound.
 
-## 已确认的高优先级问题
+It is not yet accurate to claim every exit criterion passes. The system prompt
+is missing, and M2 still has real gaps in serialization, bounded protocol
+handling, fault termination, and child-work lifecycle.
 
-1. 非法 JSON、未知帧等协议错误只走 `handleExit()`，没有确保终止进程树；随后
-   runtime 已无法通过 Map 找到该进程。
-2. 同 Session 并发 eval 被 `busy` 拒绝，而 M2 要求按提交顺序串行化。
-3. stderr、无换行 stdout 缓冲、query prompt/result、error detail 和 JSONL 行
-   没有覆盖完整的 UTF-8 字节上限。
-4. cell timeout、协议故障和插件卸载没有把活跃 one-shot Subagent 完整绑定到
-   cell 生命周期；子工作可能继续消耗资源。
-5. `Runtime.dispose()` 不是终态，之后仍能创建新 kernel。
-6. ready 握手发生在 cell timer 和 abort listener 建立前，静默解释器可无限等待。
-7. Python 子进程默认继承 `process.env`，与当前项目的凭据隔离目标不符。
+## Confirmed high-priority findings
 
-## 已确认的正确性与契约问题
+1. Invalid JSON and unknown frames enter `handleExit()` without guaranteeing
+   process-tree termination, after which the runtime can no longer find the
+   process in its Map.
+2. Concurrent evals in one Session return `busy`; M2 requires ordered
+   serialization.
+3. stderr, incomplete stdout frames, query prompt/result, error detail, and raw
+   JSONL lines are not all covered by UTF-8 byte limits.
+4. Cell timeout, protocol failure, and plugin unload do not fully bind an active
+   one-shot Subagent to the cell lifecycle.
+5. `Runtime.dispose()` is not terminal and a later eval can start a new kernel.
+6. The ready handshake occurs before the cell timer and abort listener, so a
+   silent interpreter can wait forever.
+7. Python inherits `process.env`, contrary to the project's credential-isolation
+   target.
 
-- 最终值的 `repr()` 位于 cell 异常边界之外，异常时会让 kernel fatal，而不是只
-  失败当前 cell。
-- `rlm_query` 可被用户 cell 持久覆盖或删除；内部结果槽也可能与用户 namespace
-  冲突或在失败后残留。
-- completed 但没有可见文本的子智能体被接受为空字符串，当前架构要求 typed
-  query error。
-- 公开配置 schema 没有暴露 runtime 已支持的 Python command、timeout、输出
-  上限和 query 上限；简短 RLM system prompt 也未注册。
-- `RlmError kind='query'` 在当前桥接路径上不可达，错误 taxonomy 与行为不完全一致。
+## Confirmed correctness and contract findings
 
-## 算法质量复核
+- Last-value `repr()` is outside the cell exception boundary, so an exception
+  can kill the kernel instead of failing only that cell.
+- A user cell can overwrite or delete `rlm_query`; the internal result slot can
+  collide with user globals or survive a failed cell.
+- A completed child with no visible text is accepted as an empty string even
+  though the architecture requires a typed query error.
+- The public schema does not expose the runtime's Python command, timeout,
+  output limits, or query limit; the concise RLM system prompt is not registered.
+- `RlmError kind='query'` is unreachable on the current bridge path, so the
+  declared taxonomy and observed behavior differ.
 
-以下核心算法已经成立：
+## Algorithm quality
 
-- reader thread 通过线程安全唤醒与 asyncio future 协作，query 以 ID 关联回复；
-- AST 尾表达式变换兼容普通 cell 与 top-level `await`；
-- stdout/result 的现有截断按 UTF-8 字节预算执行，不切坏多字节字符；
-- result/error/timeout/cancel/dispose 主路径大体遵循单次结算纪律；
-- 子智能体通过构造时 deny `rlm_eval`，而不是依赖提示词阻止递归。
+The following core algorithms are valid:
 
-但“没有算法性缺陷”的结论过强：异常 `repr()`、协议进程孤儿、残留结果槽和
-后台 query 越过 cell 终态，都是可复现的状态机/隔离缺陷。
+- a reader thread safely wakes asyncio futures and correlates queries by ID;
+- the AST last-expression transform works with ordinary cells and top-level await;
+- stdout/result truncation observes UTF-8 byte boundaries;
+- the main result/error/timeout/cancel/dispose paths largely obey one-time settlement;
+- child recursion is denied structurally instead of relying on prompt wording.
 
-## 与用户提供审查的一致项
+However, “no algorithmic defects” is too strong. Exceptional `repr()`, an
+orphaned protocol process, a stale result slot, and background query work crossing
+the cell terminal state are reproducible state-machine or isolation defects.
 
-以下判断得到确认：query 结果缺少宿主侧统一字节上限；Python 环境没有清洗；
-timeout 没有可靠取消子工作；stderr 无界；scaffold 可被破坏；busy 路径缺少目标
-行为；Windows Host 突然崩溃时缺少 kill-on-close 级别兜底。
+## Findings confirmed from the supplied review
 
-其中 Windows Job Object 属于 hardening 建议，不是当前架构已经承诺的 M1/M2
-退出条件。
+The audit confirmed missing host-side query limits, inherited Python environment,
+timeout that does not fully cancel child work, unbounded stderr, mutable scaffold,
+the incorrect busy behavior, and no kill-on-close protection if a Windows host
+crashes suddenly.
 
-## 不适用于当前权威架构的旧判断
+A Windows Job Object is a hardening proposal, not a currently promised M1/M2
+exit criterion.
 
-以下说法来自旧版或不同设计，不能作为当前缺陷建 Issue：
+## Stale claims that do not apply
 
-- V1 应有 6 个工具；当前权威架构明确只有 `rlm_eval`。
-- 应建立八操作 `RlmService`；当前 V1 明确不建立公共 Service。
-- Storage Domain、run record、checkpoint 是当前必需；它们属于条件扩展。
-- 当前应拆为 9 个 TypeScript 文件；目录契约明确保持两个 TS 源文件。
-- 协议必须使用 `hello/evaluate/host_reply/done` 等旧帧；当前协议就是
-  `ready/eval/query/query_result/result/error`。
-- 必须存在 `protocol.ts` / `protocol.py` 镜像或达到约 1,600 行；当前文档没有
-  这些要求，代码行数也不是完成标准。
+Do not create issues from these older or different designs:
 
-两个 `ref` 是 prior art。应采用其生命周期、资源治理和 namespace 防护经验，
-不应复制其 daemon、Storage、协议命名、自动快照或更大的框架边界。
+- V1 should have six tools; current V1 deliberately has only `rlm_eval`.
+- V1 should expose an eight-operation `RlmService`; it deliberately has no public Service.
+- Storage Domain, run records, and checkpoints are mandatory now; they are conditional extensions.
+- V1 should have nine TypeScript files; the current directory contract has two.
+- The protocol must use `hello/evaluate/host_reply/done`; current V1 uses
+  `ready/eval/query/query_result/result/error`.
+- `protocol.ts`/`protocol.py` mirrors or roughly 1,600 lines are required; neither
+  is a current acceptance criterion.
 
-## 修正顺序
+The references are prior art, not specifications to copy literally. This project
+adopts their lifecycle, resource-governance, and namespace-protection lessons,
+not their daemon, Storage, frame names, automatic snapshots, or wider framework.
 
-1. 先收口进程、deadline、dispose 和 child 生命周期，避免孤儿与迟到副作用。
-2. 再完成同 Session 队列和所有协议/诊断通道的字节上限。
-3. 修复 Python scaffold、结果格式化和空查询结果的 cell 级隔离。
-4. 完成环境变量白名单、公开配置和 system prompt 契约。
-5. 所有修正用本地测试验证，最后再次运行隔离的真实 Profile 冒烟。
+## Correction order
+
+1. Close process, deadline, dispose, and child-lifecycle gaps.
+2. Add the per-Session queue and byte limits for every protocol/diagnostic channel.
+3. Fix Python scaffold, result formatting, and empty child-result isolation.
+4. Add the environment allowlist, public configuration, and system prompt.
+5. Run local regression tests and then the isolated real Profile smoke again.

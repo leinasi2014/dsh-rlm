@@ -1,11 +1,14 @@
-# 项目状态
+# Project Status
 
-本文记录首次公开发布时的实现边界。后续缺陷和验收进度以 GitHub Issues、
-`docs/milestones.md` 与代码测试共同为准。
+> English | [简体中文](project-status.zh-CN.md)
 
-## 目标
+This document records the implementation boundary at the first public release.
+GitHub Issues, [Milestones](milestones.md), and executable tests jointly define
+subsequent progress.
 
-交付 DeepSeek Harness 中最小、可验证的 RLM 闭环：
+## Goal
+
+Deliver the smallest verifiable RLM loop for DeepSeek Harness:
 
 ```text
 DSH Agent -> rlm_eval(code) -> Session Python kernel
@@ -14,70 +17,72 @@ DSH Agent -> rlm_eval(code) -> Session Python kernel
   -> next rlm_eval reuses globals
 ```
 
-目标边界是：DSH Session log 仍是模型可见历史的权威；Provider 和凭据留在
-Host；Python kernel 只执行代码、维护 Session 内 globals，并通过宿主发起一次性
-子智能体查询。
+The target boundary keeps the DSH Session log as the model-visible history
+authority and keeps Provider credentials in the host. Python executes code,
+holds Session-local globals, and asks the host for one-shot child calls.
 
-## 发布基线
+## Publication baseline
 
-- 审查基线：`e1ce33e0d984a340e949768975e2397d8b62bd0b`
-- 审查日期：2026-09-02
-- 固定参考：`ref/rlm` 与 `ref/prime-agent`，只作为设计证据，不作为逐字兼容目标
-- 当前阶段：M1 主闭环已实现并做过真实干净 Profile 验证；M2 可靠性基线未完成
+- Audited implementation: `e1ce33e0d984a340e949768975e2397d8b62bd0b`
+- Audit date: 2026-09-02
+- Pinned references: `ref/rlm` and `ref/prime-agent`, used as design evidence,
+  not literal compatibility targets
+- Current stage: the M1 main loop passed a real clean-Profile smoke; the M2
+  reliability baseline remains open
 
-## 已完成
+## Delivered
 
-### M1A：Python kernel
+### M1A: Python kernel
 
-- 持久 globals
-- top-level `await`
-- 尾表达式结果
-- `stdout`/result UTF-8 字节截断
-- 类型化 cell 错误
+- persistent globals;
+- top-level `await`;
+- last-expression result;
+- UTF-8 byte truncation for stdout and result;
+- typed cell failures.
 
-### M1B：TypeScript runtime
+### M1B: TypeScript runtime
 
-- JSON-lines 子进程协议
-- 每 Session 一个 kernel
-- eval、result、error、timeout、cancel 和 dispose 主路径
-- timeout 后杀进程树并按需重建 kernel
+- JSON-lines child-process protocol;
+- one kernel per Session;
+- main eval, result, error, timeout, cancel, and dispose paths;
+- process-tree kill and lazy clean-kernel recreation after timeout.
 
-### M1C / M1D：DSH 集成与查询桥
+### M1C / M1D: DSH integration and query bridge
 
-- 唯一公开工具 `rlm_eval`
-- Session 作用域隔离
-- `await rlm_query(prompt)` 到 one-shot DSH Subagent 的往返
-- 子智能体通过 `toolFilter` 禁止递归调用 `rlm_eval`
-- 子智能体完成后释放
+- only public tool: `rlm_eval`;
+- Session-scoped isolation;
+- `await rlm_query(prompt)` round trip through a one-shot DSH Subagent;
+- child recursion prevented with `toolFilter` denying `rlm_eval`;
+- child disposal on normal completion.
 
-### M1E：真实 Profile 冒烟
+### M1E: Real Profile smoke
 
-真实干净 DSH Profile 已验证以下路径：插件安装/加载、中文 UTF-8 文件读取、
-`rlm_query` 返回后 Python 继续执行、第二个 cell 复用变量、官方 Session log
-出现有界工具结果，并且子智能体没有递归获得 `rlm_eval`。
+A fresh DSH Profile verified real package installation/loading, a Chinese UTF-8
+file read, Python continuation after `rlm_query`, cross-cell variable reuse,
+bounded tool results in the official Session log, and no recursive `rlm_eval`
+availability in the child.
 
-活体测试默认由 `RLM_LIVE_SMOKE=1` 设门，避免普通单元测试意外调用模型。
+Live tests are gated by `RLM_LIVE_SMOKE=1` so ordinary test runs cannot make
+accidental model calls.
 
-## 未完成
+## Open work
 
-M2 仍有以下确认缺口。首次发布后按这 7 组修正任务登记，并以公开 GitHub
-Issues 作为 live authority：
+The M2 gaps are grouped into seven public work items:
 
-1. kernel 生命周期：协议故障孤儿、ready deadline，以及 dispose 终态；
-2. Session 串行队列：同 Session 并发 cell 不应直接返回 `busy`；
-3. 有界协议：stderr、未换行缓冲、query 与 error 等载荷的统一字节上限；
-4. query/child 生命周期：timeout、取消、故障和卸载时取消并等待 child，拒绝
-   completed 但无可见文本，并保持 query 错误 taxonomy；
-5. scaffold 与结果隔离：`repr()`、内部结果槽和 `rlm_query` binding 的 cell
-   级失败隔离；
-6. 配置与 system prompt：公开完整 V1 runtime 配置并注册简短使用提示；
-7. Python 环境隔离：不默认继承可能包含 Provider 凭据的宿主环境变量。
+1. [Kernel lifecycle](https://github.com/leinasi2014/dsh-rlm/issues/1): protocol-fault orphans, ready deadline, and terminal dispose.
+2. [Session serialization](https://github.com/leinasi2014/dsh-rlm/issues/2): queue concurrent cells instead of returning `busy`.
+3. [Bounded protocol](https://github.com/leinasi2014/dsh-rlm/issues/3): byte limits for stderr, incomplete frames, queries, and errors.
+4. [Query/child lifecycle](https://github.com/leinasi2014/dsh-rlm/issues/4): cancel and await children on timeout, failure, and unload; reject empty child text; preserve query taxonomy.
+5. [Scaffold and result isolation](https://github.com/leinasi2014/dsh-rlm/issues/5): contain `repr()`, protect the result slot, and restore `rlm_query`.
+6. [Configuration and system prompt](https://github.com/leinasi2014/dsh-rlm/issues/6): expose V1 settings and register concise usage guidance.
+7. [Python environment isolation](https://github.com/leinasi2014/dsh-rlm/issues/7): do not inherit host variables that may carry Provider credentials.
 
-因此当前准确状态是：**M1 核心闭环已交付，M1 收口与 M2 可靠性仍开放**。
+The accurate status is: **the M1 core loop is delivered; M1 closeout and M2
+reliability remain open**.
 
-## 有条件的未来工作
+## Conditional future work
 
-以下能力尚未开始，而且不是 M1 缺陷：snapshot/restore、Storage Domain、run
-record、continuable spawn、递归 RLM、批量查询、第二种 kernel、跨 Host
-恢复、费用账本、UI、Workflow、Jobs 与 swarm。只有在真实需求和验收证据出现后
-才会进入里程碑。
+Snapshot/restore, Storage Domain, run records, continuable spawn, recursive RLM,
+batch queries, a second kernel, cross-host recovery, cost accounting, UI,
+Workflow, Jobs, and swarm have not started and are not M1 defects. They enter a
+milestone only after a real trigger exists.

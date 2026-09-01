@@ -1,31 +1,35 @@
-# 目录结构与语言
+# Directory Structure and Language Boundary
 
-## 语言边界
+> English | [简体中文](directory-structure.zh-CN.md)
 
-- **TypeScript/Node.js**：注册 DSH 工具、按 Session 管理进程、调用 one-shot
-  Subagent、处理取消和插件 dispose。
-- **Python 3.11+**：保存 globals、执行 cell，并通过宿主回调实现
-  `await rlm_query()`。
+## Language boundary
 
-V1 是一个 npm 包和一个 Python 脚本，不拆 Service、Provider 或协议包。
+- **TypeScript/Node.js** registers the DSH tool, manages processes by Session,
+  invokes the one-shot Subagent, propagates cancellation, and handles plugin
+  disposal.
+- **Python 3.11+** owns globals, executes cells, and implements
+  `await rlm_query()` through a host callback.
 
-## V1 目录
+V1 is one npm package plus one Python script. It does not split out a Service,
+Provider, or protocol package.
+
+## V1 layout
 
 ```text
 dsh-rlm/
 ├─ package.json
 ├─ src/
-│  ├─ index.ts             # 配置、system prompt、rlm_eval 注册与 dispose
-│  └─ runtime.ts           # Session 内核表、进程协议、one-shot query bridge
+│  ├─ index.ts              # config, system prompt, tool registration, dispose
+│  └─ runtime.ts            # Session kernels, protocol, one-shot query bridge
 ├─ python-runtime/
-│  └─ rlm_kernel.py        # persistent globals、top-level await、rlm_query
+│  └─ rlm_kernel.py         # globals, top-level await, rlm_query
 ├─ tests/
-│  ├─ rlm-loop.test.ts     # Python/query/跨 cell 闭环
-│  └─ profile-smoke.test.ts# 真实 DSH Profile 组合
+│  ├─ rlm-loop.test.ts      # Python/query/cross-cell loop
+│  └─ profile-smoke.test.ts # real DSH Profile composition
 ├─ docs/
 └─ ref/
 ```
 
-在单个文件接近项目行数限制、出现第二个独立 Consumer，或第二个真实内核实现
-开始编码之前，不继续拆文件。届时按
-[后续扩展架构](future-extensions.md) 的触发条件做最小拆分。
+Do not split further until a file reaches the project size limit, a second
+independent consumer appears, or a second real kernel implementation starts.
+At that point, follow the triggers in [Future extensions](future-extensions.md).

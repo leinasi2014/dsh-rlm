@@ -3,8 +3,8 @@ lib/
 coverage/
 *.log
 .DS_Store
+docs/*.visual-check.json
 
 # Reference checkouts are reproducible evidence hosts, not vendored product code.
 ref/prime-agent/source/
 ref/rlm/source/
-
