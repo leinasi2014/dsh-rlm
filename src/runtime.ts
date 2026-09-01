@@ -66,8 +66,8 @@ export class RlmError extends Error {
     super(message)
     this.name = 'RlmError'
     this.kind = kind
-    this.phase = opts.phase
-    this.detailed = opts.detailed
+    if (opts.phase !== undefined) this.phase = opts.phase
+    if (opts.detailed !== undefined) this.detailed = opts.detailed
   }
 }
 
@@ -148,7 +148,7 @@ class Kernel {
     child.on('error', (err) => {
       this.handleExit(new RlmError('spawn', String(err)))
     })
-    child.on('close', (code) => {
+    child.on('close', () => {
       const detail = this.stderr.trim()
       this.handleExit(new RlmError('closed', 'kernel exited', { detailed: detail }))
     })
@@ -270,11 +270,12 @@ class Kernel {
     }
     this.clearTimer(p)
     this.pending = null
-    p.resolve({
+    const out: RlmEvalOutput = {
       stdout: String(frame.stdout ?? ''),
-      result: typeof frame.result === 'string' ? frame.result : undefined,
       truncated: frame.truncated === true,
-    })
+    }
+    if (typeof frame.result === 'string') out.result = frame.result
+    p.resolve(out)
   }
 
   private onError(frame: Frame): void {
