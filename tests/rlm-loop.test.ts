@@ -383,3 +383,152 @@ test('M1B: a bad python command is a spawn failure', async () => {
   }
 })
 
+
+// ---- M1C/M1D: DSH tool registration and rlm_query -> one-shot Subagent bridge ----
+
+import { registerRlmPlugin } from '../src/runtime.ts'
+
+interface FakeExec { agent: { id: string }; signal: AbortSignal }
+
+function makeExec(agentId: string): FakeExec {
+  return { agent: { id: agentId }, signal: new AbortController().signal }
+}
+
+interface MockCtx {
+  ctx: any
+  registered: any[]
+  starts: { provider: string; request: any }[]
+  run: any
+  teardown: (() => void) | undefined
+  label: string | undefined
+}
+
+function makeMockCtx(options: { queryText?: string } = {}): MockCtx {
+  const registered: any[] = []
+  const starts: { provider: string; request: any }[] = []
+  const run: any = {
+    disposed: false,
+    result: Promise.resolve({ output: [{ type: 'text', text: options.queryText ?? '4' }], stopReason: 'completed' }),
+    dispose: async () => { run.disposed = true },
+  }
+  // Build the mutable mock first; ctx.effect writes straight onto it (not a
+  // closure local, which the returned object would capture as stale undefined).
+  const m: MockCtx = { ctx: undefined as any, registered, starts, run, teardown: undefined, label: undefined }
+  m.ctx = {
+    tools: {
+      register(def: any) {
+        registered.push(def)
+        return () => { const i = registered.indexOf(def); if (i >= 0) registered.splice(i, 1) }
+      },
+    },
+    subagents: {
+      async start(provider: string, request: any) {
+        starts.push({ provider, request })
+        return run
+      },
+    },
+    effect(execute: () => () => void, effectLabel: string) {
+      m.label = effectLabel
+      m.teardown = execute()
+    },
+  }
+  return m
+}
+
+test('M1C: rlm_eval is registered only when the plugin is enabled', () => {
+  const disabled = makeMockCtx()
+  registerRlmPlugin(disabled.ctx, { enabled: false })
+  assert.equal(disabled.registered.length, 0)
+  assert.equal(disabled.teardown, undefined)
+
+  const enabled = makeMockCtx()
+  registerRlmPlugin(enabled.ctx, { enabled: true })
+  try {
+    assert.equal(enabled.registered.length, 1)
+    assert.equal(enabled.registered[0].name, 'rlm_eval')
+    // Minimal input: only code, and it is required. defineTool normalizes
+    // `parameters` to JSON Schema ({ type, properties, required }).
+    assert.equal(enabled.registered[0].parameters.type, 'object')
+    assert.deepEqual(Object.keys(enabled.registered[0].parameters.properties), ['code'])
+    assert.equal(enabled.registered[0].parameters.properties.code.type, 'string')
+    assert.ok(enabled.registered[0].parameters.required.includes('code'))
+    // The runtime teardown effect is mounted.
+    assert.equal(typeof enabled.teardown, 'function')
+    assert.equal(enabled.label, 'rlm runtime teardown')
+  } finally {
+    enabled.teardown?.()
+  }
+})
+
+test('M1D: the one-shot child request filters out rlm_eval and uses the calling agent', async () => {
+  const m = makeMockCtx({ queryText: 'four' })
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn' })
+  const tool = m.registered[0]
+  const exec = makeExec('sess-a')
+
+  try {
+    const out = await tool.execute({ code: 't = await rlm_query("what is 2+2?")\nt + "!"' }, exec)
+
+    assert.equal(out.result, 'four!')
+    assert.equal(m.starts.length, 1)
+    const { provider, request } = m.starts[0]
+    assert.equal(provider, 'spawn')
+    assert.equal(request.label, 'rlm query')
+    assert.equal(request.parent.id, 'sess-a')
+    assert.equal(request.signal, exec.signal)
+    // Child cannot recurse: rlm_eval is explicitly denied.
+    assert.deepEqual(request.toolFilter, { deny: ['rlm_eval'] })
+    assert.deepEqual(request.prompt, [{ type: 'text', text: 'what is 2+2?' }])
+    // Foreground call must dispose the child after collecting its text.
+    assert.equal(m.run.disposed, true)
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M1C: rlm_eval keys Python kernels by the calling agent id (session isolation)', async () => {
+  const m = makeMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true })
+  const tool = m.registered[0]
+
+  try {
+    await tool.execute({ code: 'seed = 7' }, makeExec('sess-a'))
+    // Same session reuses the kernel/globals.
+    const same = await tool.execute({ code: 'seed * 6' }, makeExec('sess-a'))
+    assert.equal(same.result, '42')
+    // A different session has a fresh kernel with no seed.
+    await assert.rejects(
+      tool.execute({ code: 'seed' }, makeExec('sess-b')),
+      (err: unknown) => err instanceof Error && err.message.includes('rlm_eval failed (eval)'),
+    )
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M1C/M1D: plugin teardown unregisters the tool and cancels the in-flight cell', async () => {
+  const m = makeMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true })
+  const tool = m.registered[0]
+
+  try {
+    // Start a cell that blocks so the kernel is live and the eval is pending.
+    const pending = tool.execute({ code: 'import time\ntime.sleep(5)' }, makeExec('sess-a'))
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.equal(typeof m.teardown, 'function')
+
+    // Tear down the runtime while the cell is still running.
+    m.teardown!()
+    // The tool is unregistered…
+    assert.equal(m.registered.length, 0)
+    // …and the in-flight cell is cancelled rather than left hanging.
+    await assert.rejects(
+      pending,
+      (err: unknown) =>
+        err instanceof Error
+        && (err.message.includes('cancel') || err.message.includes('rlm_eval failed (cancel)')),
+    )
+  } finally {
+    m.teardown?.()
+  }
+})

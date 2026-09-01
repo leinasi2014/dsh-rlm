@@ -2,6 +2,9 @@ import type { Context } from '@deepseek-ai/cordis'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { SubagentRun, SubagentResult } from '@deepseek-ai/dsh-subagent'
 
 const KERNEL_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -469,4 +472,143 @@ export function createRlmRuntime(
   config: RlmRuntimeConfig,
 ): RlmRuntime {
   return new RlmRuntimeImpl(config)
+}
+
+// ---- M1C/M1D: DSH tool registration and rlm_query -> one-shot Subagent bridge ----
+
+/** The single non-recursive tool this plugin contributes. */
+export const TOOL_NAME = 'rlm_eval'
+
+/** Concatenate a subagent's final assistant text content into one string. */
+function textOf(output: readonly { type: string; text?: unknown }[]): string {
+  let out = ''
+  for (const block of output) {
+    if (block.type === 'text' && typeof block.text === 'string') out += block.text
+  }
+  return out
+}
+
+/**
+ * Answer one `rlm_query(prompt)` by starting a fresh one-shot DSH Subagent.
+ *
+ * The child is spawned with a tool filter that removes `rlm_eval`, so a child
+ * can never recurse into another RLM loop. The call is foreground: we wait for
+ * the child's terminal result and always dispose it in `finally`. Only the
+ * child's final assistant text crosses back to the Python cell.
+ */
+async function runQuery(
+  ctx: Context,
+  provider: string,
+  parent: Agent,
+  prompt: string,
+  signal: AbortSignal,
+): Promise<string> {
+  const run: SubagentRun = await ctx.subagents.start(provider, {
+    label: 'rlm query',
+    prompt: [{ type: 'text', text: prompt }],
+    parent,
+    signal,
+    toolFilter: { deny: [TOOL_NAME] },
+  })
+  try {
+    const result: SubagentResult = await run.result
+    if (result.stopReason !== 'completed') {
+      const text = textOf(result.output)
+      const suffix = text.length === 0 ? '' : ` (partial: ${text})`
+      throw new Error(`rlm_query subagent ended with stop reason "${result.stopReason}"${suffix}`)
+    }
+    return textOf(result.output)
+  } finally {
+    await run.dispose()
+  }
+}
+
+interface RlmEvalValue {
+  stdout: string
+  result?: string
+  truncated: boolean
+}
+
+function renderValue(value: RlmEvalValue): string {
+  const parts: string[] = []
+  if (value.stdout) parts.push(value.stdout)
+  if (value.result !== undefined) parts.push(value.result)
+  if (parts.length === 0) parts.push('(no output)')
+  let text = parts.join('\n')
+  if (value.truncated) text += '\n[output truncated]'
+  return text
+}
+
+/**
+ * Register the single `rlm_eval` tool and bridge `rlm_query` to a one-shot
+ * DSH Subagent. The runtime is created here and torn down with the calling
+ * Cordis fiber, so no plugin-owned Python process survives plugin unload.
+ */
+export function registerRlmPlugin(
+  ctx: Context,
+  config: RlmRuntimeConfig & { provider?: string },
+): void {
+  if (config.enabled !== true) return
+  const provider = config.provider ?? 'spawn'
+  const runtime = createRlmRuntime(ctx, config)
+
+  const disposeTool = ctx.tools.register(defineTool({
+    name: TOOL_NAME,
+    description:
+      'Run one Python cell in the current session\'s persistent kernel and return its '
+      + 'stdout and last-expression result. The cell may call `await rlm_query(prompt)`, '
+      + 'which answers by delegating the prompt to a one-shot DSH Subagent and returns only '
+      + 'its final text. The child session has no rlm_eval tool, so it cannot recurse.',
+    parameters: {
+      code: {
+        type: 'string',
+        required: true,
+        description: 'Python source to run; top-level await and persistent globals are supported.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          stdout: { type: 'string', required: true },
+          result: { type: 'string' },
+          truncated: { type: 'boolean', required: true },
+        },
+      },
+      render: (_args: unknown, value: RlmEvalValue) => [{ type: 'text', text: renderValue(value) }],
+    },
+    async execute(args: { code: string }, exec): Promise<RlmEvalValue> {
+      const parent = exec.agent
+      if (!parent) {
+        throw new Error('rlm_eval requires a calling agent (exec.agent was undefined)')
+      }
+      // The agent/session share one identity; this is the stable per-session key.
+      const sessionKey = String(parent.id)
+      let output: Awaited<ReturnType<typeof runtime.eval>>
+      try {
+        output = await runtime.eval(sessionKey, {
+          code: args.code,
+          onQuery: async (prompt: string) => runQuery(ctx, provider, parent, prompt, exec.signal),
+        })
+      } catch (error) {
+        // Surface the typed runtime error as a normal tool failure so the model
+        // sees a useful, bounded message (the registry marks the call isError).
+        if (error instanceof RlmError) {
+          throw new Error(`rlm_eval failed (${error.kind}): ${error.message}`)
+        }
+        throw error
+      }
+      const value: RlmEvalValue = { stdout: output.stdout, truncated: output.truncated }
+      if (output.result !== undefined) value.result = output.result
+      return value
+    },
+  }))
+
+  // Tear down the runtime and unregister the tool whenever the plugin's fiber
+  // unloads, so no plugin-owned Python process survives the plugin.
+  ctx.effect(() => () => {
+    disposeTool()
+    runtime.dispose()
+  }, 'rlm runtime teardown')
 }
