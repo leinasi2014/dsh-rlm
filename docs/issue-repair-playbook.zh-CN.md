@@ -61,6 +61,11 @@ OPEN -> REPRODUCED -> IMPLEMENTING -> CANDIDATE
 ```yaml
 issue: "#编号"
 base: "origin/main 完整 SHA"
+dsh_authority: "https://github.com/deepseek-ai/deepseek-harness.git"
+dsh_branch: "master"
+dsh_local_sha: "选定 DSH checkout 的完整 SHA"
+dsh_upstream_sha: "刚获取的官方完整 SHA"
+dsh_relation: "ahead=<n> behind=0"
 branch: "codex/issue-编号-简名"
 workspace: "绝对路径的自有 worktree 或受控环境"
 session: "DSH workspace/team/Session 身份"
@@ -82,6 +87,30 @@ first_material_event: "失败复现或精确 blocker"
 Issue 结果和非目标必须可测试；base、工作树、访问模式与可变范围必须覆盖整个
 任务，依赖、writer/reviewer、集成容量必须已知；同一可变语义面不能存在第二个
 writer。
+
+### 4.1 DSH 官方上游权威门禁
+
+`ref/rlm` 与 `ref/prime-agent` 是固定的设计参考，不是 DSH 最新性证据。任何生产
+代码或测试变更之前，先选定作为兼容性基准的 DSH source checkout，并运行：
+
+```powershell
+$env:RLM_DSH_REPO_ROOT = 'C:\path\to\deepseek-harness'
+pnpm check:upstream
+```
+
+命令会确认 remote 指向官方仓库，在不改变 DSH 工作树的前提下 fetch 当前
+`master` tip，并输出权威仓库、分支、本地/上游 SHA 与 ahead/behind。只有
+`behind=0` 才通过；隔离 checkout 可以包含额外提交，但必须包含刚获取的官方 tip。
+
+如果结果为 stale、diverged 或 wrong authority，必须先使用/创建位于最新 tip 的
+隔离 DSH checkout；若上游不可达，则记录 `NOT_VERIFIED`，不得声称或开始“面向最新
+DSH”的开发。门禁禁止自动 pull、reset 或 rebase 用户的 DSH 工作树。
+
+PASS 后还要检查所有受影响 `@deepseek-ai/*` 边界的最新源码/类型。契约发生变化时，
+进入 RED 前先对对应最新发布包或 source workspace 完成 typecheck/build。类型通过
+不能替代 runtime、Session、tool、Subagent 或生命周期的干净 Profile 验证。所有
+结果写入 Issue 和 development-memory；若最终真实验收前官方 tip 可能移动，则重新
+检查并显式评估漂移，不能静默扩大 Candidate。
 
 ## 5. DSH/PTC 控制面规则
 
@@ -176,8 +205,8 @@ UTF-8；query 检查 timeout/cancel/迟到结果；kernel 检查保留名称与�
 
 ### 6.6 冻结和审查
 
-Candidate packet 包含 Issue、base SHA、Candidate SHA、变更文件、定向/完整测试、
-development-memory record IDs、文档影响和已知限制。Reviewer 只读审查精确
+Candidate packet 包含 Issue、base SHA、Candidate SHA、变更文件、DSH 权威分支/SHA
+与兼容性证据、定向/完整测试、development-memory record IDs、文档影响和已知限制。Reviewer 只读审查精确
 Candidate，不得边审边修。
 
 阻塞问题形成 successor Candidate。架构和安全边界未改变时只做 delta review；

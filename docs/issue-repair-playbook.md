@@ -73,6 +73,11 @@ Before mutation, bind:
 ```yaml
 issue: "#<number>"
 base: "<full origin/main SHA>"
+dsh_authority: "https://github.com/deepseek-ai/deepseek-harness.git"
+dsh_branch: "master"
+dsh_local_sha: "<full SHA of the selected DSH checkout>"
+dsh_upstream_sha: "<full fetched authority SHA>"
+dsh_relation: "ahead=<n> behind=0"
 branch: "codex/issue-<number>-<slug>"
 workspace: "<absolute owned worktree or controlled environment>"
 session: "<DSH workspace/team/Session identity>"
@@ -95,6 +100,36 @@ The work is ready only when the Issue outcome and non-goals are testable, the
 base and worktree state are known, access and mutable scope match the complete
 assignment, dependencies are explicit, writer/reviewer and integration capacity
 exist, and no other writer owns the same mutable surface.
+
+### 4.1 Official DSH upstream authority gate
+
+`ref/rlm` and `ref/prime-agent` are frozen prior art, not DSH freshness evidence.
+Before changing production code or tests, select the DSH source checkout that
+defines compatibility and run:
+
+```powershell
+$env:RLM_DSH_REPO_ROOT = 'C:\path\to\deepseek-harness'
+pnpm check:upstream
+```
+
+The command verifies the configured remote is the official repository, fetches
+the current `master` tip without changing the worktree, and reports the authority,
+branch, local/upstream SHAs, and ahead/behind counts. `behind=0` is required. An
+isolated checkout may be ahead of the tip, but it must contain the fetched tip.
+
+If the command reports stale/diverged/wrong authority, use or create an isolated
+DSH checkout at the latest tip before mutation. If the authority cannot be
+reached, report `NOT_VERIFIED` and do not claim or begin latest-DSH development.
+Never auto-pull, reset, or rebase a user's DSH worktree as part of this gate.
+
+After a PASS, inspect the latest source/types for every affected `@deepseek-ai/*`
+boundary. When those contracts changed, compile/build against the corresponding
+published packages or source workspace before RED. A type-level PASS does not
+replace clean-Profile evidence for runtime, Session, tool, Subagent, or lifecycle
+behavior. Record all results in the Issue and development-memory record. Re-run
+the authority check before final live acceptance when the upstream tip may have
+moved; assess drift explicitly rather than silently invalidating or broadening the
+candidate.
 
 ## 5. DSH/PTC control-surface rules
 
@@ -217,6 +252,7 @@ Freeze one candidate packet:
 
 ```text
 Issue, base SHA, candidate SHA, changed paths,
+DSH authority branch/SHA and compatibility evidence,
 focused checks, full checks, development-memory record IDs,
 documentation impact, known limitations
 ```

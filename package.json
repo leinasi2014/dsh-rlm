@@ -44,7 +44,8 @@
     "build": "pnpm clean && tsc -p tsconfig.json && tsdown",
     "check:memory": "node scripts/check-development-memory.mjs --all",
     "check:memory:staged": "node scripts/check-development-memory.mjs --staged",
-    "test": "node --test tests/development-memory-gate.test.ts tests/rlm-loop.test.ts tests/profile-smoke.test.ts",
+    "check:upstream": "node scripts/check-dsh-upstream.mjs",
+    "test": "node --test tests/development-memory-gate.test.ts tests/upstream-authority-gate.test.ts tests/rlm-loop.test.ts tests/profile-smoke.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {

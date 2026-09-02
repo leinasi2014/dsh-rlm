@@ -12,3 +12,8 @@ The nested `source/` checkout is intentionally ignored by the outer project and 
 remain unmodified. Architecture decisions belong in `docs/`; upstream code never
 becomes a second DSH Agent Loop or canonical Session/state authority.
 
+These snapshots are not the DeepSeek Harness compatibility authority and are not
+updated merely to mean "latest." Before development, verify the selected DSH source
+checkout against `deepseek-ai/deepseek-harness:master` with `pnpm check:upstream`,
+then record the exact upstream SHA in the work item's evidence. DSH remains a live
+upstream contract; `ref/` remains frozen prior art.
