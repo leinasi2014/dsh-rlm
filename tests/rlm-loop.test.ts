@@ -918,10 +918,11 @@ test('M1C: rlm_eval is registered only when the plugin is enabled', () => {
 })
 
 test('M1D: the one-shot child request filters out rlm_eval and uses the calling agent', async () => {
+  const ctl = new AbortController()
   const m = makeMockCtx({ queryText: 'four' })
   registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn' })
   const tool = m.registered[0]
-  const exec = makeExec('sess-a')
+  const exec = { agent: { id: 'sess-a' }, signal: ctl.signal }
 
   try {
     const out = await tool.execute({ code: 't = await rlm_query("what is 2+2?")\nt + "!"' }, exec)
@@ -932,7 +933,13 @@ test('M1D: the one-shot child request filters out rlm_eval and uses the calling 
     assert.equal(provider, 'spawn')
     assert.equal(request.label, 'rlm query')
     assert.equal(request.parent.id, 'sess-a')
-    assert.equal(request.signal, exec.signal)
+    // Issue #4: the child receives the cell's merged cancellation signal, not
+    // the raw exec.signal. The cell-owned controller is torn down as part of
+    // normal settlement (cleanup barrier), so by the time the child is
+    // disposed the merged signal is terminal.
+    assert.notEqual(request.signal, exec.signal)
+    assert.ok(request.signal instanceof AbortSignal)
+    assert.equal(request.signal.aborted, true)
     // Child cannot recurse: rlm_eval is explicitly denied.
     assert.deepEqual(request.toolFilter, { deny: ['rlm_eval'] })
     assert.deepEqual(request.prompt, [{ type: 'text', text: 'what is 2+2?' }])
@@ -2127,5 +2134,735 @@ test('M2 Issue#3: oversized lone-surrogate detail keeps real U+D800 code units a
     assert.equal(pidAgain.result, String(pid))
   } finally {
     runtime.dispose()
+  }
+})
+
+// ---- M2 Issue #4: one-shot child lifecycle, cleanup barrier, late-event isolation ----
+
+/** A manually-settled promise (deterministic latch: no wall-clock sleeps for control). */
+class Deferred<T> {
+  readonly promise: Promise<T>
+  resolve!: (value: T) => void
+  reject!: (reason: unknown) => void
+  private settled = false
+  constructor() {
+    this.promise = new Promise<T>((res, rej) => {
+      this.resolve = (value: T) => { if (!this.settled) { this.settled = true; res(value) } }
+      this.reject = (reason: unknown) => { if (!this.settled) { this.settled = true; rej(reason) } }
+    })
+  }
+  isSettled(): boolean { return this.settled }
+}
+
+/** Event-pump microtask/macrotask queues without wall-clock sleeps. */
+async function tick(times = 5): Promise<void> {
+  for (let i = 0; i < times; i++) await new Promise<void>((resolve) => setImmediate(resolve))
+}
+
+/** Poll a condition on the event loop (bounded wall clock only as a safety net). */
+async function until(cond: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error('condition was not met within the bound')
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
+}
+
+interface LifecycleRun {
+  result: Deferred<{ output: { type: string; text?: string }[]; stopReason: string; diagnostic?: string }>
+  disposed: boolean
+  signal: AbortSignal
+}
+
+interface LifecycleMock {
+  ctx: any
+  registered: any[]
+  starts: { provider: string; request: any; run: LifecycleRun }[]
+  teardown: (() => void) | undefined
+}
+
+/**
+ * Plugin mock whose subagent provider follows the published dsh-subagent
+ * contract: the request signal is the canonical cancellation channel, so an
+ * abort settles the run with `stopReason: 'aborted'`, and `dispose` is the
+ * holder's idempotent release. This makes lifecycle failures deterministic
+ * without any real model call.
+ */
+function makeLifecycleMockCtx(options: {
+  /** Pre-resolve each started run with this terminal result (e.g. empty text). */
+  autoResult?: { output: { type: string; text?: string }[]; stopReason: string; diagnostic?: string }
+  /** Make dispose settle after one macrotask hop so a missing cleanup barrier is observable. */
+  disposeAsync?: boolean
+} = {}): LifecycleMock {
+  const registered: any[] = []
+  const starts: { provider: string; request: any; run: LifecycleRun }[] = []
+  const m: LifecycleMock = { ctx: undefined as any, registered, starts, teardown: undefined }
+  m.ctx = {
+    tools: {
+      register(def: any) {
+        registered.push(def)
+        return () => { const i = registered.indexOf(def); if (i >= 0) registered.splice(i, 1) }
+      },
+    },
+    subagents: {
+      async start(provider: string, request: any) {
+        const result = new Deferred<{ output: { type: string; text?: string }[]; stopReason: string; diagnostic?: string }>()
+        const run: LifecycleRun = { result, disposed: false, signal: request.signal }
+        request.signal.addEventListener('abort', () => {
+          if (!result.isSettled()) result.resolve({ output: [], stopReason: 'aborted', diagnostic: 'cancelled' })
+        }, { once: true })
+        if (options.autoResult && !result.isSettled()) result.resolve(options.autoResult)
+        starts.push({ provider, request, run })
+        return {
+          result: result.promise,
+          dispose: async () => {
+            if (options.disposeAsync) await new Promise<void>((resolve) => setImmediate(resolve))
+            run.disposed = true
+          },
+        }
+      },
+    },
+    effect(execute: () => () => void, effectLabel: string) {
+      m.teardown = execute()
+    },
+  }
+  return m
+}
+
+test('M2 Issue#4: a cell timeout aborts and disposes the active one-shot child before the tool settles', async () => {
+  const m = makeLifecycleMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true, timeout: 1500 })
+  const tool = m.registered[0]
+  try {
+    const pending = tool.execute(
+      { code: 'x = await rlm_query("q")\nx' },
+      makeExec('sess-timeout-child'),
+    )
+    await until(() => m.starts.length === 1)
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof Error && /timeout/.test(err.message),
+    )
+    assert.equal(m.starts[0].run.signal.aborted, true, 'child signal must be aborted by the cell timeout')
+    assert.equal(m.starts[0].run.disposed, true, 'child must be disposed before the tool settles after a timeout')
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M2 Issue#4: plugin teardown aborts and disposes the active one-shot child before the tool settles', async () => {
+  const m = makeLifecycleMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true })
+  const tool = m.registered[0]
+  try {
+    const pending = tool.execute(
+      { code: 'x = await rlm_query("q")\nx' },
+      makeExec('sess-teardown-child'),
+    )
+    await until(() => m.starts.length === 1)
+    const unload = m.teardown! as unknown as () => Promise<void>
+    const barrier = unload()
+    assert.equal(barrier instanceof Promise, true, 'plugin unload must return an awaitable disposal barrier')
+    await barrier
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof Error && /cancel/.test(err.message),
+    )
+    assert.equal(m.starts[0].run.signal.aborted, true, 'child signal must be aborted by plugin teardown')
+    assert.equal(m.starts[0].run.disposed, true, 'child must be disposed before the tool settles after teardown')
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M2 Issue#4: a kernel protocol fault leaves no active one-shot child behind', async () => {
+  const m = makeLifecycleMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true, timeout: 8000 })
+  const tool = m.registered[0]
+  try {
+    const code = [
+      'import asyncio, sys',
+      'async def corrupt():',
+      '    sys.__stdout__.write("this is not json\\n")',
+      '    sys.__stdout__.flush()',
+      'asyncio.create_task(corrupt())',
+      'x = await rlm_query("q")',
+      'x',
+    ].join('\n')
+    await assert.rejects(
+      tool.execute({ code }, makeExec('sess-protocol-child')),
+      (err: unknown) => err instanceof Error && /protocol/.test(err.message),
+    )
+    await tick(10)
+    assert.ok(
+      m.starts.every((s) => s.run.disposed),
+      'a one-shot child survived the protocol fault (token leak)',
+    )
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M2 Issue#4: kernel exit aborts and disposes the active one-shot child', async () => {
+  const m = makeLifecycleMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true, timeout: 8000 })
+  const tool = m.registered[0]
+  try {
+    const code = [
+      'import asyncio, os',
+      'async def bye():',
+      '    await asyncio.sleep(0)',
+      '    os._exit(1)',
+      'asyncio.create_task(bye())',
+      'x = await rlm_query("q")',
+      'x',
+    ].join('\n')
+    const pending = tool.execute({ code }, makeExec('sess-exit-child'))
+    await until(() => m.starts.length === 1)
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof Error && /(closed|protocol|kernel exited)/.test(err.message),
+    )
+    assert.equal(m.starts[0].run.signal.aborted, true, 'child signal must be aborted by kernel exit')
+    assert.equal(m.starts[0].run.disposed, true, 'child must be disposed after kernel exit')
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M2 Issue#4: caller cancel disposes the active one-shot child before the tool settles', async () => {
+  const m = makeLifecycleMockCtx({ disposeAsync: true })
+  registerRlmPlugin(m.ctx, { enabled: true })
+  const tool = m.registered[0]
+  const ctl = new AbortController()
+  try {
+    const exec = { agent: { id: 'sess-cancel-child' }, signal: ctl.signal }
+    const pending = tool.execute({ code: 'x = await rlm_query("q")\nx' }, exec)
+    await until(() => m.starts.length === 1)
+    ctl.abort('user-cancel')
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof Error && /cancel/.test(err.message),
+    )
+    assert.equal(m.starts[0].run.signal.aborted, true, 'child signal must observe the caller cancel')
+    assert.equal(m.starts[0].run.disposed, true, 'child must be disposed before the tool settles after cancel')
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M2 Issue#4: a completed child with no visible text is a typed query error (kind=query phase=query)', async () => {
+  const m = makeLifecycleMockCtx({ autoResult: { output: [], stopReason: 'completed' } })
+  registerRlmPlugin(m.ctx, { enabled: true })
+  const tool = m.registered[0]
+  try {
+    await assert.rejects(
+      tool.execute(
+        { code: 'x = await rlm_query("q")\n"got:" + x' },
+        makeExec('sess-empty-text'),
+      ),
+      (err: unknown) => {
+        assert.ok(err instanceof Error, 'expected the tool call to fail')
+        assert.equal((err as { kind?: string }).kind, 'query', 'external query error must keep kind=query')
+        assert.equal((err as { phase?: string }).phase, 'query', 'external query error must keep phase=query')
+        assert.match(err.message, /no visible text/)
+        return true
+      },
+    )
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M2 Issue#4: a late background query result cannot wake a terminated cell or kill the reused kernel', async () => {
+  let bg: Deferred<string> | null = null
+  const runtime = rt({ timeout: 8000 })
+  try {
+    const seed = await runtime.eval('late-bg', { code: 'import os\nmarker = 1\npid = os.getpid()\npid', timeout: 8000 })
+    const pid = Number(seed.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + seed.result)
+    const pending = runtime.eval('late-bg', {
+      code: [
+        'import asyncio, sys',
+        'async def ghost():',
+        '    s = await rlm_query("bg")',
+        '    sys.__stdout__.write("GHOST:" + s)',
+        'asyncio.create_task(ghost())',
+        'a = await rlm_query("main")',
+        'a',
+      ].join('\n'),
+      timeout: 8000,
+      onQuery: async (prompt: string, signal?: AbortSignal) => {
+        if (prompt === 'bg') {
+          const d = new Deferred<string>()
+          bg = d
+          signal?.addEventListener('abort', () => d.reject(new Error('bg cancelled')), { once: true })
+          return d.promise
+        }
+        throw new Error('main fail')
+      },
+    })
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof RlmError && err.kind === 'query' && /main fail/.test(err.message),
+    )
+    // The background answer arrives only after the cell's terminal error.
+    bg?.resolve('LATE')
+    await tick(10)
+    const cont = await runtime.eval('late-bg', { code: 'marker + 1', timeout: 8000 })
+    assert.equal(cont.result, '2', 'late background query polluted the next cell')
+    const pidAgain = await runtime.eval('late-bg', { code: 'import os\nos.getpid()', timeout: 8000 })
+    assert.equal(pidAgain.result, String(pid), 'late background query killed the reused kernel')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#4: the kernel drops a late response for a terminated cell query instead of waking an orphan', async () => {
+  const k = new Kernel()
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-ghost-'))
+  const ghostFile = path.join(dir, 'ghost.txt')
+  try {
+    await ready(k)
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: [
+        'import asyncio',
+        'async def ghost():',
+        '    s = await rlm_query("bg")',
+        '    open(' + JSON.stringify(ghostFile) + ', "w").write("GHOST:" + s)',
+        'asyncio.create_task(ghost())',
+        'x = await rlm_query("main")',
+        'x',
+      ].join('\n'),
+    })
+    const q1 = await k.next()
+    assert.equal(q1.type, 'query')
+    const q2 = await k.next()
+    assert.equal(q2.type, 'query')
+    k.send({ type: 'error', id: k.id(q1), phase: 'query', kind: 'query_error', message: 'main boom' })
+    const e = await k.next()
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'query')
+    // Late answer for the terminated cell's background query: must be dropped.
+    k.send({ type: 'query_result', id: k.id(q2), text: 'LATE' })
+    // The next eval result is the deterministic synchronization point: FIFO on
+    // the kernel side guarantees the late frame was consumed before the next
+    // cell ran, so the ghost-file check below is not a timing race.
+    k.send({ type: 'eval', id: 2, code: 'marker = 1\n2 + 2' })
+    const r = await k.next()
+    assert.equal(r.type, 'result')
+    assert.equal(r.result, '4')
+    assert.ok(!existsSync(ghostFile), 'late response woke an orphan background query into the namespace')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+    await k.close()
+  }
+})
+
+test('M2 Issue#4: a concurrent eval during a fatal child-settlement window is rejected and the next eval is clean', async () => {
+  const runtime = rt({ timeout: 8000 })
+  const ctl = new AbortController()
+  try {
+    await runtime.eval('fatal-window', { code: 'import os\nmarker = 1\npid = os.getpid()\npid', timeout: 8000 })
+    let started = false
+    const gate = new Deferred<string>()
+    const pending = runtime.eval('fatal-window', {
+      code: 'x = await rlm_query("q")\nx',
+      timeout: 8000,
+      signal: ctl.signal,
+      onQuery: async (_prompt: string, signal?: AbortSignal) => {
+        started = true
+        signal?.addEventListener('abort', () => {
+          // Keep the cleanup barrier open for one macrotask so the settlement
+          // window is observable from the test.
+          setImmediate(() => gate.reject(new Error('child aborted')))
+        }, { once: true })
+        return gate.promise
+      },
+    })
+    await until(() => started)
+    ctl.abort('window-cancel')
+    // Attach the cell-rejection expectation before the window probe so an
+    // early rejection can never surface as an unhandled rejection that masks
+    // the real assertion below.
+    const pendingRejection = assert.rejects(
+      pending,
+      (err: unknown) => err instanceof RlmError && err.kind === 'cancel',
+    )
+    // The terminal transition ran synchronously (settling), but the child
+    // cleanup barrier is still open: a concurrent eval must NOT be admitted to
+    // a replacement kernel while the old child quiesces.
+    await assert.rejects(
+      runtime.eval('fatal-window', { code: '2 + 2', timeout: 8000 }),
+      (err: unknown) => err instanceof RlmError && (err.kind === 'closed' || err.kind === 'busy'),
+    )
+    await pendingRejection
+    // After quiescence the evicted session gets a clean namespace.
+    await assert.rejects(
+      runtime.eval('fatal-window', { code: 'marker', timeout: 8000 }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+    const clear = await runtime.eval('fatal-window', { code: '2 + 2', timeout: 8000 })
+    assert.equal(clear.result, '4')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#4: a concurrent eval during a live-kernel settlement window is rejected busy', async () => {
+  const runtime = rt({ timeout: 8000 })
+  try {
+    await runtime.eval('live-settle', { code: 'marker = 1', timeout: 8000 })
+    let mainStarted = false
+    let bgStarted = false
+    let bgAborted = false
+    let settleBg: (() => void) | null = null
+    const mainGate = new Deferred<string>()
+    const pending = runtime.eval('live-settle', {
+      code: [
+        'import asyncio',
+        'async def bg():',
+        '    await rlm_query("bg")',
+        'asyncio.create_task(bg())',
+        'x = await rlm_query("main")',
+        'x',
+      ].join('\n'),
+      timeout: 8000,
+      onQuery: async (prompt: string, signal?: AbortSignal) => {
+        if (prompt === 'main') {
+          mainStarted = true
+          return mainGate.promise
+        }
+        bgStarted = true
+        return new Promise<string>((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            bgAborted = true
+            // Hold the settlement window open until the test releases it.
+            settleBg = () => reject(new Error('bg released'))
+          }, { once: true })
+        })
+      },
+    })
+    await until(() => mainStarted && bgStarted)
+    mainGate.reject(new Error('main fail'))
+    // The cell error frame starts the live-kernel settlement with an open child
+    // barrier; the window is observable via bgAborted.
+    await until(() => bgAborted)
+    await assert.rejects(
+      runtime.eval('live-settle', { code: '2 + 2', timeout: 8000 }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'busy',
+    )
+    settleBg?.()
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof RlmError && err.kind === 'query' && /main fail/.test(err.message),
+    )
+    const cont = await runtime.eval('live-settle', { code: 'marker + 1', timeout: 8000 })
+    assert.equal(cont.result, '2', 'the live kernel must keep its globals after the settlement window')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+
+
+test('M2 Issue#4: reasoning-only output is a typed query error while whitespace text stays valid', async () => {
+  const m1 = makeLifecycleMockCtx({ autoResult: { output: [{ type: 'reasoning', text: 'thinking' }], stopReason: 'completed' } })
+  registerRlmPlugin(m1.ctx, { enabled: true })
+  try {
+    await assert.rejects(
+      m1.registered[0].execute({ code: 'x = await rlm_query("q")\nx' }, makeExec('sess-reason-only')),
+      (err: unknown) => {
+        assert.ok(err instanceof Error)
+        assert.equal((err as { kind?: string }).kind, 'query')
+        assert.match(err.message, /no visible text/)
+        return true
+      },
+    )
+  } finally {
+    m1.teardown?.()
+  }
+  const m2 = makeLifecycleMockCtx({ autoResult: { output: [{ type: 'text', text: '   ' }], stopReason: 'completed' } })
+  registerRlmPlugin(m2.ctx, { enabled: true })
+  try {
+    const out = await m2.registered[0].execute(
+      { code: 'x = await rlm_query("q")\n"got:" + x' },
+      makeExec('sess-ws-text'),
+    )
+    assert.equal(out.result, 'got:   ', 'pure whitespace text remains ordinary visible text')
+  } finally {
+    m2.teardown?.()
+  }
+})
+
+test('M2 Issue#4: a detached task from a retired cell cannot open a query into a later cell', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    // Cell 1 creates a detached task that only calls rlm_query AFTER cell 2
+    // starts; ownership is fixed at create_task time (task-local token), so the
+    // retired-cell token must reject the query without ever emitting a frame.
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: [
+        'import asyncio',
+        'async def late():',
+        '    await asyncio.sleep(0.01)',
+        '    try:',
+        '        return await rlm_query("late")',
+        '    except Exception:',
+        '        return "retired"',
+        'asyncio.create_task(late())',
+        '"cell1"',
+      ].join('\n'),
+    })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    assert.equal(r1.result, 'cell1')
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: 'await asyncio.sleep(0.05)\n"cell2"',
+    })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result', 'the retired task must not emit a query frame into cell 2')
+    assert.equal(r2.result, 'cell2')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M2 Issue#4: unknown, future, duplicate, and non-integer reply ids stay fatal protocol faults', async () => {
+  const cases: { label: string; act: (k: Kernel) => Promise<void> | void }[] = [
+    {
+      label: 'non-integer string id',
+      act: (k) => {
+        k.send({ type: 'query_result', id: 'x', text: 'y' })
+      },
+    },
+    {
+      label: 'boolean id',
+      act: (k) => {
+        k.send({ type: 'query_result', id: true, text: 'y' })
+      },
+    },
+    {
+      label: 'unknown id',
+      act: (k) => {
+        k.send({ type: 'query_result', id: 999, text: 'y' })
+      },
+    },
+    {
+      label: 'future id',
+      act: async (k) => {
+        k.send({ type: 'eval', id: 1, code: 'x = await rlm_query("q")\nx' })
+        const q = await k.next()
+        assert.equal(q.type, 'query')
+        k.send({ type: 'query_result', id: k.id(q) + 5, text: 'future' })
+      },
+    },
+    {
+      label: 'duplicate id of a retired cell',
+      act: async (k) => {
+        k.send({ type: 'eval', id: 1, code: 'x = await rlm_query("q")\nx' })
+        const q = await k.next()
+        assert.equal(q.type, 'query')
+        k.send({ type: 'query_result', id: k.id(q), text: 'ok' })
+        const r = await k.next()
+        assert.equal(r.type, 'result')
+        // The cell is retired now; a second response for the same qid is still
+        // a protocol fault (duplicate), never a silent drop.
+        k.send({ type: 'query_result', id: k.id(q), text: 'dup' })
+      },
+    },
+  ]
+  for (const c of cases) {
+    const k = new Kernel()
+    try {
+      await ready(k)
+      await c.act(k)
+      const code = await Promise.race([
+        k.exit,
+        new Promise<number>((_, reject) =>
+          setTimeout(() => reject(new Error('kernel did not fatal for ' + c.label)), 5000),
+        ),
+      ])
+      assert.notEqual(code, 0, c.label + ' must terminate the kernel')
+      assert.match(k.stderr, /(query id|response|duplicate|non-integer)/i)
+    } finally {
+      try {
+        k.child.kill()
+      } catch {
+        // already dead
+      }
+      await k.exit.catch(() => {})
+    }
+  }
+})
+
+test('M2 Issue#4: a caught main query error keeps the cell active and a queued sibling reply still applies', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: [
+        'import asyncio',
+        'async def bg():',
+        '    return await rlm_query("bg")',
+        'task = asyncio.create_task(bg())',
+        'try:',
+        '    x = await rlm_query("main")',
+        'except Exception:',
+        '    x = "caught"',
+        'await asyncio.sleep(0.02)',
+        'x + "-" + task.result()',
+      ].join('\n'),
+    })
+    const qMain = await k.next()
+    assert.equal(qMain.type, 'query')
+    const qBg = await k.next()
+    assert.equal(qBg.type, 'query')
+    // The main query fails; the user cell catches it. The sibling background
+    // query is a legitimate response of the still-active cell and must apply.
+    k.send({ type: 'error', id: k.id(qMain), phase: 'query', kind: 'query_error', message: 'main boom' })
+    k.send({ type: 'query_result', id: k.id(qBg), text: 'TEXT' })
+    const r = await k.next()
+    assert.equal(r.type, 'result', 'a caught query error must not retire the cell or cancel sibling queries')
+    assert.equal(r.result, 'caught-TEXT')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M2 Issue#4: after a caught first query error the same cell can issue and complete a second query', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: [
+        'try:',
+        '    first = await rlm_query("first")',
+        'except Exception:',
+        '    first = "caught"',
+        'second = await rlm_query("second")',
+        'second',
+      ].join('\n'),
+    })
+    const q1 = await k.next()
+    assert.equal(q1.type, 'query')
+    assert.equal(q1.prompt, 'first')
+    // The cell catches the first query error and proceeds: the kernel MUST
+    // still emit the second query of the same cell (no eager retirement).
+    k.send({ type: 'error', id: k.id(q1), phase: 'query', kind: 'query_error', message: 'first boom' })
+    const q2 = await k.next()
+    assert.equal(q2.type, 'query', 'the kernel must continue after a caught query error')
+    assert.equal(q2.prompt, 'second')
+    k.send({ type: 'query_result', id: k.id(q2), text: 'TWO' })
+    const r = await k.next()
+    assert.equal(r.type, 'result')
+    assert.equal(r.result, 'TWO')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M2 Issue#4: a duplicate response for a qid answered two cells earlier still fatals', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    // Cell 1: one query answered normally; the cell ends.
+    k.send({ type: 'eval', id: 1, code: 'x = await rlm_query("q")\nx' })
+    const q = await k.next()
+    assert.equal(q.type, 'query')
+    const qid = k.id(q)
+    k.send({ type: 'query_result', id: qid, text: 'ok' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    // Two more cells, so the answered qid is outside any current/previous
+    // answered-id rotation window.
+    k.send({ type: 'eval', id: 2, code: '1 + 1' })
+    const r2 = await k.next()
+    assert.equal(r2.result, '2')
+    k.send({ type: 'eval', id: 3, code: '2 + 2' })
+    const r3 = await k.next()
+    assert.equal(r3.result, '4')
+    // The duplicate for the two-cells-old answered qid must still be fatal.
+    k.send({ type: 'query_result', id: qid, text: 'dup' })
+    const code = await Promise.race([
+      k.exit,
+      new Promise<number>((_, reject) =>
+        setTimeout(() => reject(new Error('kernel did not fatal on an old duplicate qid')), 5000),
+      ),
+    ])
+    assert.notEqual(code, 0, 'a two-cells-old duplicate response must terminate the kernel')
+    assert.match(k.stderr, /(duplicate|query id|response)/i)
+  } finally {
+    try {
+      k.child.kill()
+    } catch {
+      // already dead
+    }
+    await k.exit.catch(() => {})
+  }
+})
+
+test('M2 Issue#4: a second late reply for a retired unanswered query fatals after the first was dropped', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: [
+        'import asyncio',
+        'async def bg():',
+        '    return await rlm_query("bg")',
+        'asyncio.create_task(bg())',
+        'x = await rlm_query("main")',
+        'x',
+      ].join('\n'),
+    })
+    const qMain = await k.next()
+    assert.equal(qMain.type, 'query')
+    const qBg = await k.next()
+    assert.equal(qBg.type, 'query')
+    // The main query fails -> the cell reaches its terminal; the bg query was
+    // never answered (retired-unanswered).
+    k.send({ type: 'error', id: k.id(qMain), phase: 'query', kind: 'query_error', message: 'boom' })
+    const e = await k.next()
+    assert.equal(e.type, 'error')
+    // A live cell proves the kernel survived the terminal.
+    k.send({ type: 'eval', id: 2, code: '1 + 1' })
+    const r2 = await k.next()
+    assert.equal(r2.result, '2')
+    // First late reply for the retired-unanswered qid: correctly dropped.
+    k.send({ type: 'query_result', id: k.id(qBg), text: 'LATE1' })
+    k.send({ type: 'eval', id: 3, code: '2 + 2' })
+    const r3 = await k.next()
+    assert.equal(r3.result, '4', 'first late reply must be dropped without affecting the kernel')
+    // The second identical reply is a duplicate and must be fatal.
+    k.send({ type: 'query_result', id: k.id(qBg), text: 'LATE2' })
+    const code = await Promise.race([
+      k.exit,
+      new Promise<number>((_, reject) =>
+        setTimeout(() => reject(new Error('kernel did not fatal on a second late reply')), 5000),
+      ),
+    ])
+    assert.notEqual(code, 0, 'a second late reply for the same retired qid must terminate the kernel')
+    assert.match(k.stderr, /(duplicate|query id|response)/i)
+  } finally {
+    try {
+      k.child.kill()
+    } catch {
+      // already dead
+    }
+    await k.exit.catch(() => {})
   }
 })
