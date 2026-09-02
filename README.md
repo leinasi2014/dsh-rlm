@@ -120,10 +120,21 @@ RLM_LIVE_SMOKE=1 DSH_HOME=/path/to/configured/dsh-home \
   node --test tests/profile-smoke.test.ts
 ```
 
-Never point the live smoke at an unverified or user-owned target. It creates and
-removes an isolated temporary DSH home, but it copies the complete `settings.yaml`
-and, when present, the complete `.credentials.yaml` from the supplied `DSH_HOME`.
-Those temporary files and Session logs must never be committed or uploaded.
+Never point the live smoke at an unverified or user-owned target. It creates
+and removes an isolated temporary DSH home. The complete `settings.yaml` and,
+when present, the complete `.credentials.yaml` are copied byte-for-byte from
+the supplied `DSH_HOME`; in the disposable copy only, the top-level
+`agent-default-model` block is deterministically rewritten to provider
+`vllm` and model `DeepSeek-V4-Flash-Vision-Exp`, so the isolated run
+exercises the explicit vLLM/PTC route instead of the ambient default. Override
+with `RLM_LIVE_PROVIDER` and `RLM_LIVE_MODEL` if needed. For an external
+worktree, point the test at the authoritative harness checkout with
+`RLM_DSH_REPO_ROOT` (resolved to an absolute path); without it the in-tree
+three-level default is used, and the test fails fast with a bounded non-secret
+message when `apps/cli/src/bin.ts` is missing there. Ambient settings and
+credentials are never rewritten and are asserted byte-unchanged after the run.
+Those disposable temporary files and Session logs must never be committed or
+uploaded.
 
 ## Install into a DSH Profile
 

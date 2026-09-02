@@ -277,6 +277,14 @@ V1 通过一个 `Config` schema（`src/runtime.ts` 中的 `ConfigSchema`，由�
 5. Agent 根据修订结果输出最终答案；
 6. Session log 中能看到两次工具调用及其有界结果。
 
+被门禁的 clean-Profile smoke 只在可弃置副本上钉住显式模型路由：读取 ambient
+`settings.yaml` 字节，在副本文本中把顶层 `agent-default-model` 块改写为
+provider `vllm`、model `DeepSeek-V4-Flash-Vision-Exp`（可用
+`RLM_LIVE_PROVIDER` / `RLM_LIVE_MODEL` 覆盖），原样复制 `.credentials.yaml`，
+并在运行后断言两个 ambient 文件逐字节未变。ambient DSH settings 从不被改写。
+可选的 `RLM_DSH_REPO_ROOT` 覆盖用于外部 worktree 定位 harness checkout；
+smoke 在启动前会校验该根下的 `apps/cli/src/bin.ts` 存在。
+
 只有这条路径通过，才能宣称 RLM 闭环和自我迭代闭环成立。
 
 后续能力及其触发条件见 [后续扩展架构](future-extensions.zh-CN.md)，交付顺序和退出

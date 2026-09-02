@@ -311,6 +311,16 @@ In a real DSH Profile:
 5. the Agent returns the final answer;
 6. the official Session log contains both bounded tool calls and results.
 
+The gated clean-Profile smoke pins the explicit model route on the disposable
+copy only: it reads the ambient `settings.yaml` bytes, rewrites the top-level
+`agent-default-model` block in the copied text to provider `vllm` and model
+`DeepSeek-V4-Flash-Vision-Exp` (overridable via `RLM_LIVE_PROVIDER` /
+`RLM_LIVE_MODEL`), copies `.credentials.yaml` exactly, and asserts both ambient
+files are byte-unchanged afterwards. Ambient DSH settings are never rewritten.
+An optional `RLM_DSH_REPO_ROOT` override locates the harness checkout for
+external worktrees; the smoke validates `apps/cli/src/bin.ts` there before
+launching.
+
 Only this result proves the RLM and self-iteration loop. See
 [Future extensions](future-extensions.md) for evidence-triggered additions and
 [Milestones](milestones.md) for delivery order and exit criteria.
