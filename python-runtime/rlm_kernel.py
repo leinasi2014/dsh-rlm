@@ -179,10 +179,11 @@ class RlmKernel:
         self.cell_ceiling = 1
         self.cell_done = False
         self._current_owner: Optional[_CellOwner] = None
-        # Query ids already answered in the current (and immediately previous)
-        # cell: a second response for one of them is a duplicate and fatal.
-        self.answered_ids: set[int] = set()
-        self.retired_answered_ids: set[int] = set()
+        # Every response qid observed over the kernel lifetime: either applied
+        # (active delivery) or dropped exactly once (the first late reply of a
+        # retired cell). Any second observation of the same qid is a duplicate
+        # and fatal, no matter how many cells have passed since.
+        self.seen_response_ids: set[int] = set()
         self.query_truncated = False
         self.failed: Optional[str] = None
         # The pipe stream frames go to even while sys.stdout is swapped to a
@@ -368,21 +369,24 @@ class RlmKernel:
         """
         entry = self.pending.pop(qid, None)
         if entry is None:
-            if qid in self.answered_ids or qid in self.retired_answered_ids:
+            if qid in self.seen_response_ids:
                 self._fatal("duplicate response for query id " + repr(qid))
                 return
             if self._is_retired_qid(qid):
-                # A first (late) response for a provably retired query: drop.
+                # First (late) response for a provably retired query: record
+                # and drop it; any later identical reply is a duplicate.
+                self.seen_response_ids.add(qid)
                 return
             self._fatal("response for unknown query id " + repr(qid))
             return
         future, owner = entry
         if owner is not self._current_owner or owner.done or future.cancelled():
             # The query belongs to a retired owner or was cancelled by the
-            # cell terminal: drop it, never wake the orphan continuation.
+            # cell terminal: record and drop it, never wake the orphan.
+            self.seen_response_ids.add(qid)
             return
         future.set_result((text, truncated))
-        self.answered_ids.add(qid)
+        self.seen_response_ids.add(qid)
 
     def _deliver_query_error(
         self, qid: int, message: str, detail: Any, truncated: bool
@@ -390,18 +394,22 @@ class RlmKernel:
         """Apply one `error` response on the event loop, after any retirement."""
         entry = self.pending.pop(qid, None)
         if entry is None:
-            if qid in self.answered_ids or qid in self.retired_answered_ids:
+            if qid in self.seen_response_ids:
                 self._fatal("duplicate response for query id " + repr(qid))
                 return
             if self._is_retired_qid(qid):
+                # First (late) response for a provably retired query: record
+                # and drop it; any later identical reply is a duplicate.
+                self.seen_response_ids.add(qid)
                 return
             self._fatal("response for unknown query id " + repr(qid))
             return
         future, owner = entry
         if owner is not self._current_owner or owner.done or future.cancelled():
+            self.seen_response_ids.add(qid)
             return
         future.set_exception(RlmQueryError(message, detail, truncated))
-        self.answered_ids.add(qid)
+        self.seen_response_ids.add(qid)
 
     def _end_cell(self) -> None:
         """A cell reached its terminal frame: no query of it may continue.
@@ -552,8 +560,6 @@ class RlmKernel:
         self.cell_floor = self.next_query_id
         self.cell_ceiling = self.next_query_id
         self.cell_done = False
-        self.retired_answered_ids = self.answered_ids
-        self.answered_ids = set()
         for qid, (future, qowner) in list(self.pending.items()):
             if qowner is not owner:
                 del self.pending[qid]

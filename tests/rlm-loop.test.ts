@@ -2772,3 +2772,97 @@ test('M2 Issue#4: after a caught first query error the same cell can issue and c
     await k.close()
   }
 })
+
+test('M2 Issue#4: a duplicate response for a qid answered two cells earlier still fatals', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    // Cell 1: one query answered normally; the cell ends.
+    k.send({ type: 'eval', id: 1, code: 'x = await rlm_query("q")\nx' })
+    const q = await k.next()
+    assert.equal(q.type, 'query')
+    const qid = k.id(q)
+    k.send({ type: 'query_result', id: qid, text: 'ok' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    // Two more cells, so the answered qid is outside any current/previous
+    // answered-id rotation window.
+    k.send({ type: 'eval', id: 2, code: '1 + 1' })
+    const r2 = await k.next()
+    assert.equal(r2.result, '2')
+    k.send({ type: 'eval', id: 3, code: '2 + 2' })
+    const r3 = await k.next()
+    assert.equal(r3.result, '4')
+    // The duplicate for the two-cells-old answered qid must still be fatal.
+    k.send({ type: 'query_result', id: qid, text: 'dup' })
+    const code = await Promise.race([
+      k.exit,
+      new Promise<number>((_, reject) =>
+        setTimeout(() => reject(new Error('kernel did not fatal on an old duplicate qid')), 5000),
+      ),
+    ])
+    assert.notEqual(code, 0, 'a two-cells-old duplicate response must terminate the kernel')
+    assert.match(k.stderr, /(duplicate|query id|response)/i)
+  } finally {
+    try {
+      k.child.kill()
+    } catch {
+      // already dead
+    }
+    await k.exit.catch(() => {})
+  }
+})
+
+test('M2 Issue#4: a second late reply for a retired unanswered query fatals after the first was dropped', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: [
+        'import asyncio',
+        'async def bg():',
+        '    return await rlm_query("bg")',
+        'asyncio.create_task(bg())',
+        'x = await rlm_query("main")',
+        'x',
+      ].join('\n'),
+    })
+    const qMain = await k.next()
+    assert.equal(qMain.type, 'query')
+    const qBg = await k.next()
+    assert.equal(qBg.type, 'query')
+    // The main query fails -> the cell reaches its terminal; the bg query was
+    // never answered (retired-unanswered).
+    k.send({ type: 'error', id: k.id(qMain), phase: 'query', kind: 'query_error', message: 'boom' })
+    const e = await k.next()
+    assert.equal(e.type, 'error')
+    // A live cell proves the kernel survived the terminal.
+    k.send({ type: 'eval', id: 2, code: '1 + 1' })
+    const r2 = await k.next()
+    assert.equal(r2.result, '2')
+    // First late reply for the retired-unanswered qid: correctly dropped.
+    k.send({ type: 'query_result', id: k.id(qBg), text: 'LATE1' })
+    k.send({ type: 'eval', id: 3, code: '2 + 2' })
+    const r3 = await k.next()
+    assert.equal(r3.result, '4', 'first late reply must be dropped without affecting the kernel')
+    // The second identical reply is a duplicate and must be fatal.
+    k.send({ type: 'query_result', id: k.id(qBg), text: 'LATE2' })
+    const code = await Promise.race([
+      k.exit,
+      new Promise<number>((_, reject) =>
+        setTimeout(() => reject(new Error('kernel did not fatal on a second late reply')), 5000),
+      ),
+    ])
+    assert.notEqual(code, 0, 'a second late reply for the same retired qid must terminate the kernel')
+    assert.match(k.stderr, /(duplicate|query id|response)/i)
+  } finally {
+    try {
+      k.child.kill()
+    } catch {
+      // already dead
+    }
+    await k.exit.catch(() => {})
+  }
+})
