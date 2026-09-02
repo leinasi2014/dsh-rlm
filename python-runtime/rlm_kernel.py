@@ -26,6 +26,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import builtins
+import contextvars
 import inspect
 import json
 import os
@@ -41,6 +42,33 @@ MAX_QUERY_TEXT = 64 * 1024
 MAX_FRAME_BYTES = 256 * 1024
 MAX_ERROR_TEXT = 64 * 1024
 CELL_FILENAME = "<rlm-cell>"
+
+
+class _CellOwner:
+    """Immutable ownership token for one cell epoch (task-local Issue #4).
+
+    The token is created at the start of `_on_eval` and copied into every
+    `asyncio.create_task` by the event loop context mechanism, so ownership is
+    fixed at creation time. A detached task from an earlier cell keeps this
+    token even when it resumes during a later cell, and `_rlm_query` refuses
+    to open a query from a retired token.
+    """
+
+    __slots__ = ("generation", "done")
+
+    def __init__(self, generation: int) -> None:
+        self.generation = generation
+        self.done = False
+
+    def retire(self) -> None:
+        self.done = True
+
+
+# Task-local current-cell ownership. asyncio.Tasks copy the running context at
+# creation time, so `create_task` inside a cell inherits that cell's owner.
+_current_cell: contextvars.ContextVar[Optional[_CellOwner]] = contextvars.ContextVar(
+    "rlm_current_cell", default=None
+)
 
 
 class RlmQueryError(Exception):
@@ -138,8 +166,23 @@ class RlmKernel:
         }
         self.loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
         self.queue: "asyncio.Queue[Optional[dict[str, Any]]]" = asyncio.Queue()
-        self.pending: dict[int, asyncio.Future] = {}
+        self.pending: dict[int, tuple[asyncio.Future, _CellOwner]] = {}
         self.next_query_id = 1
+        # Cell lifecycle state (Issue #4): query ids are monotonic and cells
+        # run strictly one at a time. On every cell terminal the kernel cancels
+        # all still-pending queries of that cell, so any response for an id
+        # below the current cell's floor is a provably retired-cell response
+        # and may be dropped; unknown, future, or duplicate ids stay fatal
+        # protocol faults (Issue #1 contract).
+        self.cell_generation = 0
+        self.cell_floor = 1
+        self.cell_ceiling = 1
+        self.cell_done = False
+        self._current_owner: Optional[_CellOwner] = None
+        # Query ids already answered in the current (and immediately previous)
+        # cell: a second response for one of them is a duplicate and fatal.
+        self.answered_ids: set[int] = set()
+        self.retired_answered_ids: set[int] = set()
         self.query_truncated = False
         self.failed: Optional[str] = None
         # The pipe stream frames go to even while sys.stdout is swapped to a
@@ -236,7 +279,7 @@ class RlmKernel:
             if not line:
                 # stdin closed cleanly between frames: release any pending query
                 # so the loop can wind down.
-                for future in list(self.pending.values()):
+                for future, _generation in list(self.pending.values()):
                     self.loop.call_soon_threadsafe(
                         future.set_exception,
                         RlmQueryError("kernel: host closed the pipe"),
@@ -273,36 +316,130 @@ class RlmKernel:
                 self.loop.call_soon_threadsafe(self.queue.put_nowait, frame)
             elif kind in ("query_result", "error"):
                 qid = frame.get("id")
-                future = self.pending.pop(qid, None)
-                if future is None:
-                    self._fatal("response for unknown query id " + repr(qid))
+                if isinstance(qid, bool) or not isinstance(qid, int):
+                    self._fatal("response with non-integer query id " + repr(qid))
                     return
+                # Decide in the event-loop thread, never in the reader: the
+                # reader must not pop a reply before the loop can see its entry
+                # during a cell retirement, otherwise a queued set_result could
+                # race `_end_cell` (orphan wake / InvalidStateError).
                 if kind == "query_result":
                     text = str(frame.get("text", ""))
                     truncated = frame.get("truncated") is True
                     self.loop.call_soon_threadsafe(
-                        future.set_result, (text, truncated)
+                        self._deliver_query_result, qid, text, truncated
                     )
                 else:
                     message = str(frame.get("message", "rlm_query failed"))
                     detail = frame.get("detail")
                     truncated = frame.get("truncated") is True
                     self.loop.call_soon_threadsafe(
-                        future.set_exception,
-                        RlmQueryError(message, detail, truncated),
+                        self._deliver_query_error, qid, message, detail, truncated
                     )
             else:
                 self._fatal("unexpected message type: " + repr(kind))
                 return
 
+    def _is_retired_qid(self, qid: int) -> bool:
+        """True when `qid` was issued by a cell that already reached a terminal frame.
+
+        Query ids start at 1 and grow monotonically; cells run strictly one at
+        a time, and every cell terminal cancels (and later retires) all
+        still-pending queries of that cell. Therefore an id below the current
+        cell's floor was issued by a provably retired cell, and an id of the
+        current cell is retired once this cell is done. Unknown (never
+        issued) and future (>= next_query_id) ids are not retired and remain
+        fatal protocol faults (Issue #1 contract). Duplicates are handled by
+        the answered-id sets, not by this range check.
+        """
+        if qid < 1:
+            return False
+        if qid < self.cell_floor:
+            return True
+        return self.cell_done and qid < self.cell_ceiling
+
+    def _deliver_query_result(self, qid: int, text: str, truncated: bool) -> None:
+        """Apply one `query_result` on the event loop, after any retirement.
+
+        The owner token re-check covers the window where the reader already
+        scheduled this delivery but the loop has not run it yet when the cell
+        retires: the future is cancelled and the owner marked done, so the
+        delivery must drop instead of waking an orphan continuation.
+        """
+        entry = self.pending.pop(qid, None)
+        if entry is None:
+            if qid in self.answered_ids or qid in self.retired_answered_ids:
+                self._fatal("duplicate response for query id " + repr(qid))
+                return
+            if self._is_retired_qid(qid):
+                # A first (late) response for a provably retired query: drop.
+                return
+            self._fatal("response for unknown query id " + repr(qid))
+            return
+        future, owner = entry
+        if owner is not self._current_owner or owner.done or future.cancelled():
+            # The query belongs to a retired owner or was cancelled by the
+            # cell terminal: drop it, never wake the orphan continuation.
+            return
+        future.set_result((text, truncated))
+        self.answered_ids.add(qid)
+
+    def _deliver_query_error(
+        self, qid: int, message: str, detail: Any, truncated: bool
+    ) -> None:
+        """Apply one `error` response on the event loop, after any retirement."""
+        entry = self.pending.pop(qid, None)
+        if entry is None:
+            if qid in self.answered_ids or qid in self.retired_answered_ids:
+                self._fatal("duplicate response for query id " + repr(qid))
+                return
+            if self._is_retired_qid(qid):
+                return
+            self._fatal("response for unknown query id " + repr(qid))
+            return
+        future, owner = entry
+        if owner is not self._current_owner or owner.done or future.cancelled():
+            return
+        future.set_exception(RlmQueryError(message, detail, truncated))
+        self.answered_ids.add(qid)
+
+    def _end_cell(self) -> None:
+        """A cell reached its terminal frame: no query of it may continue.
+
+        Retire the cell's owner token (so any detached task of this cell can
+        never open a query again) and cancel every still-pending query issued
+        by this cell so a late host response can never wake an orphan
+        continuation into the next cell or into the raw protocol pipe.
+        """
+        self.cell_done = True
+        owner = self._current_owner
+        if owner is not None:
+            owner.retire()
+        for qid, (future, qowner) in list(self.pending.items()):
+            if qowner is owner and not future.done():
+                future.cancel()
+
     # ---- query bridge ----
 
     async def _rlm_query(self, prompt: Any) -> str:
+        # Ownership is fixed at creation time (task-local): only the current
+        # cell's owner token may open a query. A detached task from a retired
+        # cell must fail without ever sending a query frame, regardless of
+        # which cell is running now.
+        owner = _current_cell.get()
+        if (
+            owner is None
+            or owner.done
+            or owner.generation != self.cell_generation
+            or owner is not self._current_owner
+        ):
+            raise RlmQueryError("rlm_query called from a retired cell")
         prompt_str = str(prompt)
         if len(prompt_str.encode("utf-8", "backslashreplace")) > MAX_QUERY_TEXT:
             raise RlmQueryError("rlm_query prompt exceeds 64 KiB")
         qid = self.next_query_id
         self.next_query_id += 1
+        self.cell_ceiling = self.next_query_id
         query_frame = {"type": "query", "id": qid, "prompt": prompt_str}
         # A query frame that cannot fit the wire budget becomes a typed query
         # error for the cell instead of a silently broken protocol write.
@@ -310,7 +447,7 @@ class RlmKernel:
             raise RlmQueryError("rlm_query frame exceeds 256 KiB wire budget")
         loop = asyncio.get_running_loop()
         future: "asyncio.Future[tuple[str, bool]]" = loop.create_future()
-        self.pending[qid] = future
+        self.pending[qid] = (future, owner)
         self._send(query_frame)
         try:
             text, truncated = await future
@@ -385,7 +522,7 @@ class RlmKernel:
     async def _on_eval(self, frame: dict[str, Any]) -> None:
         eval_id = frame.get("id")
         code = frame.get("code")
-        if not isinstance(eval_id, int) or not isinstance(code, str):
+        if isinstance(eval_id, bool) or not isinstance(eval_id, int) or not isinstance(code, str):
             self._fatal("malformed eval frame: " + repr(frame))
             return
         max_stdout = frame.get("max_stdout", DEFAULT_MAX_STDOUT)
@@ -404,6 +541,22 @@ class RlmKernel:
         # Restore the official scaffold before every cell so a previous cell
         # that shadowed or deleted rlm_query cannot poison this one.
         self._restore_scaffold()
+        # Begin a new cell epoch (Issue #4): a fresh task-local owner token is
+        # published (create_task copies it automatically), old-token entries
+        # are dropped, and answered ids rotate so duplicates of the previous
+        # cell stay detectable (bounded memory).
+        self.cell_generation += 1
+        owner = _CellOwner(self.cell_generation)
+        self._current_owner = owner
+        _current_cell.set(owner)
+        self.cell_floor = self.next_query_id
+        self.cell_ceiling = self.next_query_id
+        self.cell_done = False
+        self.retired_answered_ids = self.answered_ids
+        self.answered_ids = set()
+        for qid, (future, qowner) in list(self.pending.items()):
+            if qowner is not owner:
+                del self.pending[qid]
 
         capture = _BoundedStdout(max_stdout)
         old_stdout = sys.stdout
@@ -412,11 +565,13 @@ class RlmKernel:
             try:
                 body_code, expr_code = self._compile_cell(code)
             except SyntaxError as e:
+                self._end_cell()
                 self._send(self._error_frame(eval_id, "eval", "syntax_error", e))
                 return
             except ValueError as e:
                 # Defensive: an AST/compile failure must fail the cell, never the
                 # whole kernel; report it as a typed error and keep serving eval.
+                self._end_cell()
                 self._send(self._error_frame(eval_id, "eval", "compile_error", e))
                 return
 
@@ -440,6 +595,7 @@ class RlmKernel:
                     rendered = self._format_result(value)
                     result, result_cut = self._cut(rendered, max_result)
         except RlmQueryError as e:
+            self._end_cell()
             self._send(
                 self._error_frame(
                     eval_id, "query", "query_error", e, name="RlmQueryError"
@@ -447,6 +603,7 @@ class RlmKernel:
             )
             return
         except BaseException as e:
+            self._end_cell()
             self._send(self._error_frame(eval_id, "eval", "runtime_error", e))
             return
         finally:
@@ -462,6 +619,7 @@ class RlmKernel:
         }
         if result is not None:
             frame_out["result"] = result
+        self._end_cell()
         self._send(frame_out)
 
     # ---- error helpers ----

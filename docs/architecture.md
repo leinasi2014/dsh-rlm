@@ -187,6 +187,46 @@ other Session kernels and globals remain intact.
   64 KiB budget. `PROTOCOL_VERSION` stays `1`; no protocol message, Service,
   or framework was added.
 
+### Query/child lifecycle (Issue #4)
+
+One `rlm_query` call owns exactly one one-shot Subagent for the lifetime of
+the cell that issued it:
+
+- Every cell creates its own `AbortController`; the child's request signal is
+  the merge of that controller with the caller's `exec.signal`. A timeout,
+  caller cancel, protocol fault, kernel exit, or plugin dispose aborts the
+  controller, so the provider cancels the child's remaining turn work.
+- A cell's tool Promise settles only after its in-flight child work settles:
+  every query task includes `run.dispose()` before it resolves, and terminal
+  paths wait for that cleanup barrier before rejecting or resolving the cell.
+  No one-shot child survives its cell's terminal frame.
+- Terminal transitions use an explicit `active -> settling -> settled` shape:
+  routing and child publication are blocked synchronously on the first terminal
+  edge (`evalCell` returns `busy` or `closed` while the barrier runs), and the
+  session-map eviction plus the public cell Promise settle happen only after
+  child quiescence — no next cell can slip through the settlement window.
+- Plugin unload returns an awaitable disposal barrier: `runtime.dispose()` is
+  terminal synchronously (later evals reject `closed`) and resolves after every
+  kernel's child cleanup barrier, so Cordis teardown can await real child
+  quiescence instead of fire-and-forget cancellation.
+- Late child outcomes never enter a later cell: the host drops any response
+  whose query no longer belongs to the current cell (the pending-cell identity
+  guard), and the Python kernel applies reply delivery on the event loop with
+  task-local cell-owner tokens (`contextvars`), so ownership is fixed when a
+  detached task is created and a retired cell's task can never open a query
+  into a later cell. A reply is applied while its cell is still active — even
+  when already queued before a terminal edge — and is dropped only once the
+  owner has actually retired (ids below the current monotonic floor, or ids of
+  the just-terminated cell); unknown, future, duplicate, and non-integer reply
+  ids remain fatal protocol faults (Issue #1 contract). The reader never pops
+  replies (delivery runs on the event loop and re-checks owner/future state),
+  so no reader/loop InvalidStateError race exists, and user code may still
+  catch a query error and keep the cell running with its sibling queries.
+- A query that resolves `completed` with no visible `text` block is a typed
+  `query` error (`phase='query'`), never an empty successful string.
+- Query failures keep `kind='query'` / `phase='query'` at the model-facing
+  tool boundary, alongside the Issue #3 bounded detail/truncation contract.
+
 ## 8. Minimal configuration
 
 V1 needs:

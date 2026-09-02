@@ -157,8 +157,14 @@ export interface RlmEvalInput {
   code: string
   /** Overrides the runtime's total timeout budget for this call (startup + cell). */
   timeout?: number
-  /** Resolves an rlm_query(prompt) issued by the active cell. */
-  onQuery?: (prompt: string) => Promise<string>
+  /**
+   * Resolves an rlm_query(prompt) issued by the active cell. The second
+   * argument is this cell's own cancellation signal: it merges the caller's
+   * `signal` with a per-cell AbortController, so every terminal transition of
+   * the cell (timeout, cancel, protocol fault, kernel exit, dispose) cancels
+   * and disposes the active one-shot child before the cell settles.
+   */
+  onQuery?: (prompt: string, signal: AbortSignal) => Promise<string>
   /**
    * Caller-owned cancellation. When it aborts, the owning session's kernel is
    * evicted and its process tree killed; the cell is rejected with
@@ -209,10 +215,14 @@ interface PendingEval {
   maxResult: number
   maxQueries: number
   timeout: number
-  onQuery: ((prompt: string) => Promise<string>) | undefined
+  onQuery: ((prompt: string, signal: AbortSignal) => Promise<string>) | undefined
   queries: number
   timer: ReturnType<typeof setTimeout> | undefined
   signal: AbortSignal | undefined
+  /** Per-cell cancel source: aborted by every terminal transition of this cell. */
+  controller: AbortController
+  /** In-flight one-shot child work of this cell (settles only after child dispose). */
+  childWorks: Promise<unknown>[]
   resolve: (out: RlmEvalOutput) => void
   reject: (err: RlmError) => void
 }
@@ -242,6 +252,13 @@ class Kernel {
   private rejectReady!: (err: RlmError) => void
   private readyDone = false
   private abortBound: { signal: AbortSignal; onAbort: () => void } | null = null
+  /** True once a terminal transition started; new evals are busy/closed until settled. */
+  private settling = false
+  /** The one in-flight terminal-transition completion (cleanup barrier + settle). */
+  private cellFinish: Promise<void> | null = null
+  /** True once the kernel was evicted from the session map (exactly once). */
+  private evicted = false
+  private disposedPromise: Promise<void> | undefined
   onExit: ((k: Kernel) => void) | null = null
 
   constructor(key: string, config: RlmRuntimeConfig) {
@@ -408,10 +425,16 @@ class Kernel {
       })
       return
     }
-    Promise.resolve()
-      .then(() => onQuery(String(frame.prompt ?? '')))
-      .then((text) => {
-        if (this.exited || this.disposed) return
+    // One cell-bound child task: it settles only after the child run is
+    // disposed (runQuery's finally), so every terminal path can use it as the
+    // cleanup barrier. If the cell is already terminal, never start child work.
+    const childWork: Promise<unknown> = Promise.resolve().then(() => {
+      if (this.exited || this.disposed || this.pending !== p) return undefined
+      return onQuery(String(frame.prompt ?? ''), this.childSignal(p))
+    })
+    p.childWorks.push(childWork)
+    void childWork.then((text) => {
+        if (text === undefined || this.exited || this.disposed || this.pending !== p) return
         const raw = String(text)
         // First the 64 KiB payload budget, then the real JSONL wire budget:
         // JSON.stringify inflates control characters sixfold, so a payload that
@@ -427,7 +450,7 @@ class Kernel {
         this.write(response)
       })
       .catch((err) => {
-        if (this.exited || this.disposed) return
+        if (this.exited || this.disposed || this.pending !== p) return
         try {
           // A rejection is untrusted: message/detail/detailed getters and
           // toString may throw, so every read goes through non-throwing
@@ -478,6 +501,59 @@ class Kernel {
       })
   }
 
+  /**
+   * Merge the caller's signal with the cell's own cancel source for one child.
+   */
+  private childSignal(p: PendingEval): AbortSignal {
+    const own = p.controller.signal
+    if (!p.signal) return own
+    return AbortSignal.any([own, p.signal])
+  }
+
+  /**
+   * Cleanup barrier for one cell: abort the cell's child cancel source, then
+   * wait for every in-flight child task to settle (each settles only after its
+   * one-shot run was disposed). Every terminal path settles a cell only after
+   * this barrier, so the tool Promise never resolves while a child still
+   * consumes tokens.
+   */
+  private async settleChild(p: PendingEval): Promise<void> {
+    p.controller.abort()
+    if (p.childWorks.length > 0) {
+      await Promise.allSettled(p.childWorks)
+    }
+  }
+
+  /** Evict from the session map exactly once, only after child quiescence. */
+  private evict(): void {
+    if (this.evicted) return
+    this.evicted = true
+    this.onExit?.(this)
+  }
+
+  /**
+   * Finish one cell terminal transition in the ordered shape
+   * active -> settling -> (child cleanup barrier) -> settle -> evict.
+   *
+   * `this.pending` is cleared (and `settling` set) synchronously by the caller,
+   * so routing and child publication are already blocked while this barrier
+   * runs; only the public Promise settle and the session-map eviction wait for
+   * child quiescence. The barrier never awaits a promise that contains this
+   * cell's own write/handleExit chain, so no self-await deadlock is possible.
+   */
+  private async finishCell(p: PendingEval, out?: RlmEvalOutput, err?: RlmError): Promise<void> {
+    try {
+      await this.settleChild(p)
+    } catch {
+      // A cleanup failure must never override the terminal taxonomy.
+    }
+    if (err !== undefined) p.reject(err)
+    else if (out !== undefined) p.resolve(out)
+    this.settling = false
+    this.cellFinish = null
+    if (this.exited) this.evict()
+  }
+
   private onResult(frame: Frame): void {
     const p = this.pending
     if (!p || frame.id !== p.id) {
@@ -487,12 +563,14 @@ class Kernel {
     this.clearTimer(p)
     this.detachAbort()
     this.pending = null
+    // Block routing now; the public settle waits for child quiescence.
+    this.settling = true
     const out: RlmEvalOutput = {
       stdout: String(frame.stdout ?? ''),
       truncated: frame.truncated === true,
     }
     if (typeof frame.result === 'string') out.result = frame.result
-    p.resolve(out)
+    if (!this.cellFinish) this.cellFinish = this.finishCell(p, out)
   }
 
   private onError(frame: Frame): void {
@@ -504,14 +582,18 @@ class Kernel {
     this.clearTimer(p)
     this.detachAbort()
     this.pending = null
+    // Block routing now; the public settle waits for child quiescence.
+    this.settling = true
     const phase = frame.phase === 'query' ? 'query' : 'eval'
     const kind = phase === 'query' ? 'query' : 'eval'
     const message = safeErrorText(frame.message ?? 'kernel reported an error')
-    p.reject(new RlmError(kind, message, {
-      phase,
-      detailed: safeDetailText(frame.detail),
-      truncated: frame.truncated === true,
-    }))
+    if (!this.cellFinish) {
+      this.cellFinish = this.finishCell(p, undefined, new RlmError(kind, message, {
+        phase,
+        detailed: safeDetailText(frame.detail),
+        truncated: frame.truncated === true,
+      }))
+    }
   }
 
   private clearTimer(p: PendingEval): void {
@@ -555,14 +637,15 @@ class Kernel {
     this.pending = null
     const err = new RlmError('cancel', message)
     this.exited = true
+    this.settling = true
     this.kill()
-    this.onExit?.(this)
-    p.reject(err)
+    if (!this.cellFinish) this.cellFinish = this.finishCell(p, undefined, err)
   }
 
   private handleExit(err: RlmError): void {
     if (this.exited) return
     this.exited = true
+    this.settling = true
     if (!this.readyDone) {
       this.readyDone = true
       this.rejectReady(err)
@@ -572,13 +655,15 @@ class Kernel {
       this.clearTimer(p)
       this.detachAbort()
       this.pending = null
-      p.reject(err)
+      // Kill immediately (fatal), but defer eviction and the public settle
+      // until the child cleanup barrier completes.
+      this.kill()
+      if (!this.cellFinish) this.cellFinish = this.finishCell(p, undefined, err)
+      return
     }
-    // Every terminal transition (protocol fault, timeout, cancel, dispose,
-    // spawn error, child close) must kill the owning process tree before the
-    // kernel is evicted, or the runtime loses its only handle to the PID.
     this.kill()
-    this.onExit?.(this)
+    if (this.cellFinish) return
+    this.evict()
   }
 
   /**
@@ -638,6 +723,9 @@ class Kernel {
     if (this.exited || this.disposed) {
       throw new RlmError('closed', 'kernel is not running')
     }
+    if (this.settling) {
+      throw new RlmError('busy', 'a cell is still settling on this kernel')
+    }
     if (this.pending) {
       throw new RlmError('busy', 'a cell is already running on this kernel')
     }
@@ -677,6 +765,8 @@ class Kernel {
       queries: 0,
       timer: undefined,
       signal: input.signal,
+      controller: new AbortController(),
+      childWorks: [],
       resolve,
       reject,
     }
@@ -688,9 +778,9 @@ class Kernel {
       this.pending = null
       const err = new RlmError('timeout', 'cell timed out after ' + timeout + 'ms')
       this.exited = true
+      this.settling = true
       this.kill()
-      this.onExit?.(this)
-      reject(err)
+      if (!this.cellFinish) this.cellFinish = this.finishCell(p, undefined, err)
     }, timeout)
     this.attachAbort(p)
     // A signal that was already aborted cancels the cell synchronously above;
@@ -827,10 +917,13 @@ class Kernel {
     })
   }
 
-  dispose(): void {
-    if (this.disposed) return
+  dispose(): Promise<void> {
+    if (this.disposedPromise) return this.disposedPromise
+    // Terminal state is set synchronously so no eval can enter after unload;
+    // the awaitable barrier resolves only after the child cleanup barrier.
     this.disposed = true
     this.exited = true
+    this.settling = true
     // A dispose during the ready handshake must settle the waiting eval; the
     // startup waiters share the ready promise, so rejecting it unblocks them.
     if (!this.readyDone) {
@@ -842,10 +935,12 @@ class Kernel {
       this.clearTimer(p)
       this.detachAbort()
       this.pending = null
-      p.reject(new RlmError('cancel', 'runtime disposed while a cell was running'))
     }
     this.kill()
-    this.onExit?.(this)
+    this.disposedPromise = p && !this.cellFinish
+      ? this.finishCell(p, undefined, new RlmError('cancel', 'runtime disposed while a cell was running'))
+      : (this.cellFinish ?? Promise.resolve().then(() => this.evict()))
+    return this.disposedPromise
   }
 }
 
@@ -855,14 +950,20 @@ export interface RlmRuntime {
    * one already exists and starting a fresh process on its first use.
    */
   eval(sessionKey: string, input: RlmEvalInput): Promise<RlmEvalOutput>
-  /** Terminate every owned Python process and release all session kernels. */
-  dispose(): void
+  /**
+   * Terminate every owned Python process and release all session kernels.
+   * Terminal state is set synchronously (later evals reject `closed`); the
+   * returned barrier resolves after every kernel's child cleanup barrier, so
+   * a plugin unload can await full quiescence.
+   */
+  dispose(): Promise<void>
 }
 
 class RlmRuntimeImpl implements RlmRuntime {
   private kernels = new Map<string, Kernel>()
   private config: RlmRuntimeConfig
   private disposed = false
+  private disposePromise: Promise<void> | undefined
   constructor(config: RlmRuntimeConfig) {
     this.config = config
   }
@@ -897,11 +998,16 @@ class RlmRuntimeImpl implements RlmRuntime {
     return kernel.evalCell(input, deadline)
   }
 
-  dispose(): void {
-    if (this.disposed) return
+  dispose(): Promise<void> {
+    if (this.disposePromise) return this.disposePromise
+    // Synchronously terminal: new evals reject immediately, even while the
+    // child cleanup barriers still run.
     this.disposed = true
-    for (const kernel of this.kernels.values()) kernel.dispose()
-    this.kernels.clear()
+    const kernels = [...this.kernels.values()]
+    this.disposePromise = Promise.all(kernels.map((kernel) => kernel.dispose())).then(() => {
+      this.kernels.clear()
+    })
+    return this.disposePromise
   }
 }
 
@@ -960,7 +1066,11 @@ async function runQuery(
       const suffix = text.length === 0 ? '' : ` (partial: ${text})`
       throw new Error(`rlm_query subagent ended with stop reason "${result.stopReason}"${suffix}`)
     }
-    return textOf(result.output)
+    const text = textOf(result.output)
+    if (text.length === 0) {
+      throw new RlmError('query', 'rlm_query produced no visible text', { phase: 'query' })
+    }
+    return text
   } finally {
     await run.dispose()
   }
@@ -1033,13 +1143,19 @@ export function registerRlmPlugin(
         output = await runtime.eval(sessionKey, {
           code: args.code,
           signal: exec.signal,
-          onQuery: async (prompt: string) => runQuery(ctx, provider, parent, prompt, exec.signal),
+          onQuery: async (prompt: string, cellSignal: AbortSignal) =>
+            runQuery(ctx, provider, parent, prompt, cellSignal),
         })
       } catch (error) {
         // Surface the typed runtime error as a normal tool failure so the model
         // sees a useful, bounded message (the registry marks the call isError).
         if (error instanceof RlmError) {
-          throw new Error(formatToolError(error))
+          const toolError = new Error(formatToolError(error))
+          // Keep the typed taxonomy visible on the model-facing tool failure:
+          // query-phase failures must remain kind=query / phase=query, not only
+          // a message prefix, per the Issue #4 contract.
+          Object.assign(toolError, { kind: error.kind, phase: error.phase })
+          throw toolError
         }
         throw error
       }
@@ -1053,6 +1169,6 @@ export function registerRlmPlugin(
   // unloads, so no plugin-owned Python process survives the plugin.
   ctx.effect(() => () => {
     disposeTool()
-    runtime.dispose()
+    return runtime.dispose()
   }, 'rlm runtime teardown')
 }

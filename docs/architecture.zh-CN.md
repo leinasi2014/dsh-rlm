@@ -174,6 +174,39 @@ V1 不承诺故障后恢复变量。恢复能力只有在真实使用需要时�
   `kind + message + Detail + [truncated]` 且总字节 ≤ 64 KiB。
   `PROTOCOL_VERSION` 保持 `1`；未新增协议消息、Service 或框架。
 
+### Query/child 生命周期（Issue #4）
+
+一次 `rlm_query` 调用在发出它的 cell 生命周期内恰好拥有一个 one-shot
+Subagent：
+
+- 每个 cell 创建自己的 `AbortController`；child 的请求信号是该控制器与调用方
+  `exec.signal` 的合并。超时、调用方取消、协议故障、kernel 退出或插件
+  dispose 都会中止该控制器，使 provider 取消 child 剩余轮次的工作。
+- cell 的工具 Promise 只在其在飞 child 工作结算后结算：每个 query 任务在
+  解析前都包含 `run.dispose()`，所有终态路径在拒绝或解析 cell 前等待该
+  cleanup barrier。没有任何 one-shot child 会越过其 cell 的终态帧存活。
+- 终态转换使用显式的 `active -> settling -> settled` 形态：首个终态边沿
+  同步阻断路由与 child 发布（barrier 运行期间 `evalCell` 返回 `busy` 或
+  `closed`），Session map 驱逐与公开的 cell Promise 结算只在 child 静默
+  完成后发生——任何下一 cell 都无法穿过结算窗口。
+- 插件卸载返回可等待的 disposal barrier：`runtime.dispose()` 同步置为
+  terminal（后续 eval 拒绝 `closed`），并在每个 kernel 的 child cleanup
+  barrier 完成后 resolve，使 Cordis teardown 可以真正等待 child 静默。
+- 迟到的 child 结果不会进入后续 cell：宿主丢弃任何不再属于当前 cell 的响应
+  （pending-cell 身份守卫），Python kernel 在事件循环上执行回复投递，并使用
+  任务本地 cell-owner token（`contextvars`）：归属在 detached task 创建时
+  固定，已退休 cell 的任务不可能在后续 cell 中打开新 query。响应在其 cell
+  仍活动时正常投递（即使已在终态边沿前排队），只有 owner 实际退休后才丢弃
+  （低于当前 cell 单调 floor 的 id，或刚终结 cell 的 id）；未知、未来、重复
+  与非整数 reply id 仍是致命协议故障（Issue #1 契约）。reader 从不 pop 回复
+  （投递在事件循环上并再次检查 owner/future），因此不存在 reader/loop
+  InvalidStateError 竞态；用户代码仍可 catch query 错误并继续运行 cell 及其
+  兄弟查询。
+- `completed` 但没有可见 `text` 块的 query 是类型化的 `query` 错误
+  （`phase='query'`），绝不是空字符串成功。
+- Query 失败在模型可见的工具边界保持 `kind='query'` / `phase='query'`，
+  同时遵守 Issue #3 的有界 detail/truncation 契约。
+
 ## 8. 最小配置
 
 V1 只需要：
