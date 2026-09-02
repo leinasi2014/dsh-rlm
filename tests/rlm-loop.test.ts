@@ -2461,7 +2461,7 @@ test('M2 Issue#4: the kernel drops a late response for a terminated cell query i
   }
 })
 
-test('M2 Issue#4: a concurrent eval during a fatal child-settlement window is rejected and the next eval is clean', async () => {
+test('M2 Issue#4: a concurrent eval during a fatal child-settlement window is queued and the next eval uses a fresh kernel', async () => {
   const runtime = rt({ timeout: 8000 })
   const ctl = new AbortController()
   try {
@@ -2492,14 +2492,17 @@ test('M2 Issue#4: a concurrent eval during a fatal child-settlement window is re
       (err: unknown) => err instanceof RlmError && err.kind === 'cancel',
     )
     // The terminal transition ran synchronously (settling), but the child
-    // cleanup barrier is still open: a concurrent eval must NOT be admitted to
-    // a replacement kernel while the old child quiesces.
-    await assert.rejects(
-      runtime.eval('fatal-window', { code: '2 + 2', timeout: 8000 }),
-      (err: unknown) => err instanceof RlmError && (err.kind === 'closed' || err.kind === 'busy'),
-    )
+    // cleanup barrier is still open: a concurrent eval must be QUEUED, never
+    // admitted to a replacement kernel while the old child quiesces.
+    const queued = runtime.eval('fatal-window', { code: '2 + 2', timeout: 8000 })
+    let queuedDone = false
+    queued.then(() => { queuedDone = true }, () => { queuedDone = true })
     await pendingRejection
-    // After quiescence the evicted session gets a clean namespace.
+    assert.equal(queuedDone, false, 'the queued eval must not run inside the fatal settlement window')
+    // Issue #2 FIFO: the queued eval starts only after the old kernel was
+    // evicted, on the fresh (empty) namespace.
+    const fresh = await queued
+    assert.equal(fresh.result, '4')
     await assert.rejects(
       runtime.eval('fatal-window', { code: 'marker', timeout: 8000 }),
       (err: unknown) => err instanceof RlmError && err.kind === 'eval',
@@ -2511,7 +2514,7 @@ test('M2 Issue#4: a concurrent eval during a fatal child-settlement window is re
   }
 })
 
-test('M2 Issue#4: a concurrent eval during a live-kernel settlement window is rejected busy', async () => {
+test('M2 Issue#4: a concurrent eval during a live-kernel settlement window is queued until settlement completes', async () => {
   const runtime = rt({ timeout: 8000 })
   try {
     await runtime.eval('live-settle', { code: 'marker = 1', timeout: 8000 })
@@ -2550,15 +2553,19 @@ test('M2 Issue#4: a concurrent eval during a live-kernel settlement window is re
     // The cell error frame starts the live-kernel settlement with an open child
     // barrier; the window is observable via bgAborted.
     await until(() => bgAborted)
-    await assert.rejects(
-      runtime.eval('live-settle', { code: '2 + 2', timeout: 8000 }),
-      (err: unknown) => err instanceof RlmError && err.kind === 'busy',
-    )
+    // Issue #2 FIFO: the concurrent eval queues instead of failing busy; it may
+    // start only after the live kernel's settlement completes.
+    const queued = runtime.eval('live-settle', { code: '2 + 2', timeout: 8000 })
+    let queuedDone = false
+    queued.then(() => { queuedDone = true }, () => { queuedDone = true })
     settleBg?.()
     await assert.rejects(
       pending,
       (err: unknown) => err instanceof RlmError && err.kind === 'query' && /main fail/.test(err.message),
     )
+    assert.equal(queuedDone, false, 'the queued eval must not run before the settlement window closes')
+    const out = await queued
+    assert.equal(out.result, '4', 'the queued eval runs on the same live kernel after settlement')
     const cont = await runtime.eval('live-settle', { code: 'marker + 1', timeout: 8000 })
     assert.equal(cont.result, '2', 'the live kernel must keep its globals after the settlement window')
   } finally {
@@ -2864,5 +2871,231 @@ test('M2 Issue#4: a second late reply for a retired unanswered query fatals afte
       // already dead
     }
     await k.exit.catch(() => {})
+  }
+})
+
+// ---- M2 Issue #2: per-session FIFO queue (serialize same-session evals) ----
+
+test('M2 Issue#2: same-session evals run FIFO by submission order and the later cell sees earlier globals', async () => {
+  const runtime = rt({ timeout: 8000 })
+  try {
+    const latch = new Deferred<string>()
+    const order: string[] = []
+    // The first cell parks on rlm_query so the second eval is provably queued.
+    const first = runtime.eval('issue2-fifo', {
+      code: 'v = await rlm_query("hold")\nvalue = 40\nvalue + len(v)',
+      timeout: 8000,
+      onQuery: async () => {
+        order.push('query')
+        return latch.promise
+      },
+    })
+    first.then(() => { order.push('first-done') }, () => { order.push('first-failed') })
+    const second = runtime.eval('issue2-fifo', { code: 'value * 2', timeout: 8000 })
+    second.then(() => { order.push('second-done') }, () => { order.push('second-failed') })
+    await until(() => order.includes('query'))
+    assert.equal(order.includes('second-done'), false, 'FIFO: the second eval must wait for the first')
+    latch.resolve('ok')
+    const [out1, out2] = await Promise.all([first, second])
+    assert.equal(out1.result, '42')
+    assert.equal(out2.result, '80')
+    assert.deepEqual(order, ['query', 'first-done', 'second-done'])
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('M2 Issue#2: different sessions run concurrently and keep isolated namespaces', async () => {
+  const runtime = rt({ timeout: 8000 })
+  try {
+    const gateA = new Deferred<string>()
+    const gateB = new Deferred<string>()
+    const seen: string[] = []
+    const a = runtime.eval('issue2-par-a', {
+      code: 'mineA = await rlm_query("ga")\nmineA',
+      timeout: 8000,
+      onQuery: async (prompt: string) => {
+        seen.push(prompt)
+        return gateA.promise
+      },
+    })
+    const b = runtime.eval('issue2-par-b', {
+      code: 'mineB = await rlm_query("gb")\nmineB',
+      timeout: 8000,
+      onQuery: async (prompt: string) => {
+        seen.push(prompt)
+        return gateB.promise
+      },
+    })
+    // Both cells are live at the same time: each session is parked on its own query.
+    await until(() => seen.length === 2)
+    assert.deepEqual([...seen].sort(), ['ga', 'gb'])
+    gateA.resolve('A')
+    gateB.resolve('B')
+    assert.equal((await a).result, 'A')
+    assert.equal((await b).result, 'B')
+    // Namespace isolation: neither session sees the other session's variable.
+    await assert.rejects(
+      runtime.eval('issue2-par-a', { code: 'mineB', timeout: 8000 }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+    await assert.rejects(
+      runtime.eval('issue2-par-b', { code: 'mineA', timeout: 8000 }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('M2 Issue#2: aborting a queued eval rejects immediately and keeps the running same-session kernel alive', async () => {
+  const runtime = rt({ timeout: 8000 })
+  try {
+    const seed = await runtime.eval('issue2-cancel', { code: 'import os\nos.getpid()', timeout: 8000 })
+    const pid = Number(seed.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + seed.result)
+    const latch = new Deferred<string>()
+    const first = runtime.eval('issue2-cancel', {
+      code: 'v = await rlm_query("hold")\nv',
+      timeout: 8000,
+      onQuery: async () => latch.promise,
+    })
+    void first.catch(() => {})
+    const ctl = new AbortController()
+    const queued = runtime.eval('issue2-cancel', { code: '1 + 1', timeout: 8000, signal: ctl.signal })
+    let queuedDone = false
+    const queuedRejection = assert.rejects(queued, (err: unknown) => {
+      assert.ok(err instanceof RlmError)
+      assert.equal(err.kind, 'cancel')
+      return true
+    }).then(() => { queuedDone = true })
+    ctl.abort('user-cancel')
+    await Promise.race([
+      queuedRejection.then(() => undefined, () => undefined),
+      until(() => queuedDone),
+    ])
+    assert.equal(queuedDone, true, 'a queued abort must reject promptly, not wait for dequeue')
+    // The queued cancel never touched the running kernel: it still parks on its query.
+    latch.resolve('ok')
+    assert.equal((await first).result, 'ok')
+    // Same kernel PID: neither the queued abort nor the queue evicted the session kernel.
+    const pidAgain = await runtime.eval('issue2-cancel', { code: 'import os\nos.getpid()', timeout: 8000 })
+    assert.equal(pidAgain.result, String(pid), 'queued abort must not kill the running session kernel')
+    await queuedRejection
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('M2 Issue#2: dispose rejects every queued eval, awaits kernel teardown, and no queued work starts', async () => {
+  const runtime = rt({ timeout: 8000 })
+  let queryStarted = false
+  try {
+    const first = runtime.eval('issue2-dispose', {
+      code: 'v = await rlm_query("hold")\nv',
+      timeout: 8000,
+      onQuery: async (_prompt: string, signal?: AbortSignal) => {
+        queryStarted = true
+        // The cell-bound child settles only when the cell's controller aborts
+        // (dispose), so the Kernel cleanup barrier can complete deterministically.
+        const pending = new Deferred<string>()
+        signal?.addEventListener('abort', () => pending.reject(new Error('cell disposed')), { once: true })
+        return pending.promise
+      },
+    })
+    // Wait until the kernel is live and the cell is provably running, so the
+    // queued evals below would fail `busy` on the pre-queue implementation.
+    await until(() => queryStarted)
+    const queuedA = runtime.eval('issue2-dispose', { code: '1 + 1', timeout: 8000 })
+    const queuedB = runtime.eval('issue2-dispose', { code: '2 + 2', timeout: 8000 })
+    const firstRejection = assert.rejects(first, (err: unknown) => err instanceof RlmError && err.kind === 'cancel')
+    const queuedARejection = assert.rejects(queuedA, (err: unknown) => err instanceof RlmError && err.kind === 'cancel')
+    const queuedBRejection = assert.rejects(queuedB, (err: unknown) => err instanceof RlmError && err.kind === 'cancel')
+    const barrier = runtime.dispose()
+    await Promise.all([firstRejection, queuedARejection, queuedBRejection])
+    // The disposal barrier settles only after the running kernel's teardown barrier.
+    await barrier
+    // Terminal: a post-dispose eval rejects without starting any kernel.
+    await assert.rejects(
+      runtime.eval('issue2-dispose', { code: '1' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'closed' && /disposed/.test(err.message),
+    )
+  } finally {
+    await runtime.dispose() // idempotent
+  }
+})
+
+test('M2 Issue#2: after a kernel crash the queued successors run on a fresh kernel only after eviction (namespace loss observable)', async () => {
+  const runtime = rt({ timeout: 8000 })
+  try {
+    const seed = await runtime.eval('issue2-crash', { code: 'import os\npid = os.getpid()\nmarker = 1\npid', timeout: 8000 })
+    const pid = Number(seed.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + seed.result)
+    const latch = new Deferred<string>()
+    const fatal = runtime.eval('issue2-crash', {
+      code: 'x = await rlm_query("go")\nimport os\nos._exit(1)',
+      timeout: 8000,
+      onQuery: async () => latch.promise,
+    })
+    const failed = runtime.eval('issue2-crash', { code: 'marker + 1', timeout: 8000 })
+    const pidAgain = runtime.eval('issue2-crash', { code: 'import os\nos.getpid()', timeout: 8000 })
+    void failed.catch(() => {})
+    void pidAgain.catch(() => {})
+    // The successors are queued while the fatal cell is parked; releasing it
+    // crashes the kernel so the queue must advance only after eviction.
+    latch.resolve('go')
+    await assert.rejects(
+      fatal,
+      (err: unknown) => err instanceof RlmError && (err.kind === 'closed' || err.kind === 'protocol'),
+    )
+    // Namespace loss is observable: the old `marker` is gone on the fresh kernel.
+    await assert.rejects(
+      failed,
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+    const out = await pidAgain
+    const newPid = Number(out.result)
+    assert.ok(Number.isInteger(newPid) && newPid > 0)
+    assert.notEqual(newPid, pid, 'the successor must run on a fresh kernel, not reuse the dead one')
+    const clear = await runtime.eval('issue2-crash', { code: '2 + 2', timeout: 8000 })
+    assert.equal(clear.result, '4')
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('M2 Issue#2: a queued eval whose budget expires before dequeue is rejected timeout without starting a kernel', async () => {
+  const runtime = rt({ timeout: 8000 })
+  try {
+    const seed = await runtime.eval('issue2-deadline', { code: 'import os\nos.getpid()', timeout: 8000 })
+    const pid = Number(seed.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + seed.result)
+    const latch = new Deferred<string>()
+    const first = runtime.eval('issue2-deadline', {
+      code: 'v = await rlm_query("hold")\nv',
+      timeout: 8000,
+      onQuery: async () => latch.promise,
+    })
+    void first.catch(() => {})
+    const queued = runtime.eval('issue2-deadline', { code: '1 + 1', timeout: 150 })
+    let queuedDone = false
+    const queuedRejection = assert.rejects(queued, (err: unknown) => {
+      assert.ok(err instanceof RlmError)
+      assert.equal(err.kind, 'timeout', 'budget exhaustion while queued must be a timeout')
+      return true
+    }).then(() => { queuedDone = true })
+    await Promise.race([
+      queuedRejection.then(() => undefined, () => undefined),
+      until(() => queuedDone),
+    ])
+    assert.equal(queuedDone, true, 'the queued eval must expire against its own deadline, not after dequeue')
+    latch.resolve('ok')
+    await first
+    // The running kernel was never disturbed, and no second kernel was spawned.
+    const pidAgain = await runtime.eval('issue2-deadline', { code: 'import os\nos.getpid()', timeout: 8000 })
+    assert.equal(pidAgain.result, String(pid), 'a queued deadline expiry must not kill or replace the kernel')
+    await queuedRejection
+  } finally {
+    await runtime.dispose()
   }
 })

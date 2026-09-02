@@ -162,6 +162,37 @@ other Session kernels and globals remain intact.
   when that cell is still the current pending request.
 - Cancellation reuses the existing Kernel kill/evict path.
 
+### Session serialization (Issue #2)
+
+Concurrent `rlm_eval` calls for the same Session are never rejected `busy`;
+they are serialized by a minimal per-Session FIFO queue:
+
+- Each Session key owns one queue and one drain worker with at most one active
+  cell; requests run in submission order, and a later cell sees the earlier
+  cell's successful globals on the same kernel.
+- The total deadline is frozen at `eval()` submission: queue wait and startup
+  consume the same budget. A request whose budget expires before it is dequeued
+  rejects as `timeout` and never starts a kernel; once active, the Kernel owns
+  the remaining budget (startup + cell share one deadline).
+- A queued request observes its own `AbortSignal` immediately: abort (or
+  queued deadline expiry) settles only that entry with `cancel` (or `timeout`)
+  and never touches the running kernel, so cancelling a queued cell does not
+  evict the same-Session kernel.
+- Kernel lookup/creation happens only at dequeue time; after a fatal
+  (timeout, cancel, protocol fault, crash) the old kernel is evicted through
+  the identity-checked `onExit` before the next entry dequeues, so a successor
+  can only use a fresh kernel and the namespace loss is observable (old
+  globals gone, new PID).
+- `runtime.dispose()` is terminal: it rejects every not-yet-active queued entry
+  with `cancel` synchronously, lets the active entry settle through the
+  existing `Kernel.dispose` child-cleanup barrier, and its returned barrier
+  waits for both the kernels and the drain workers; no queued work starts after
+  dispose.
+- Queues are per-Session: different Sessions still run in parallel with
+  isolated kernels and globals; there is no global scheduler or cross-process
+  queue. `RlmError kind='busy'` remains only as an unreachable internal
+  defense of `Kernel.evalCell`.
+
 ### Bounded protocol contract (Issue #3)
 
 - Total frame budget `MAX_FRAME_BYTES = 256 * 1024` is enforced on the exact
@@ -202,9 +233,12 @@ the cell that issued it:
   No one-shot child survives its cell's terminal frame.
 - Terminal transitions use an explicit `active -> settling -> settled` shape:
   routing and child publication are blocked synchronously on the first terminal
-  edge (`evalCell` returns `busy` or `closed` while the barrier runs), and the
-  session-map eviction plus the public cell Promise settle happen only after
-  child quiescence — no next cell can slip through the settlement window.
+  edge, and the session-map eviction plus the public cell Promise settle happen
+  only after child quiescence. A concurrent same-Session eval is queued by the
+  Issue #2 per-Session FIFO — it never slips through the settlement window; it
+  starts only after the window closes, on the same kernel after a live
+  settlement or on a fresh kernel after a fatal one. `Kernel.busy` is an
+  unreachable internal defense, not the contract.
 - Plugin unload returns an awaitable disposal barrier: `runtime.dispose()` is
   terminal synchronously (later evals reject `closed`) and resolves after every
   kernel's child cleanup barrier, so Cordis teardown can await real child
