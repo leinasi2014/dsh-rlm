@@ -10,7 +10,7 @@
       {
         "id": "managed-context",
         "label": "M3 managed context",
-        "focus": ["contextSource", "contextLoader", "sessionKernel", "rlmEval"],
+        "focus": ["contextSource", "sessionKernel", "rlmEval"],
         "note": "An absolute UTF-8 file becomes a protected Session-local context variable without copying its contents through the model-facing tool call."
       },
       {
@@ -83,14 +83,6 @@
       "sublabel": "trusted local · bounded bytes",
       "pos": [265, 510],
       "size": [180, 70]
-    },
-    {
-      "id": "contextLoader",
-      "type": "backend",
-      "label": "Managed Context Loader",
-      "sublabel": "atomic read · typed failure",
-      "pos": [535, 510],
-      "size": [205, 70]
     }
   ],
   "connections": [
@@ -112,14 +104,8 @@
     {
       "id": "sourceLoader",
       "from": "contextSource",
-      "to": "contextLoader",
-      "label": "strict UTF-8 read"
-    },
-    {
-      "id": "loaderKernel",
-      "from": "contextLoader",
       "to": "sessionKernel",
-      "label": "atomic context publish",
+      "label": "kernel strict UTF-8 read + atomic publish",
       "variant": "security"
     },
     {
@@ -154,7 +140,7 @@
       "dot": "cyan",
       "title": "M3 Context Contract",
       "items": [
-        "Loader sends only a path descriptor; user code may still return context",
+        "Host sends only the path descriptor; the kernel loader reads bytes",
         "Load succeeds atomically or preserves the previous managed context",
         "No URL fetch, glob, directory walk, attachment domain, or snapshot"
       ]
