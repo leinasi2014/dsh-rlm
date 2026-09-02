@@ -38,7 +38,6 @@ PROTOCOL_VERSION = 1
 DEFAULT_MAX_STDOUT = 64 * 1024
 DEFAULT_MAX_RESULT = 64 * 1024
 CELL_FILENAME = "<rlm-cell>"
-RESULT_NAME = "__rlm_result__"
 
 
 class RlmQueryError(Exception):
@@ -88,6 +87,37 @@ class _BoundedStdout:
         return self._total_bytes > self._limit
 
 
+def _safe_str(value: Any) -> str:
+    """Best-effort str() that cannot raise: a hostile __str__ inside the
+    error being reported must never turn a typed cell error into a kernel
+    crash while building the error frame."""
+    try:
+        return str(value)
+    except BaseException:
+        return _safe_type_name(value)
+
+
+def _safe_type_name(value: Any) -> str:
+    """Best-effort exception class name that cannot raise: a hostile
+    metaclass whose __name__ access throws must never turn a typed cell
+    error into a kernel crash while building the error frame. The fallback
+    is a stable string that keeps the frame well-formed."""
+    try:
+        return type(value).__name__
+    except BaseException:
+        return "BaseException"
+
+
+def _safe_attr(obj: Any, name: str) -> Any:
+    """getattr that cannot raise: a hostile exception whose attribute reads
+    (e.g. lineno/offset/text/detail properties) throw again must not let
+    error-frame construction escape as a kernel crash."""
+    try:
+        return getattr(obj, name)
+    except BaseException:
+        return None
+
+
 class RlmKernel:
     def __init__(self) -> None:
         # Persistent globals shared across every cell of this process.
@@ -109,7 +139,11 @@ class RlmKernel:
     # ---- framing ----
 
     def _send(self, frame: dict[str, Any]) -> None:
-        self._real_stdout.write(json.dumps(frame, ensure_ascii=False) + "\n")
+        # ASCII-safe wire encoding: every frame is written as pure-ASCII JSON
+        # escapes, so a lone surrogate anywhere in a frame (message, detail,
+        # text, result, stdout, query prompt) can never crash the strict UTF-8
+        # pipe; the host JSON parser restores the original Unicode semantics.
+        self._real_stdout.write(json.dumps(frame, ensure_ascii=True) + "\n")
         self._real_stdout.flush()
 
     def _fatal(self, message: str) -> None:
@@ -184,22 +218,41 @@ class RlmKernel:
 
     # ---- cell execution ----
 
+    def _restore_scaffold(self) -> None:
+        """Re-bind the official rlm_query bridge at every cell boundary.
+
+        User code may legitimately shadow or delete any global (the namespace
+        is deliberately not frozen), so the scaffold this kernel speaks is
+        always self._rlm_query: it is re-injected before a cell and again in
+        the outer finally that covers every success/error exit.
+        """
+        self.namespace["rlm_query"] = self._rlm_query
+
     @staticmethod
-    def _compile_cell(code: str):
+    def _compile_cell(code: str) -> "tuple[Any, Optional[Any]]":
+        """Split a cell into its statement body and the final top-level
+        expression. Both are compiled with PyCF_ALLOW_TOP_LEVEL_AWAIT so
+        top-level await keeps working; a code object whose flags carry
+        CO_COROUTINE is the coroutine to await. The expression value is
+        captured in a local, never written into the user namespace."""
         tree = ast.parse(code, filename=CELL_FILENAME, mode="exec")
-        if tree.body and isinstance(tree.body[-1], ast.Expr):
-            last = tree.body.pop()
-            assign = ast.Assign(
-                targets=[ast.Name(id=RESULT_NAME, ctx=ast.Store())],
-                value=last.value,
-            )
-            # Preserve the original expression line range so fix_missing_locations
-            # does not reject the wrapper node.
-            tree.body.append(ast.copy_location(assign, last))
-        ast.fix_missing_locations(tree)
-        return compile(
-            tree, CELL_FILENAME, "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
+        body_nodes = list(tree.body)
+        last: Optional[ast.Expr] = None
+        if body_nodes and isinstance(body_nodes[-1], ast.Expr):
+            last = body_nodes.pop()
+        body_tree = ast.Module(body=body_nodes, type_ignores=tree.type_ignores)
+        ast.fix_missing_locations(body_tree)
+        body_code = compile(
+            body_tree, CELL_FILENAME, "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
         )
+        expr_code: Optional[Any] = None
+        if last is not None:
+            expr_tree = ast.copy_location(ast.Expression(body=last.value), last)
+            ast.fix_missing_locations(expr_tree)
+            expr_code = compile(
+                expr_tree, CELL_FILENAME, "eval", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT
+            )
+        return body_code, expr_code
 
     @staticmethod
     def _format_result(value: Any) -> str:
@@ -229,26 +282,44 @@ class RlmKernel:
             self._fatal("invalid limits in eval frame: " + repr(frame))
             return
 
-        try:
-            cell_code = self._compile_cell(code)
-        except SyntaxError as e:
-            self._send(self._error_frame(eval_id, "eval", "syntax_error", e))
-            return
-        except ValueError as e:
-            # Defensive: an AST/compile failure must fail the cell, never the
-            # whole kernel; report it as a typed error and keep serving eval.
-            self._send(self._error_frame(eval_id, "eval", "compile_error", e))
-            return
+        # Restore the official scaffold before every cell so a previous cell
+        # that shadowed or deleted rlm_query cannot poison this one.
+        self._restore_scaffold()
 
         capture = _BoundedStdout(max_stdout)
         old_stdout = sys.stdout
         sys.stdout = capture
         try:
-            coro = eval(cell_code, self.namespace)  # type: ignore[arg-type]
-            # A cell without top-level await runs synchronously and eval returns
-            # None; only await a returned awaitable.
-            if coro is not None and inspect.isawaitable(coro):
+            try:
+                body_code, expr_code = self._compile_cell(code)
+            except SyntaxError as e:
+                self._send(self._error_frame(eval_id, "eval", "syntax_error", e))
+                return
+            except ValueError as e:
+                # Defensive: an AST/compile failure must fail the cell, never the
+                # whole kernel; report it as a typed error and keep serving eval.
+                self._send(self._error_frame(eval_id, "eval", "compile_error", e))
+                return
+
+            coro = eval(body_code, self.namespace)  # type: ignore[arg-type]
+            # Only a module compiled with top-level await yields a coroutine;
+            # a plain module runs synchronously and eval returns None.
+            if body_code.co_flags & inspect.CO_COROUTINE:
                 await coro
+
+            result: Optional[str] = None
+            result_cut = False
+            if expr_code is not None:
+                value = eval(expr_code, self.namespace)
+                if expr_code.co_flags & inspect.CO_COROUTINE:
+                    value = await value
+                if value is not None:
+                    # Formatting and truncation stay inside the cell's error
+                    # boundary and before sys.stdout is restored, so a raising
+                    # __repr__ is a typed eval error, never a kernel crash, and
+                    # cannot pollute the protocol pipe.
+                    rendered = self._format_result(value)
+                    result, result_cut = self._cut(rendered, max_result)
         except RlmQueryError as e:
             self._send(
                 self._error_frame(
@@ -261,14 +332,8 @@ class RlmKernel:
             return
         finally:
             sys.stdout = old_stdout
+            self._restore_scaffold()
 
-        result: Optional[str] = None
-        value = self.namespace.pop(RESULT_NAME, _MISSING)
-        if value is not _MISSING and value is not None:
-            result = self._format_result(value)
-            result, result_cut = self._cut(result, max_result)
-        else:
-            result_cut = False
         stdout, stdout_cut = self._cut(capture.value(), max_stdout)
         frame_out: dict[str, Any] = {
             "type": "result",
@@ -295,25 +360,30 @@ class RlmKernel:
             "id": eval_id,
             "phase": phase,
             "kind": kind,
-            "message": str(exc),
-            "name": name or exc.__class__.__name__,
+            "message": _safe_str(exc),
+            "name": name or _safe_type_name(exc),
         }
-        lineno = getattr(exc, "lineno", None)
-        column = getattr(exc, "offset", None)
-        text = getattr(exc, "text", None)
-        if lineno is not None:
+        lineno = _safe_attr(exc, "lineno")
+        column = _safe_attr(exc, "offset")
+        text = _safe_attr(exc, "text")
+        if isinstance(lineno, int):
             frame["line"] = lineno
-        if column is not None:
+        if isinstance(column, int):
             frame["column"] = column
-        if text is not None:
+        if isinstance(text, str):
             frame["text"] = text
-        detail = getattr(exc, "detail", None)
+        detail = _safe_attr(exc, "detail")
         if detail is not None:
             try:
-                json.dumps(detail)
-                frame["detail"] = detail
-            except (TypeError, ValueError):
-                frame["detail"] = str(detail)
+                # Detach into pure JSON-native values so the frame's send-time
+                # serialization can never re-enter a hostile object: serialize
+                # once (no NaN, non-ASCII kept) and re-parse immediately. Any
+                # BaseException or NaN falls back to a safe string.
+                frame["detail"] = json.loads(
+                    json.dumps(detail, ensure_ascii=False, allow_nan=False)
+                )
+            except BaseException:
+                frame["detail"] = _safe_str(detail)
         return frame
 
     # ---- main loop ----
@@ -336,9 +406,6 @@ class RlmKernel:
             else:
                 self._fatal("unexpected queued message type: " + repr(kind))
                 return
-
-
-_MISSING = object()
 
 
 def main() -> int:

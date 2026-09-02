@@ -214,6 +214,430 @@ test('M1A: protocol error terminates the kernel nonzero', async () => {
   assert.notEqual(code, 0)
 })
 
+// ---- M1A Issue #5: scaffold isolation and result formatting containment ----
+
+test('M1A Issue#5: a cell that shadows rlm_query cannot poison later cells', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'rlm_query = lambda prompt: "fake"\n1' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    assert.equal(r1.result, '1')
+    k.send({ type: 'eval', id: 2, code: 'await rlm_query("real")' })
+    const q = await k.next()
+    assert.equal(q.type, 'query')
+    assert.equal(q.prompt, 'real')
+    k.send({ type: 'query_result', id: k.id(q), text: 'official' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, 'official')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: deleting rlm_query in a failing cell is restored before the next cell', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'del rlm_query\nraise ValueError("boom")' })
+    const e = await k.next()
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'ValueError')
+    k.send({ type: 'eval', id: 2, code: 'await rlm_query("after-delete")' })
+    const q = await k.next()
+    assert.equal(q.type, 'query')
+    assert.equal(q.prompt, 'after-delete')
+    k.send({ type: 'query_result', id: k.id(q), text: 'restored' })
+    const r = await k.next()
+    assert.equal(r.type, 'result')
+    assert.equal(r.result, 'restored')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: a failed result leaves no stale result and keeps user __rlm_result__', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: '__rlm_result__ = "stale"\n1 / 0' })
+    const e = await k.next()
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'ZeroDivisionError')
+    k.send({ type: 'eval', id: 2, code: 'x = 5' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, undefined)
+    k.send({ type: 'eval', id: 3, code: '__rlm_result__' })
+    const r3 = await k.next()
+    assert.equal(r3.type, 'result')
+    assert.equal(r3.result, 'stale')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: a user-defined __rlm_result__ is an ordinary persistent global', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: '__rlm_result__ = "mine"\n40 + 2' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    assert.equal(r1.result, '42')
+    k.send({ type: 'eval', id: 2, code: '__rlm_result__' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, 'mine')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: a raising __repr__ is a typed eval error and the kernel survives', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'marker = 1' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: 'class Boom:\n    def __repr__(self):\n        raise RuntimeError("repr boom")\nBoom()',
+    })
+    const e = await k.next(4000)
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'RuntimeError')
+    assert.equal(e.message, 'repr boom')
+    k.send({ type: 'eval', id: 3, code: 'marker' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, '1')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: a bare awaitable last expression is not auto-awaited', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'import asyncio\nasyncio.sleep(0.01)' })
+    const r = await k.next()
+    assert.equal(r.type, 'result')
+    assert.equal(typeof r.result, 'string')
+    assert.match(r.result as string, /<coroutine object .* at 0x[0-9a-fA-F]+>/)
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: hostile exception attributes cannot escape as a kernel fatal', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'import os\nmarker = 1\nos.getpid()' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    const pid = Number(r1.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + r1.result)
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: [
+        'class Evil(Exception):',
+        '    @property',
+        '    def lineno(self):',
+        '        raise RuntimeError("lineno boom")',
+        '    @property',
+        '    def offset(self):',
+        '        raise RuntimeError("offset boom")',
+        '    @property',
+        '    def text(self):',
+        '        raise RuntimeError("text boom")',
+        '    @property',
+        '    def detail(self):',
+        '        raise RuntimeError("detail boom")',
+        '    def __str__(self):',
+        '        return "evil repr"',
+        'class Boom:',
+        '    def __repr__(self):',
+        '        raise Evil("repr boom")',
+        'Boom()',
+      ].join('\n'),
+    })
+    const e = await k.next(4000)
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'Evil')
+    assert.equal(e.message, 'evil repr')
+    assert.equal(e.line, undefined)
+    assert.equal(e.column, undefined)
+    k.send({ type: 'eval', id: 3, code: 'import os\nmarker + 40' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, '41')
+    k.send({ type: 'eval', id: 4, code: 'import os\nos.getpid()' })
+    const r3 = await k.next()
+    assert.equal(r3.type, 'result')
+    assert.equal(r3.result, String(pid))
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: flaky or NaN result detail cannot escape error-frame construction', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'import os\nmarker = 1\nos.getpid()' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    const pid = Number(r1.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + r1.result)
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: [
+        'class FlakyDetail(list):',
+        '    def __init__(self):',
+        '        list.__init__(self, [1, 2, 3])',
+        '        self.calls = 0',
+        '    def __iter__(self):',
+        '        self.calls += 1',
+        '        if self.calls > 1:',
+        '            raise RuntimeError("detail boom on second pass")',
+        '        return list.__iter__(self)',
+        'class Boom:',
+        '    def __repr__(self):',
+        '        e = RuntimeError("repr boom")',
+        '        e.detail = FlakyDetail()',
+        '        raise e',
+        'Boom()',
+      ].join('\n'),
+    })
+    const e = await k.next(4000)
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'RuntimeError')
+    assert.equal(e.message, 'repr boom')
+    assert.deepEqual(e.detail, [1, 2, 3])
+    k.send({ type: 'eval', id: 3, code: 'import os\nmarker + 40' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, '41')
+    k.send({ type: 'eval', id: 4, code: 'import os\nos.getpid()' })
+    const r3 = await k.next()
+    assert.equal(r3.type, 'result')
+    assert.equal(r3.result, String(pid))
+    k.send({
+      type: 'eval',
+      id: 5,
+      code: [
+        'class BoomNaN:',
+        '    def __repr__(self):',
+        '        e = RuntimeError("nan repr")',
+        '        e.detail = float("nan")',
+        '        raise e',
+        'BoomNaN()',
+      ].join('\n'),
+    })
+    const e2 = await k.next()
+    assert.equal(e2.type, 'error')
+    assert.equal(e2.name, 'RuntimeError')
+    assert.equal(e2.message, 'nan repr')
+    assert.equal(e2.detail, 'nan')
+    k.send({ type: 'eval', id: 6, code: 'marker' })
+    const r4 = await k.next()
+    assert.equal(r4.type, 'result')
+    assert.equal(r4.result, '1')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: a lone surrogate in result detail is a typed error and the kernel survives', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'import os\nmarker = 1\nos.getpid()' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    const pid = Number(r1.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + r1.result)
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: [
+        'class Boom:',
+        '    def __repr__(self):',
+        '        e = RuntimeError("repr boom")',
+        '        e.detail = chr(0xD800)',
+        '        raise e',
+        'Boom()',
+      ].join('\n'),
+    })
+    const e = await k.next(4000)
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'RuntimeError')
+    assert.equal(e.message, 'repr boom')
+    assert.equal(e.detail, '\uD800')
+    k.send({ type: 'eval', id: 3, code: 'import os\nmarker + 40' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, '41')
+    k.send({ type: 'eval', id: 4, code: 'import os\nos.getpid()' })
+    const r3 = await k.next()
+    assert.equal(r3.type, 'result')
+    assert.equal(r3.result, String(pid))
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: a lone surrogate in an error message is a typed error and the kernel survives', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'import os\nmarker = 7\nos.getpid()' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    const pid = Number(r1.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + r1.result)
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: [
+        'class Evil(Exception):',
+        '    def __str__(self):',
+        '        return chr(0xD800)',
+        'class Boom:',
+        '    def __repr__(self):',
+        '        raise Evil("x")',
+        'Boom()',
+      ].join('\n'),
+    })
+    const e = await k.next(4000)
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'Evil')
+    assert.equal(e.message, '\uD800')
+    k.send({ type: 'eval', id: 3, code: 'import os\nmarker + 35' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, '42')
+    k.send({ type: 'eval', id: 4, code: 'import os\nos.getpid()' })
+    const r3 = await k.next()
+    assert.equal(r3.type, 'result')
+    assert.equal(r3.result, String(pid))
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: normal UTF-8 and Chinese text round-trip through the wire', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'print("中文输出")\n"中文结果"' })
+    const r = await k.next()
+    assert.equal(r.type, 'result')
+    assert.equal(r.stdout, '中文输出\n')
+    assert.equal(r.result, '中文结果')
+    k.send({ type: 'eval', id: 2, code: 'await rlm_query("你好")' })
+    const q = await k.next()
+    assert.equal(q.type, 'query')
+    assert.equal(q.prompt, '你好')
+    k.send({ type: 'query_result', id: k.id(q), text: '世界' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, '世界')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: a hostile metaclass __name__ is a typed error and the kernel survives', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'import os\nmarker = 5\nos.getpid()' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    const pid = Number(r1.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + r1.result)
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: [
+        'class Meta(type):',
+        '    def __getattribute__(self, name):',
+        '        if name == "__name__":',
+        '            raise RuntimeError("name boom")',
+        '        return super().__getattribute__(name)',
+        'class Evil(Exception, metaclass=Meta):',
+        '    pass',
+        'raise Evil("boom")',
+      ].join('\n'),
+    })
+    const e = await k.next(4000)
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'BaseException')
+    assert.equal(e.message, 'boom')
+    k.send({ type: 'eval', id: 3, code: 'import os\nmarker + 37' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, '42')
+    k.send({ type: 'eval', id: 4, code: 'import os\nos.getpid()' })
+    const r3 = await k.next()
+    assert.equal(r3.type, 'result')
+    assert.equal(r3.result, String(pid))
+    k.send({
+      type: 'eval',
+      id: 5,
+      code: [
+        'class Meta2(type):',
+        '    def __getattribute__(self, name):',
+        '        if name == "__name__":',
+        '            raise RuntimeError("name boom 2")',
+        '        return super().__getattribute__(name)',
+        'class Evil2(Exception, metaclass=Meta2):',
+        '    def __str__(self):',
+        '        raise RuntimeError("str boom")',
+        'raise Evil2("x")',
+      ].join('\n'),
+    })
+    const e2 = await k.next()
+    assert.equal(e2.type, 'error')
+    assert.equal(e2.phase, 'eval')
+    assert.equal(e2.kind, 'runtime_error')
+    assert.equal(e2.name, 'BaseException')
+    assert.equal(e2.message, 'BaseException')
+    k.send({ type: 'eval', id: 6, code: 'marker' })
+    const r4 = await k.next()
+    assert.equal(r4.type, 'result')
+    assert.equal(r4.result, '5')
+  } finally {
+    await k.close()
+  }
+})
+
 // ---- M1B: TypeScript runtime process protocol ----
 
 import { createRlmRuntime, RlmError } from '../src/runtime.ts'
@@ -386,6 +810,28 @@ test('M1B: a bad python command is a spawn failure', async () => {
       runtime.eval('sp', { code: '1' }),
       (err: unknown) => err instanceof RlmError && err.kind === 'spawn',
     )
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M1B Issue#5: a raising __repr__ is kind=eval and the same kernel keeps its globals', async () => {
+  const runtime = rt()
+  try {
+    const pidOut = await runtime.eval('repr', { code: 'import os\nos.getpid()' })
+    const pid = Number(pidOut.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + pidOut.result)
+    await runtime.eval('repr', { code: 'marker = 1' })
+    await assert.rejects(
+      runtime.eval('repr', {
+        code: 'class Boom:\n    def __repr__(self):\n        raise RuntimeError("repr boom")\nBoom()',
+      }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval' && /repr boom/.test(err.message),
+    )
+    const pidAgain = await runtime.eval('repr', { code: 'import os\nos.getpid()' })
+    assert.equal(pidAgain.result, String(pid))
+    const markerOut = await runtime.eval('repr', { code: 'marker' })
+    assert.equal(markerOut.result, '1')
   } finally {
     runtime.dispose()
   }
