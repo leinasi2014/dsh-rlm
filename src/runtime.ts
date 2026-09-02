@@ -619,6 +619,12 @@ class RlmRuntimeImpl implements RlmRuntime {
     if (this.disposed) {
       throw new RlmError('closed', 'runtime is disposed')
     }
+    // One effective timeout is the total budget for the whole eval: it is taken
+    // at the true entry so the synchronous kernel lookup/construction (spawn)
+    // is already charged to the same deadline that waitReady and evalCell
+    // consume; a slow startup can never stack a second full timeout.
+    const budget = input.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT
+    const deadline = Date.now() + budget
     let kernel = this.kernels.get(sessionKey)
     if (!kernel) {
       kernel = new Kernel(sessionKey, this.config)
@@ -627,11 +633,6 @@ class RlmRuntimeImpl implements RlmRuntime {
       }
       this.kernels.set(sessionKey, kernel)
     }
-    // One effective timeout is the total budget for the whole eval: the ready
-    // handshake and the cell execution consume the same deadline, so a slow
-    // startup cannot stack a second full timeout onto the cell.
-    const budget = input.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT
-    const deadline = Date.now() + budget
     await kernel.waitReady({
       timeout: Math.max(0, deadline - Date.now()),
       ...(input.signal ? { signal: input.signal } : {}),

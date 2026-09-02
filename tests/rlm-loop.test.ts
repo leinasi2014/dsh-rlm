@@ -348,12 +348,18 @@ test('M1B: a cell that runs past its timeout is terminated', async () => {
 test('M1B: after a timeout a later eval starts a fresh kernel', async () => {
   const runtime = rt({ timeout: 300 })
   try {
+    // The first eval keeps the tight 300ms budget: it must time out and evict
+    // the kernel exactly as before.
     await assert.rejects(
       runtime.eval('fresh', { code: 'import time\ntime.sleep(5)\nval = 1' }),
       (err: unknown) => err instanceof RlmError && err.kind === 'timeout',
     )
+    // The second eval is a fresh-namespace semantic check (NameError), not a
+    // cold-start probe: give it an explicit generous budget so a slow Windows
+    // Python start is never mistaken for a semantic error. The production
+    // default timeout is unchanged.
     await assert.rejects(
-      runtime.eval('fresh', { code: 'val' }),
+      runtime.eval('fresh', { code: 'val', timeout: 5000 }),
       (err: unknown) => err instanceof RlmError && err.kind === 'eval',
     )
   } finally {
