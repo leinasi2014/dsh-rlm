@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import {
+  addedRecordText,
   materialPathReferenced,
   parseRecords,
   removedRecordLines,
@@ -55,6 +56,48 @@ test('rejects duplicate record IDs across workstream shards', () => {
 test('detects changed or removed historical JSONL lines', () => {
   const diff = '--- a/record.jsonl\n+++ b/record.jsonl\n-old record\n+new record\n'
   assert.deepEqual(removedRecordLines(diff), ['-old record'])
+})
+
+test('accepts an append after an unterminated final record without treating it as rewritten', () => {
+  const prior = JSON.stringify(validEntry)
+  const appended = JSON.stringify({ ...validEntry, recordId: 'mem-20260902-next-agent' })
+  const diff = [
+    '--- a/record.jsonl',
+    '+++ b/record.jsonl',
+    `-${prior}`,
+    '\\ No newline at end of file',
+    `+${prior}`,
+    `+${appended}`,
+    '\\ No newline at end of file',
+    '',
+  ].join('\n')
+
+  assert.deepEqual(removedRecordLines(diff), [])
+  assert.equal(addedRecordText(diff), appended)
+})
+
+test('still rejects changing an unterminated final record', () => {
+  const diffs = [
+    '-old record\n\\ No newline at end of file\n+changed record\n+new record',
+    '-old record\n\\ No newline at end of file',
+    '-first record\n-second record\n\\ No newline at end of file\n+second record\n+first record',
+  ]
+  for (const diff of diffs) assert.ok(removedRecordLines(diff).length > 0)
+})
+
+test('keeps a truly duplicated record visible after terminal-newline normalization', () => {
+  const record = JSON.stringify(validEntry)
+  const diff = [
+    `-${record}`,
+    '\\ No newline at end of file',
+    `+${record}`,
+    `+${record}`,
+  ].join('\n')
+  const added = JSON.parse(addedRecordText(diff))
+
+  assert.ok(validateRecordSet([
+    { source: 'record.jsonl', entries: [validEntry, added] },
+  ]).some((error) => error.includes('duplicate recordId')))
 })
 
 test('requires at least one changed material path to be referenced', () => {

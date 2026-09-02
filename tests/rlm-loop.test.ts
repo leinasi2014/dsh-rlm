@@ -1,6 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -346,12 +348,18 @@ test('M1B: a cell that runs past its timeout is terminated', async () => {
 test('M1B: after a timeout a later eval starts a fresh kernel', async () => {
   const runtime = rt({ timeout: 300 })
   try {
+    // The first eval keeps the tight 300ms budget: it must time out and evict
+    // the kernel exactly as before.
     await assert.rejects(
       runtime.eval('fresh', { code: 'import time\ntime.sleep(5)\nval = 1' }),
       (err: unknown) => err instanceof RlmError && err.kind === 'timeout',
     )
+    // The second eval is a fresh-namespace semantic check (NameError), not a
+    // cold-start probe: give it an explicit generous budget so a slow Windows
+    // Python start is never mistaken for a semantic error. The production
+    // default timeout is unchanged.
     await assert.rejects(
-      runtime.eval('fresh', { code: 'val' }),
+      runtime.eval('fresh', { code: 'val', timeout: 5000 }),
       (err: unknown) => err instanceof RlmError && err.kind === 'eval',
     )
   } finally {
@@ -667,6 +675,350 @@ test('M2: cancelling and disposing leaves no orphaned kernel process', async () 
 
     const gone = await waitForPidGone(pid)
     assert.ok(gone, 'kernel pid ' + pid + ' is still alive after cancel + dispose')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+// ---- M2 Issue #1: protocol-fault kill, ready deadline/abort, terminal dispose ----
+
+/**
+ * Wait until the silent-kernel marker writes the child's OS pid. Used instead
+ * of a fixed sleep so the ready-timeout/abort tests stay event-driven.
+ */
+async function waitForPidFile(pidFile: string, timeoutMs = 5000): Promise<number> {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (existsSync(pidFile)) return Number(readFileSync(pidFile, 'utf8'))
+    await new Promise((r) => setTimeout(r, 25))
+  }
+  throw new Error('silent kernel pid marker was not written in time')
+}
+
+/**
+ * Run the very next Python process with a `sitecustomize` that writes its own
+ * PID to a marker file and then executes `body` (Python statements) before
+ * blocking. Shadowing `sitecustomize` through PYTHONPATH lets tests simulate a
+ * kernel that never sends `ready` or one that sends a bad `ready` frame,
+ * without touching `python-runtime/rlm_kernel.py`.
+ */
+async function withPressedKernel<T>(body: string, fn: (pidFile: string) => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-silent-'))
+  const pidFile = path.join(dir, 'pid.txt')
+  const py =
+    'import os, time\nopen(' + JSON.stringify(pidFile) + ', "w").write(str(os.getpid()))\n'
+    + body + '\ntime.sleep(60)\n'
+  writeFileSync(path.join(dir, 'sitecustomize.py'), py)
+  const prev = process.env.PYTHONPATH
+  process.env.PYTHONPATH = dir + path.delimiter + (prev ?? '')
+  try {
+    return await fn(pidFile)
+  } finally {
+    if (prev === undefined) delete process.env.PYTHONPATH
+    else process.env.PYTHONPATH = prev
+    rmSync(dir, { recursive: true, force: true })
+  }
+}
+
+function withHungKernel<T>(fn: (pidFile: string) => Promise<T>): Promise<T> {
+  return withPressedKernel('', fn)
+}
+
+test('M2: a corrupt JSON frame from the kernel kills and evicts the process tree', async () => {
+  const runtime = rt()
+  try {
+    await runtime.eval('fault-json', { code: 'marker = 7' })
+    const pidOut = await runtime.eval('fault-json', { code: 'import os\nos.getpid()' })
+    const pid = Number(pidOut.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + pidOut.result)
+
+    await assert.rejects(
+      runtime.eval('fault-json', {
+        code: `import sys
+sys.__stdout__.write('this is not json\\n')`,
+      }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'protocol',
+    )
+    const gone = await waitForPidGone(pid)
+    assert.ok(gone, 'corrupt JSON frame left kernel pid ' + pid + ' alive')
+    // The kernel was evicted, so the next eval starts a fresh namespace.
+    await assert.rejects(
+      runtime.eval('fault-json', { code: 'marker' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: a non-object frame from the kernel kills and evicts the process tree', async () => {
+  const runtime = rt()
+  try {
+    const pidOut = await runtime.eval('fault-array', { code: 'import os\nos.getpid()' })
+    const pid = Number(pidOut.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + pidOut.result)
+
+    await assert.rejects(
+      runtime.eval('fault-array', {
+        code: `import sys
+sys.__stdout__.write('[1, 2, 3]\\n')`,
+      }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'protocol',
+    )
+    const gone = await waitForPidGone(pid)
+    assert.ok(gone, 'non-object frame left kernel pid ' + pid + ' alive')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: an unknown frame type from the kernel kills and evicts the process tree', async () => {
+  const runtime = rt()
+  try {
+    const pidOut = await runtime.eval('fault-unknown', { code: 'import os\nos.getpid()' })
+    const pid = Number(pidOut.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + pidOut.result)
+
+    await assert.rejects(
+      runtime.eval('fault-unknown', {
+        code: `import sys
+sys.__stdout__.write('{"type":"mystery"}\\n')`,
+      }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'protocol',
+    )
+    const gone = await waitForPidGone(pid)
+    assert.ok(gone, 'unknown frame type left kernel pid ' + pid + ' alive')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: a frame with a wrong request id from the kernel kills and evicts the process tree', async () => {
+  const runtime = rt()
+  try {
+    const pidOut = await runtime.eval('fault-id', { code: 'import os\nos.getpid()' })
+    const pid = Number(pidOut.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + pidOut.result)
+
+    await assert.rejects(
+      runtime.eval('fault-id', {
+        code: `import sys, json
+sys.__stdout__.write(json.dumps({"type": "result", "id": 999, "stdout": "", "truncated": False}) + "\\n")`,
+      }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'protocol',
+    )
+    const gone = await waitForPidGone(pid)
+    assert.ok(gone, 'wrong request id left kernel pid ' + pid + ' alive')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: a wrong ready version terminates the startup path once, kills, and evicts', async () => {
+  const runtime = rt()
+  try {
+    await withPressedKernel(
+      `import sys, json
+sys.stdout.write(json.dumps({"type": "ready", "version": 999}) + "\\n")
+sys.stdout.flush()`,
+      async (pidFile) => {
+        const pending = runtime.eval('bad-version', { code: '1' })
+        // Attach the rejection handler immediately: the bad ready frame can
+        // arrive before the pid marker poll completes, and an unhandled
+        // rejection would turn this test into a spurious failure.
+        const rejection = assert.rejects(
+          pending,
+          (err: unknown) =>
+            err instanceof RlmError && err.kind === 'protocol' && /version/.test(err.message),
+        )
+        const pid = await waitForPidFile(pidFile)
+        await rejection
+        const gone = await waitForPidGone(pid)
+        assert.ok(gone, 'bad-ready-version kernel pid ' + pid + ' is still alive')
+      },
+    )
+    // After the pressed startup window, the same session gets a fresh kernel.
+    const out = await runtime.eval('bad-version', { code: '2 + 2' })
+    assert.equal(out.result, '4')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: a silent kernel that never sends ready is killed by the startup deadline', async () => {
+  const runtime = rt({ timeout: 1500 })
+  try {
+    await withHungKernel(async (pidFile) => {
+      const pending = runtime.eval('silent-ready', { code: '1' })
+      const rejection = assert.rejects(
+        pending,
+        (err: unknown) => err instanceof RlmError && err.kind === 'timeout' && /startup/.test(err.message),
+      )
+      const pid = await waitForPidFile(pidFile)
+      const start = Date.now()
+      await rejection
+      assert.ok(Date.now() - start < 5000, 'ready timeout must reject promptly, not hang')
+      const gone = await waitForPidGone(pid)
+      assert.ok(gone, 'silent kernel pid ' + pid + ' survived the startup deadline')
+    })
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: aborting during the ready handshake kills the kernel and rejects with cancel', async () => {
+  const runtime = rt()
+  try {
+    await withHungKernel(async (pidFile) => {
+      const ctl = new AbortController()
+      const pending = runtime.eval('ready-abort', { code: '1', signal: ctl.signal })
+      const rejection = assert.rejects(
+        pending,
+        (err: unknown) => err instanceof RlmError && err.kind === 'cancel' && /ready-cancel/.test(err.message),
+      )
+      // The child is up but cannot send `ready`; abort while the host waits.
+      const pid = await waitForPidFile(pidFile)
+      ctl.abort('ready-cancel')
+      await rejection
+      const gone = await waitForPidGone(pid)
+      assert.ok(gone, 'ready-aborted kernel pid ' + pid + ' is still alive')
+    })
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: disposing during the ready handshake settles the waiter and kills the kernel', async () => {
+  const runtime = rt()
+  try {
+    await withHungKernel(async (pidFile) => {
+      const pending = runtime.eval('ready-dispose', { code: '1' })
+      const rejection = assert.rejects(
+        pending,
+        (err: unknown) => err instanceof RlmError && err.kind === 'cancel',
+      )
+      const pid = await waitForPidFile(pidFile)
+      runtime.dispose()
+      await rejection
+      const gone = await waitForPidGone(pid)
+      assert.ok(gone, 'pid ' + pid + ' survived dispose during the ready handshake')
+    })
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2: dispose is terminal and a later eval is rejected without spawning', async () => {
+  // A missing interpreter would surface as `spawn` if eval still tried to
+  // start a kernel; the terminal-dispose check must win and reject `closed`.
+  const runtime = createRlmRuntime(undefined, { python: 'dsh-rlm-no-such-interpreter' })
+  runtime.dispose()
+  runtime.dispose()
+  const start = Date.now()
+  await assert.rejects(
+    runtime.eval('post-dispose', { code: '1' }),
+    (err: unknown) => err instanceof RlmError && err.kind === 'closed' && /disposed/.test(err.message),
+  )
+  assert.ok(Date.now() - start < 500, 'post-dispose eval must reject immediately')
+  runtime.dispose()
+})
+
+// ---- M2 Issue #1 successor: Windows kill fallback, shared deadline, ready guards ----
+
+test('M2 Issue#1 successor: a taskkill startup failure falls back and never crashes the host', {
+  skip: process.platform !== 'win32',
+}, async () => {
+  const runtime = rt({ timeout: 5000 })
+  const savedPath = process.env.PATH
+  const savedSystemRoot = process.env.SystemRoot
+  try {
+    // Live kernel so a terminal transition has a real OS pid to kill.
+    const idOut = await runtime.eval('tkfail', { code: 'import os\nos.getpid()' })
+    const pid = Number(idOut.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + idOut.result)
+
+    const ctl = new AbortController()
+    const pending = runtime.eval('tkfail', { code: runningCell(), signal: ctl.signal })
+    await new Promise((r) => setTimeout(r, SHORT_DELAY))
+    const rejection = assert.rejects(
+      pending,
+      (err: unknown) => err instanceof RlmError && err.kind === 'cancel',
+    )
+
+    // Make both the bare-name taskkill (the b1f13ae bug) and the canonical
+    // SystemRoot\System32\taskkill.exe resolution fail, then restore before any
+    // further probe so no other tooling sees a stripped environment.
+    const bogus = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-no-taskkill-'))
+    process.env.PATH = bogus
+    process.env.SystemRoot = bogus
+    try {
+      ctl.abort('tkfail-cancel')
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH
+      else process.env.PATH = savedPath
+      if (savedSystemRoot === undefined) delete process.env.SystemRoot
+      else process.env.SystemRoot = savedSystemRoot
+      rmSync(bogus, { recursive: true, force: true })
+    }
+
+    await rejection
+    const gone = await waitForPidGone(pid)
+    assert.ok(gone, 'kernel pid ' + pid + ' survived a taskkill startup failure without a fallback')
+
+    // The host survived the failed taskkill spawn (any unhandled ChildProcess
+    // 'error' would have exited the test process) and can still start kernels.
+    const out = await runtime.eval('tkfail-other', { code: '2 + 2' })
+    assert.equal(out.result, '4')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#1 successor: startup and cell share one total deadline', async () => {
+  const runtime = rt({ timeout: 1200 })
+  try {
+    await withPressedKernel(
+      `import time
+time.sleep(0.5)
+import sys, json
+sys.stdout.write(json.dumps({"type": "ready", "version": 1}) + "\\n")
+sys.stdout.flush()`,
+      async (pidFile) => {
+        const start = Date.now()
+        const pending = runtime.eval('shared-budget', { code: 'import time\ntime.sleep(60)' })
+        const rejection = assert.rejects(
+          pending,
+          (err: unknown) => err instanceof RlmError && err.kind === 'timeout',
+        )
+        const pid = await waitForPidFile(pidFile)
+        await rejection
+        const elapsed = Date.now() - start
+        // b1f13ae charges the full timeout to startup AND the cell (~0.5s+1.2s);
+        // the successor charges one budget (~1.2s) from eval entry.
+        assert.ok(elapsed < 1600, `eval exceeded a single 1200ms budget (${elapsed}ms)`)
+        const gone = await waitForPidGone(pid)
+        assert.ok(gone, 'shared-budget kernel pid ' + pid + ' is still alive after the deadline')
+      },
+    )
+    const out = await runtime.eval('shared-budget-other', { code: '2 + 2' })
+    assert.equal(out.result, '4')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#1 successor: a late abort after a settled eval cannot evict the idle kernel', async () => {
+  const runtime = rt()
+  try {
+    await runtime.eval('late-abort', { code: 'marker = 1' })
+    const ctl = new AbortController()
+    const out = await runtime.eval('late-abort', { code: 'marker + 1', signal: ctl.signal })
+    assert.equal(out.result, '2')
+    // The ready waiters' abort listener is removed synchronously when ready
+    // settles; a late abort must be a no-op on the idle kernel and its globals.
+    ctl.abort('too-late')
+    const again = await runtime.eval('late-abort', { code: 'marker + 2' })
+    assert.equal(again.result, '3')
   } finally {
     runtime.dispose()
   }

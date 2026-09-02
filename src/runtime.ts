@@ -18,11 +18,23 @@ const DEFAULT_MAX_STDOUT = 64 * 1024
 const DEFAULT_MAX_RESULT = 64 * 1024
 const DEFAULT_MAX_QUERIES = 16
 
+/**
+ * Resolve the canonical Windows tree-kill tool. A bare `taskkill` name would
+ * go through PATH, so a stripped PATH breaks cleanup and a planted CWD
+ * `taskkill.exe` could hijack it; the absolute System32 path (with the CWD
+ * search disabled at spawn time) is the pinned prime-agent reference's
+ * hardening. Env is read lazily so tests can inject a bogus SystemRoot
+ * without touching the global environment permanently.
+ */
+function resolveTaskkill(): string {
+  return path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe')
+}
+
 export interface RlmRuntimeConfig {
   enabled?: boolean
   /** Python interpreter command. Defaults to the `python` on PATH. */
   python?: string
-  /** Per-cell total timeout in milliseconds. */
+  /** Total timeout budget for one eval (startup handshake + cell execution). */
   timeout?: number
   /** Byte cap for a cell's captured stdout. */
   maxStdout?: number
@@ -35,7 +47,7 @@ export interface RlmRuntimeConfig {
 export interface RlmEvalInput {
   /** Python source; top-level await is supported. */
   code: string
-  /** Overrides the runtime's per-cell timeout for this call. */
+  /** Overrides the runtime's total timeout budget for this call (startup + cell). */
   timeout?: number
   /** Resolves an rlm_query(prompt) issued by the active cell. */
   onQuery?: (prompt: string) => Promise<string>
@@ -112,6 +124,7 @@ class Kernel {
   private pending: PendingEval | null = null
   private nextId = 1
   private stderr = ''
+  private killStarted = false
   private ready: Promise<void>
   private resolveReady!: () => void
   private rejectReady!: (err: RlmError) => void
@@ -196,11 +209,12 @@ class Kernel {
     switch (frame.type) {
       case 'ready': {
         if (frame.version !== PROTOCOL_VERSION) {
-          this.readyDone = true
-          this.rejectReady(
+          // A wrong protocol version is a startup protocol fault: route it
+          // through the single terminal transition so the process tree is
+          // killed, the kernel is evicted, and waiters settle exactly once.
+          this.handleExit(
             new RlmError('protocol', 'unsupported kernel protocol version: ' + String(frame.version)),
           )
-          this.kill()
           return
         }
         this.readyDone = true
@@ -365,14 +379,66 @@ class Kernel {
       this.pending = null
       p.reject(err)
     }
+    // Every terminal transition (protocol fault, timeout, cancel, dispose,
+    // spawn error, child close) must kill the owning process tree before the
+    // kernel is evicted, or the runtime loses its only handle to the PID.
+    this.kill()
     this.onExit?.(this)
   }
 
-  waitReady(): Promise<void> {
-    return this.ready
+  /**
+   * Wait for the ready handshake under the eval's startup deadline and the
+   * caller's abort signal. A deadline or abort here is a terminal kernel
+   * fault: it goes through `handleExit`, so the process tree is killed, the
+   * kernel evicted, and the waiter rejected exactly once.
+   */
+  waitReady(opts: { timeout: number; signal?: AbortSignal }): Promise<void> {
+    if (this.exited || this.disposed) {
+      return Promise.reject(new RlmError('closed', 'kernel is not running'))
+    }
+    if (this.readyDone) return this.ready
+    let cleanup = (): void => {}
+    // A local 'settled' guard makes the timer and the abort listener exact
+    // once: the first path to settle clears the timer/listener and is the only
+    // one allowed to drive `handleExit`, so a re-entrant or queued event
+    // between `resolveReady` and the finally-cleaned window is a no-op.
+    let settled = false
+    const finish = (err: RlmError): void => {
+      if (settled) return
+      settled = true
+      cleanup()
+      this.handleExit(err)
+    }
+    const timer = setTimeout(() => {
+      finish(new RlmError('timeout', 'kernel startup timed out after ' + opts.timeout + 'ms'))
+    }, opts.timeout)
+    cleanup = () => clearTimeout(timer)
+    const signal = opts.signal
+    if (signal) {
+      if (signal.aborted) {
+        finish(new RlmError('cancel', String(signal.reason ?? 'cancelled')))
+        return this.ready
+      }
+      const onAbort = (): void => {
+        finish(new RlmError('cancel', String(signal.reason ?? 'cancelled')))
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      const clearTimerOnly = cleanup
+      cleanup = () => {
+        clearTimerOnly()
+        signal.removeEventListener('abort', onAbort)
+      }
+    }
+    // The finally runs synchronously inside the ready settlement cascade
+    // (before any further macrotask can deliver another timer/abort event), so
+    // it marks the waiter settled and clears both handles on every path.
+    return this.ready.finally(() => {
+      settled = true
+      cleanup()
+    })
   }
 
-  async evalCell(input: RlmEvalInput): Promise<RlmEvalOutput> {
+  async evalCell(input: RlmEvalInput, deadline?: number): Promise<RlmEvalOutput> {
     await this.ready
     if (this.exited || this.disposed) {
       throw new RlmError('closed', 'kernel is not running')
@@ -381,7 +447,11 @@ class Kernel {
       throw new RlmError('busy', 'a cell is already running on this kernel')
     }
     const id = this.nextId++
-    const timeout = input.timeout ?? this.config.timeout
+    // The caller hands down the eval-entry deadline so startup and cell
+    // execution consume one budget instead of two full timeouts back to back.
+    const timeout = deadline === undefined
+      ? input.timeout ?? this.config.timeout
+      : Math.max(0, deadline - Date.now())
     let resolve!: (out: RlmEvalOutput) => void
     let reject!: (err: RlmError) => void
     const promise = new Promise<RlmEvalOutput>((res, rej) => {
@@ -439,6 +509,10 @@ class Kernel {
   }
 
   private kill(): void {
+    // Every terminal path calls kill; one attempt per kernel is enough, so
+    // repeated calls cannot stack taskkill spawns or redundant signals.
+    if (this.killStarted) return
+    this.killStarted = true
     const child = this.child
     if (!child || child.pid == null) {
       if (child && !child.killed) child.kill()
@@ -446,18 +520,7 @@ class Kernel {
     }
     const pid = child.pid
     if (process.platform === 'win32') {
-      try {
-        spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
-          stdio: 'ignore',
-          windowsHide: true,
-        })
-      } catch {
-        try {
-          child.kill()
-        } catch {
-          // ignore
-        }
-      }
+      this.killWin32(child, pid)
     } else {
       try {
         process.kill(-pid, 'SIGKILL')
@@ -471,9 +534,52 @@ class Kernel {
     }
   }
 
+  /**
+   * Windows tree kill: absolute System32 taskkill `/T /F` with the CWD search
+   * disabled (a bare PATH name can resolve a planted `taskkill.exe`). The
+   * async `error` must be listened because Windows reports a missing command
+   * after `spawn` returns; an unlistened error would crash the host. Any
+   * startup failure or non-zero close falls back to killing the direct child,
+   * so a terminal transition always settles.
+   */
+  private killWin32(child: ChildProcess, pid: number): void {
+    let fellBack = false
+    const fallback = (): void => {
+      if (fellBack) return
+      fellBack = true
+      try {
+        child.kill()
+      } catch {
+        // ignore; the kernel's own close handler reports the final state
+      }
+    }
+    let killer: ChildProcess
+    try {
+      killer = spawn(resolveTaskkill(), ['/pid', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        windowsHide: true,
+        env: { ...process.env, NoDefaultCurrentDirectoryInExePath: '1' },
+      })
+    } catch {
+      fallback()
+      return
+    }
+    killer.on('error', fallback)
+    killer.on('close', (code) => {
+      if (code !== 0) fallback()
+    })
+  }
+
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    this.exited = true
+    // A dispose during the ready handshake must settle the waiting eval; the
+    // startup waiters share the ready promise, so rejecting it unblocks them.
+    if (!this.readyDone) {
+      this.readyDone = true
+      this.rejectReady(new RlmError('cancel', 'runtime disposed while the kernel was starting'))
+    }
     const p = this.pending
     if (p) {
       this.clearTimer(p)
@@ -499,6 +605,7 @@ export interface RlmRuntime {
 class RlmRuntimeImpl implements RlmRuntime {
   private kernels = new Map<string, Kernel>()
   private config: RlmRuntimeConfig
+  private disposed = false
   constructor(config: RlmRuntimeConfig) {
     this.config = config
   }
@@ -508,6 +615,16 @@ class RlmRuntimeImpl implements RlmRuntime {
     if (input.signal?.aborted) {
       throw new RlmError('cancel', String(input.signal.reason ?? 'cancelled'))
     }
+    // Dispose is terminal: reject without looking up or starting any kernel.
+    if (this.disposed) {
+      throw new RlmError('closed', 'runtime is disposed')
+    }
+    // One effective timeout is the total budget for the whole eval: it is taken
+    // at the true entry so the synchronous kernel lookup/construction (spawn)
+    // is already charged to the same deadline that waitReady and evalCell
+    // consume; a slow startup can never stack a second full timeout.
+    const budget = input.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT
+    const deadline = Date.now() + budget
     let kernel = this.kernels.get(sessionKey)
     if (!kernel) {
       kernel = new Kernel(sessionKey, this.config)
@@ -516,11 +633,16 @@ class RlmRuntimeImpl implements RlmRuntime {
       }
       this.kernels.set(sessionKey, kernel)
     }
-    await kernel.waitReady()
-    return kernel.evalCell(input)
+    await kernel.waitReady({
+      timeout: Math.max(0, deadline - Date.now()),
+      ...(input.signal ? { signal: input.signal } : {}),
+    })
+    return kernel.evalCell(input, deadline)
   }
 
   dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
     for (const kernel of this.kernels.values()) kernel.dispose()
     this.kernels.clear()
   }

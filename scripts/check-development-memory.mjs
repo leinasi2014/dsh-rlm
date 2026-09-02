@@ -172,8 +172,27 @@ export function materialPathReferenced(changedPaths, entries) {
     changed.has(normalizeRepositoryPath(file.path ?? ''))))
 }
 
+export function analyzeRecordDiff(diff) {
+  const lines = diff.split(/\r?\n/)
+  const removed = []
+  const syntheticReadds = new Set()
+  for (const [index, line] of lines.entries()) {
+    if (!line.startsWith('-') || line.startsWith('---')) continue
+    const nextRecord = lines[index + 3]
+    const terminalNewlineAppend = lines[index + 1] === '\\ No newline at end of file' &&
+      lines[index + 2] === `+${line.slice(1)}` &&
+      nextRecord?.startsWith('+') && !nextRecord.startsWith('+++') &&
+      nextRecord.slice(1).trim().length > 0
+    if (terminalNewlineAppend) syntheticReadds.add(index + 2)
+    else removed.push(line)
+  }
+  const added = lines.filter((line, index) =>
+    line.startsWith('+') && !line.startsWith('+++') && !syntheticReadds.has(index))
+  return { added, removed }
+}
+
 export function removedRecordLines(diff) {
-  return diff.split(/\r?\n/).filter((line) => line.startsWith('-') && !line.startsWith('---'))
+  return analyzeRecordDiff(diff).removed
 }
 
 function recordFiles(directory) {
@@ -216,9 +235,8 @@ function recordDiff(args) {
   return git([...args, '--', RECORDS_ROOT])
 }
 
-function addedRecordText(diff) {
-  return diff.split(/\r?\n/)
-    .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+export function addedRecordText(diff) {
+  return analyzeRecordDiff(diff).added
     .map((line) => line.slice(1))
     .filter((line) => line.trim().length > 0)
     .join('\n')
