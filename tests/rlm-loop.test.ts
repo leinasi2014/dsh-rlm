@@ -36,10 +36,13 @@ class Kernel {
       this.buf += d
       let i: number
       while ((i = this.buf.indexOf('\n')) >= 0) {
-        const line = this.buf.slice(0, i).trim()
+        const rawLine = this.buf.slice(0, i)
         this.buf = this.buf.slice(i + 1)
+        const line = rawLine.trim()
         if (!line) continue
         const frame = JSON.parse(line) as Frame
+        // Test-only metadata: exact serialized JSONL wire bytes incl. the newline.
+        ;(frame as Frame & { wireBytes?: number }).wireBytes = Buffer.byteLength(rawLine, 'utf8') + 1
         const w = this.waiters.shift()
         if (w) w(frame)
         else this.lines.push(frame)
@@ -177,7 +180,7 @@ test('M1A: query failure is a typed error and kernel continues', async () => {
     })
     const e = await k.next()
     assert.equal(e.type, 'error')
-    assert.equal(e.phase, 'eval')
+    assert.equal(e.phase, 'query')
     assert.equal(e.kind, 'query_error')
     assert.equal(e.name, 'RlmQueryError')
     assert.equal(e.message, 'model unavailable')
@@ -711,7 +714,7 @@ test('M1B: a failing query callback surfaces as a cell error', async () => {
         },
       }),
       (err: unknown) =>
-        err instanceof RlmError && err.kind === 'eval' && /model down/.test(err.message),
+        err instanceof RlmError && err.kind === 'query' && /model down/.test(err.message),
     )
   } finally {
     runtime.dispose()
@@ -1465,6 +1468,663 @@ test('M2 Issue#1 successor: a late abort after a settled eval cannot evict the i
     ctl.abort('too-late')
     const again = await runtime.eval('late-abort', { code: 'marker + 2' })
     assert.equal(again.result, '3')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+// ---- M2 Issue #3: bounded wire / channel limits ----
+
+test('M2 Issue#3: a giant no-newline frame from the kernel is a protocol fault and evicts the kernel', async () => {
+  const runtime = rt({ timeout: 4000 })
+  try {
+    const pidOut = await runtime.eval('giant-nl', { code: 'import os\nos.getpid()' })
+    const pid = Number(pidOut.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + pidOut.result)
+    await assert.rejects(
+      runtime.eval('giant-nl', {
+        code: [
+          'import sys',
+          'sys.__stdout__.write("a" * (256 * 1024 + 1))',
+          'sys.__stdout__.flush()',
+          'import time',
+          'time.sleep(60)',
+        ].join('\n'),
+      }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'protocol',
+    )
+    const gone = await waitForPidGone(pid)
+    assert.ok(gone, 'giant no-newline frame left kernel pid ' + pid + ' alive')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#3: kernel stderr over 64KiB is capped in the error detail and marked truncated', async () => {
+  const runtime = rt()
+  try {
+    await assert.rejects(
+      runtime.eval('stderr-cap', {
+        code: [
+          'import sys',
+          'sys.stderr.write("e" * (64 * 1024 * 2))',
+          'sys.stderr.flush()',
+          'import os',
+          'os._exit(1)',
+        ].join('\n'),
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof RlmError)
+        assert.equal(err.kind, 'closed')
+        const detailed = (err as RlmError).detailed ?? ''
+        // The truncation marker counts inside the 64 KiB stderr budget: the
+        // final detailed string (prefix + " [stderr truncated]") must never
+        // exceed 64 KiB in total.
+        assert.ok(
+          Buffer.byteLength(detailed, 'utf8') <= 64 * 1024,
+          'stderr detail with marker is not bounded: ' + Buffer.byteLength(detailed, 'utf8') + ' bytes',
+        )
+        assert.ok(detailed.includes('[stderr truncated]'), 'stderr detail lacks a truncation marker')
+        return true
+      },
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#3: an over-size rlm_query prompt is a typed query error and never invokes the handler', async () => {
+  const runtime = rt()
+  let called = 0
+  try {
+    await assert.rejects(
+      runtime.eval('prompt-cap', {
+        code: 'await rlm_query("x" * (64 * 1024 + 1))',
+        onQuery: async () => {
+          called += 1
+          return 'unexpected'
+        },
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof RlmError)
+        assert.equal(err.kind, 'query')
+        assert.match(err.message, /prompt/i)
+        return true
+      },
+    )
+    assert.equal(called, 0, 'onQuery must not be called for an over-size prompt')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#3: an over-size multibyte query result is truncated code-point-safely and the kernel continues', async () => {
+  const runtime = rt()
+  try {
+    const pidOut = await runtime.eval('qr-cap', { code: 'import os\npid = os.getpid()\nmarker = 1\npid' })
+    const pid = Number(pidOut.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + pidOut.result)
+    let called = 0
+    const out = await runtime.eval('qr-cap', {
+      code: [
+        'text = await rlm_query("size")',
+        'n = len(text.encode("utf-8"))',
+        'bad = "\\ufffd" in text',
+        'f"{n}|{bad}"',
+      ].join('\n'),
+      onQuery: async () => {
+        called += 1
+        return '中'.repeat(64 * 1024)
+      },
+    })
+    assert.equal(called, 1)
+    assert.equal(out.truncated, true, 'over-size query result must be reported as truncated')
+    const [nStr, badStr] = (out.result ?? '').split('|')
+    const n = Number(nStr)
+    assert.ok(
+      Number.isInteger(n) && n <= 64 * 1024,
+      'query result text byte length not capped: ' + out.result,
+    )
+    assert.equal(badStr, 'False', 'query result truncation introduced U+FFFD: ' + out.result)
+    const cont = await runtime.eval('qr-cap', { code: 'marker' })
+    assert.equal(cont.result, '1')
+    const pidAgain = await runtime.eval('qr-cap', { code: 'import os\nos.getpid()' })
+    assert.equal(pidAgain.result, String(pid))
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#3: Python inbound giant no-newline frame fatals the kernel nonzero', async () => {
+  const k = new Kernel()
+  await ready(k)
+  try {
+    // Send strictly more than 256 KiB and no newline so the kernel reader must
+    // trip its own framing bound and fatal instead of buffering forever.
+    k.child.stdin.write('x'.repeat(256 * 1024 + 1))
+    const code = await Promise.race([
+      k.exit,
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error('kernel did not fatal on a giant no-newline inbound frame')),
+          5000,
+        ),
+      ),
+    ])
+    assert.notEqual(code, 0, 'expected the Python kernel to exit nonzero')
+    assert.match(k.stderr, /(frame|protocol|256 ?KiB)/i)
+  } finally {
+    try {
+      k.child.stdin.end()
+    } catch {
+      // ignore
+    }
+    await k.exit.catch(() => {})
+  }
+})
+
+test('M2 Issue#3: host outbound giant eval frame is a protocol error and preserves the kernel', async () => {
+  const runtime = rt()
+  try {
+    const seed = await runtime.eval('out-cap', { code: 'import os\npid = os.getpid()\nmarker = 23\npid' })
+    const pid = Number(seed.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + seed.result)
+    const bigCode = 'x'.repeat(300 * 1024)
+    await assert.rejects(
+      runtime.eval('out-cap', { code: bigCode }),
+      (err: unknown) =>
+        err instanceof RlmError
+          && err.kind === 'protocol'
+          && /frame/i.test(err.message)
+          && /256 ?KiB/i.test(err.message),
+    )
+    const ret = await runtime.eval('out-cap', { code: 'marker' })
+    assert.equal(ret.result, '23')
+    const pidAgain = await runtime.eval('out-cap', { code: 'import os\nos.getpid()' })
+    assert.equal(pidAgain.result, String(pid))
+  } finally {
+    runtime.dispose()
+  }
+})
+
+
+
+test('M2 Issue#3: query rejection bounds message and detailed and preserves the kernel', async () => {
+  const runtime = rt()
+  try {
+    const seed = await runtime.eval('q-reject-cap', { code: 'import os\npid = os.getpid()\nmarker = 7\npid' })
+    const pid = Number(seed.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + seed.result)
+    await assert.rejects(
+      runtime.eval('q-reject-cap', {
+        code: 'await rlm_query("q")',
+        onQuery: async () => {
+          const err = new Error('错'.repeat(64 * 1024))
+          ;(err as { detail?: string }).detail = '详'.repeat(64 * 1024)
+          throw err
+        },
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof RlmError, 'expected a typed RlmError')
+        const r = err as RlmError
+        const message = r.message
+        assert.ok(
+          Buffer.byteLength(message, 'utf8') <= 64 * 1024 + 256,
+          'error message not bounded: ' + Buffer.byteLength(message, 'utf8') + ' bytes',
+        )
+        assert.ok(message.includes('[query error truncated]'), 'error message lacks [query error truncated]')
+        assert.ok(!message.includes('\uFFFD'), 'error message contains U+FFFD')
+        const detailed = r.detailed ?? ''
+        assert.ok(
+          Buffer.byteLength(detailed, 'utf8') <= 64 * 1024 + 256,
+          'error detailed not bounded: ' + Buffer.byteLength(detailed, 'utf8') + ' bytes',
+        )
+        assert.ok(detailed.includes('[query error truncated]'), 'error detailed lacks [query error truncated]')
+        assert.ok(!detailed.includes('\uFFFD'), 'error detailed contains U+FFFD')
+        return true
+      },
+    )
+    const ret = await runtime.eval('q-reject-cap', { code: 'marker' })
+    assert.equal(ret.result, '7')
+    const pidAgain = await runtime.eval('q-reject-cap', { code: 'import os\nos.getpid()' })
+    assert.equal(pidAgain.result, String(pid))
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#3: Python outbound serialized frames fit the 256 KiB wire budget', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'import os\nos.getpid()' })
+    const pidFrame = await k.next()
+    assert.equal(pidFrame.type, 'result')
+    const pid = Number(pidFrame.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + pidFrame.result)
+
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: 'import sys\nsys.stdout.write("\\x01" * (64 * 1024))\n"\\x01" * (64 * 1024)',
+    })
+    const r = await k.next()
+    assert.equal(r.type, 'result')
+    const wire = (r as Frame & { wireBytes?: number }).wireBytes as number
+    assert.ok(wire <= 256 * 1024, 'result frame wire bytes exceed 256 KiB: ' + wire)
+    assert.equal(r.truncated, true, 'result frame must be marked truncated when fields are shrunk')
+    assert.ok(Buffer.byteLength(String(r.stdout), 'utf8') <= 64 * 1024, 'result stdout not bounded')
+    assert.ok(Buffer.byteLength(String(r.result), 'utf8') <= 64 * 1024, 'result result not bounded')
+    assert.ok(!String(r.stdout).includes('\uFFFD'), 'result stdout contains U+FFFD')
+    assert.ok(!String(r.result).includes('\uFFFD'), 'result result contains U+FFFD')
+
+    k.send({
+      type: 'eval',
+      id: 3,
+      code: [
+        'class Boom(Exception):',
+        '    pass',
+        'e = Boom("错" * (64 * 1024))',
+        'e.detail = "详" * (64 * 1024)',
+        'raise e',
+      ].join('\n'),
+    })
+    const e = await k.next()
+    assert.equal(e.type, 'error')
+    const ewire = (e as Frame & { wireBytes?: number }).wireBytes as number
+    assert.ok(ewire <= 256 * 1024, 'error frame wire bytes exceed 256 KiB: ' + ewire)
+    const emsg = String(e.message ?? '')
+    const edet = String(e.detail ?? '')
+    assert.ok(Buffer.byteLength(emsg, 'utf8') <= 64 * 1024 + 256, 'error message not bounded')
+    assert.ok(Buffer.byteLength(edet, 'utf8') <= 64 * 1024 + 256, 'error detail not bounded')
+    assert.ok(
+      e.truncated === true || emsg.includes('[error truncated]') || edet.includes('[error truncated]'),
+      'error frame not marked truncated',
+    )
+    assert.ok(!emsg.includes('\uFFFD') && !edet.includes('\uFFFD'), 'error frame contains U+FFFD')
+
+    k.send({ type: 'eval', id: 4, code: 'import os\nos.getpid()' })
+    const pidAgain = await k.next()
+    assert.equal(Number(pidAgain.result), pid, 'kernel PID changed after capped outbound frames')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M2 Issue#3: an error frame with non-shrinkable oversized metadata makes progress or fatals', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    // A runtime-constructed exception whose class __name__ is ~300 KiB lands in
+    // the error frame's `name` field, which the kernel's adaptive shrink loop
+    // does not treat as shrinkable; the only shrinkable text field (message
+    // "x") is already at its 1-byte floor. A shrink loop that cannot make
+    // progress would spin forever instead of sending a bounded error frame or
+    // fatalling, so the test owns its own short deadline and kills the child.
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: 'E = type("E" * 300000, (Exception,), {})\nraise E("x")',
+    })
+    const outcome = await Promise.race([
+      k.next(5000).then((f): { kind: 'frame'; f: Frame } => ({ kind: 'frame', f })),
+      k.exit.then((code): { kind: 'exit'; code: number | null } => ({ kind: 'exit', code })),
+    ])
+    if (outcome.kind === 'exit') {
+      assert.notEqual(outcome.code, 0, 'a kernel self-fatal must exit nonzero')
+    } else {
+      assert.equal(outcome.f.type, 'error')
+      const wire = (outcome.f as Frame & { wireBytes?: number }).wireBytes as number
+      assert.ok(wire <= 256 * 1024, 'error frame wire bytes exceed 256 KiB: ' + wire)
+      // Recoverable typed error: the same kernel must keep serving.
+      k.send({ type: 'eval', id: 2, code: '1 + 1' })
+      const r = await k.next(5000)
+      assert.equal(r.type, 'result')
+      assert.equal(r.result, '2')
+    }
+  } finally {
+    try {
+      k.child.kill()
+    } catch {
+      // already dead
+    }
+    await k.exit.catch(() => {})
+  }
+})
+
+test('M2 Issue#3: a control-character query result is shrunk to the wire budget instead of protocol-killing', async () => {
+  const runtime = rt({ timeout: 5000 })
+  try {
+    const seed = await runtime.eval('ctrl-result', { code: 'import os\npid = os.getpid()\nmarker = 3\npid' })
+    const pid = Number(seed.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + seed.result)
+    // 64 KiB of U+0001: the raw UTF-8 payload is NOT over the 64 KiB payload
+    // cap, but JSON.stringify escapes every control char to 6 bytes, so the
+    // serialized query_result line would be ~384 KiB. The host must shrink by
+    // the real JSONL wire budget (code-point-safe, explicit truncated) instead
+    // of tripping the central outbound guard into a protocol kill/evict.
+    const out = await runtime.eval('ctrl-result', {
+      code: [
+        'text = await rlm_query("ctrl")',
+        'n = len(text.encode("utf-8"))',
+        'bad = "\\ufffd" in text',
+        'f"{n}|{bad}"',
+      ].join('\n'),
+      onQuery: async () => '\u0001'.repeat(64 * 1024),
+    })
+    assert.equal(out.truncated, true, 'wire-shrunk control-char result must be marked truncated')
+    const [nStr, badStr] = (out.result ?? '').split('|')
+    const n = Number(nStr)
+    assert.ok(
+      Number.isInteger(n) && n <= 64 * 1024,
+      'control-char result byte length not capped: ' + out.result,
+    )
+    assert.equal(badStr, 'False', 'control-char result contains U+FFFD')
+    // The cell must have SUCCEEDED (not a protocol kill/evict), so the same
+    // session kernel still owns the same PID and globals.
+    const cont = await runtime.eval('ctrl-result', { code: 'marker' })
+    assert.equal(cont.result, '3')
+    const pidAgain = await runtime.eval('ctrl-result', { code: 'import os\nos.getpid()' })
+    assert.equal(pidAgain.result, String(pid))
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#3: kernel stdout JSONL uses LF-only line delimiters on Windows', async () => {
+  const child = spawn(pythonCmd, [kernelPath], { stdio: ['pipe', 'pipe', 'pipe'] })
+  let raw = Buffer.alloc(0)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const delimiter = await new Promise<{ index: number; precededByCR: boolean }>((resolve, reject) => {
+      timer = setTimeout(() => reject(new Error('no LF delimiter in kernel stdout within 5s')), 5000)
+      const onData = (d: Buffer): void => {
+        raw = Buffer.concat([raw, d])
+        const i = raw.indexOf(0x0a)
+        if (i < 0) return
+        clearTimeout(timer)
+        child.stdout.removeListener('data', onData)
+        resolve({ index: i, precededByCR: raw[i - 1] === 0x0d })
+      }
+      child.stdout.on('data', onData)
+    })
+    assert.ok(delimiter.index > 0, 'no line delimiter found in kernel stdout')
+    assert.equal(
+      delimiter.precededByCR,
+      false,
+      'kernel stdout writes CRLF line endings; JSONL must use LF-only delimiters',
+    )
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    child.kill()
+    await new Promise((r) => child.on('close', r))
+  }
+})
+
+test('M2 Issue#3: host counts the untrimmed raw line, so a whitespace-padded ready frame is a protocol fault', async () => {
+  const runtime = rt({ timeout: 4000 })
+  try {
+    await withPressedKernel(
+      [
+        'import sys, json, time',
+        // Content before CR is exactly MAX_FRAME_BYTES - 1 = 262143 bytes:
+        // valid ready JSON plus trailing spaces, then a CRLF terminator (real
+        // wire 262145 bytes). The write is split into two deliveries with a
+        // gap: the first 250000 bytes carry no newline (the no-newline buffer
+        // guard allows it), and the second delivery carries the remaining
+        // content plus CRLF, so onData sees the newline in a later data event
+        // and reaches the trim-then-count path. The host must count the
+        // untrimmed raw line and reject before ever accepting ready.
+        'payload = json.dumps({"type": "ready", "version": 1, "python": "x"}).encode("utf-8")',
+        'content = payload + b" " * (262143 - len(payload))',
+        'sys.stdout.buffer.write(content[:250000])',
+        'sys.stdout.buffer.flush()',
+        'time.sleep(0.1)',
+        'sys.stdout.buffer.write(content[250000:] + b"\\r\\n")',
+        'sys.stdout.buffer.flush()',
+        // If the host wrongly accepts the ready frame, serve its eval with a
+        // result so the acceptance is observable as a successful eval.
+        'for raw in sys.stdin.buffer:',
+        '    try:',
+        '        frame = json.loads(raw.decode("utf-8"))',
+        '    except Exception:',
+        '        break',
+        '    if frame.get("type") != "eval":',
+        '        break',
+        '    sys.stdout.buffer.write(json.dumps({"type": "result", "id": frame.get("id"), "stdout": "", "result": "11", "truncated": False}).encode("utf-8") + b"\\n")',
+        '    sys.stdout.buffer.flush()',
+      ].join('\n'),
+      async (pidFile) => {
+        const pending = runtime.eval('raw-line-cap', { code: '1' })
+        const rejection = assert.rejects(
+          pending,
+          (err: unknown) =>
+            err instanceof RlmError && err.kind === 'protocol' && /frame/i.test(err.message),
+        )
+        const pid = await waitForPidFile(pidFile)
+        await rejection
+        const gone = await waitForPidGone(pid)
+        assert.ok(gone, 'whitespace-padded kernel pid ' + pid + ' survived the raw-line protocol fault')
+      },
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#3: an exact 256 KiB no-newline inbound line fatals the kernel while the writer stays open', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    // Exactly MAX_FRAME_BYTES bytes with no newline and stdin left open:
+    // readline(MAX + 1) would wait for the 262145th byte, so the kernel must
+    // instead detect the bound itself and fatal within a short deadline.
+    k.child.stdin.write('x'.repeat(256 * 1024))
+    const code = await Promise.race([
+      k.exit,
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error('kernel did not fatal on an exact-256KiB newline-less inbound frame')),
+          5000,
+        ),
+      ),
+    ])
+    assert.notEqual(code, 0, 'expected the Python kernel to exit nonzero')
+    assert.match(k.stderr, /(frame|protocol|256 ?KiB)/i)
+  } finally {
+    try {
+      k.child.kill()
+    } catch {
+      // already dead
+    }
+    await k.exit.catch(() => {})
+  }
+})
+
+
+test('M2 Issue#3: a control-character query rejection is a typed query error with truncated=true and no protocol kill', async () => {
+  const runtime = rt({ timeout: 5000 })
+  try {
+    const seed = await runtime.eval('qerr-ctrl', { code: 'import os\npid = os.getpid()\nmarker = 9\npid' })
+    const pid = Number(seed.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + seed.result)
+    await assert.rejects(
+      runtime.eval('qerr-ctrl', {
+        code: 'await rlm_query("q")',
+        onQuery: async () => {
+          const err = new Error('\u0001'.repeat(64 * 1024))
+          ;(err as { detail?: string }).detail = '\u0001'.repeat(64 * 1024)
+          throw err
+        },
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof RlmError, 'expected a typed RlmError, got ' + String(err))
+        const r = err as RlmError
+        assert.equal(r.kind, 'query', 'a query rejection must surface as RlmError kind=query')
+        assert.equal(r.truncated, true, 'wire-fitted query error must be marked truncated')
+        assert.ok(Buffer.byteLength(r.message, 'utf8') <= 64 * 1024, 'error message not bounded')
+        assert.ok(Buffer.byteLength(r.detailed ?? '', 'utf8') <= 64 * 1024, 'error detailed not bounded')
+        assert.ok(!r.message.includes('\uFFFD'), 'error message contains U+FFFD')
+        assert.ok(!(r.detailed ?? '').includes('\uFFFD'), 'error detailed contains U+FFFD')
+        return true
+      },
+    )
+    const cont = await runtime.eval('qerr-ctrl', { code: 'marker' })
+    assert.equal(cont.result, '9')
+    const pidAgain = await runtime.eval('qerr-ctrl', { code: 'import os\nos.getpid()' })
+    assert.equal(pidAgain.result, String(pid))
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#3: host onError surfaces frame.truncated and stable JSON text for structured detail', async () => {
+  const runtime = rt()
+  try {
+    const seed = await runtime.eval('onerr', { code: 'import os\npid = os.getpid()\nmarker = 5\npid' })
+    const pid = Number(seed.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + seed.result)
+    await assert.rejects(
+      runtime.eval('onerr', {
+        code: 'e = RuntimeError("x" * (64 * 1024 + 1))\ne.detail = [1, 2, 3]\nraise e',
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof RlmError)
+        const r = err as RlmError
+        assert.equal(r.truncated, true, 'frame.truncated must propagate to RlmError')
+        assert.equal(r.detailed, '[1,2,3]', 'structured detail must keep stable JSON text')
+        return true
+      },
+    )
+    await assert.rejects(
+      runtime.eval('onerr', {
+        code: 'e = RuntimeError("boom")\ne.detail = {"code": "x"}\nraise e',
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof RlmError)
+        assert.equal((err as RlmError).detailed, '{"code":"x"}', 'object detail must keep stable JSON text')
+        return true
+      },
+    )
+    const cont = await runtime.eval('onerr', { code: 'marker' })
+    assert.equal(cont.result, '5')
+    const pidAgain = await runtime.eval('onerr', { code: 'import os\nos.getpid()' })
+    assert.equal(pidAgain.result, String(pid))
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#3: rlm_eval tool failure carries the bounded detailed and a truncation hint', async () => {
+  const m = makeMockCtx()
+  const hostile = Object.assign(new Error('\u0001'.repeat(64 * 1024)), {
+    detail: '\u0001'.repeat(64 * 1024),
+  })
+  m.run.result = Promise.reject(hostile)
+  // The real kernel round-trip attaches the await on `run.result` only after
+  // the query frame arrives, so mark the rejection handled immediately to keep
+  // it from surfacing as an unhandled rejection; the awaited rejection is
+  // unaffected because a promise can serve any number of consumers.
+  m.run.result.catch(() => {})
+  registerRlmPlugin(m.ctx, { enabled: true })
+  const tool = m.registered[0]
+  try {
+    await assert.rejects(
+      tool.execute({ code: 'await rlm_query("q")' }, makeExec('sess-tool-qerr')),
+      (err: unknown) => {
+        assert.ok(err instanceof Error)
+        const msg = err.message
+        assert.match(msg, /rlm_eval failed \((query|eval)\):/, 'tool error must keep the typed kind')
+        assert.ok(msg.includes('Detail:'), 'tool error must include the bounded query detailed')
+        assert.ok(
+          msg.includes('[query error truncated]') || msg.includes('[truncated]'),
+          'tool error must include a truncation hint',
+        )
+        assert.ok(
+          Buffer.byteLength(msg, 'utf8') <= 64 * 1024 + 256,
+          'tool error message is not bounded: ' + Buffer.byteLength(msg, 'utf8') + ' bytes',
+        )
+        return true
+      },
+    )
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M2 Issue#3: hostile query rejection with throwing detail getters still yields a typed error promptly', async () => {
+  const runtime = rt({ timeout: 4000 })
+  try {
+    const seed = await runtime.eval('hostile-q', { code: 'import os\npid = os.getpid()\nmarker = 4\npid' })
+    const pid = Number(seed.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + seed.result)
+    // Variant A: detail/detailed getters throw on access.
+    const evil = new Error('boom-getter')
+    Object.defineProperty(evil, 'detail', { get() { throw new Error('detail getter boom') } })
+    Object.defineProperty(evil, 'detailed', { get() { throw new Error('detailed getter boom') } })
+    const startA = Date.now()
+    await assert.rejects(
+      runtime.eval('hostile-q', {
+        code: 'await rlm_query("q")',
+        onQuery: async () => {
+          throw evil
+        },
+      }),
+      (err: unknown) => err instanceof RlmError && /boom-getter/.test(err.message),
+    )
+    assert.ok(Date.now() - startA < 4000, 'hostile getter must not hang until the cell timeout')
+    // Variant B: toString throws, no detail attributes at all.
+    const evilB = new Error('boom-tostring')
+    ;(evilB as { toString: () => string }).toString = () => {
+      throw new Error('toString boom')
+    }
+    await assert.rejects(
+      runtime.eval('hostile-q', {
+        code: 'await rlm_query("q")',
+        onQuery: async () => {
+          throw evilB
+        },
+      }),
+      (err: unknown) => err instanceof RlmError && /boom-tostring/.test(err.message),
+    )
+    const cont = await runtime.eval('hostile-q', { code: 'marker' })
+    assert.equal(cont.result, '4')
+    const pidAgain = await runtime.eval('hostile-q', { code: 'import os\nos.getpid()' })
+    assert.equal(pidAgain.result, String(pid))
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#3: oversized lone-surrogate detail keeps real U+D800 code units after truncation', async () => {
+  const runtime = rt()
+  try {
+    const seed = await runtime.eval('sur-detail', { code: 'import os\npid = os.getpid()\nmarker = 2\npid' })
+    const pid = Number(seed.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + seed.result)
+    await assert.rejects(
+      runtime.eval('sur-detail', {
+        code: 'e = RuntimeError("boom")\ne.detail = chr(0xD800) * (64 * 1024 + 1)\nraise e',
+      }),
+      (err: unknown) => {
+        assert.ok(err instanceof RlmError, 'expected a typed RlmError')
+        const r = err as RlmError
+        const d = r.detailed ?? ''
+        assert.ok(d.includes('\uD800'), 'detail must keep real U+D800 code units, not literal \\ud800 text')
+        assert.ok(!d.includes('\\ud800'), 'detail must not degrade to literal \\ud800 fragments')
+        assert.ok(!d.includes('\uFFFD'), 'detail must not contain U+FFFD')
+        assert.equal(r.truncated, true, 'truncated surrogate detail must be marked truncated')
+        assert.ok(
+          Buffer.byteLength(d, 'utf8') <= 64 * 1024 + 512,
+          'surrogate detail is not bounded: ' + Buffer.byteLength(d, 'utf8') + ' bytes',
+        )
+        return true
+      },
+    )
+    const cont = await runtime.eval('sur-detail', { code: 'marker' })
+    assert.equal(cont.result, '2')
+    const pidAgain = await runtime.eval('sur-detail', { code: 'import os\nos.getpid()' })
+    assert.equal(pidAgain.result, String(pid))
   } finally {
     runtime.dispose()
   }

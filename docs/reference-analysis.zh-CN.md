@@ -24,6 +24,14 @@
 参考 RLM 默认 `max_depth = 1`。因此 V1 的 `rlm_query` 是 one-shot 叶调用，
 无需先实现递归子 RLM。
 
+## 有界协议与参考实现的差异
+
+Prime Agent 有类似的 REPL/JSONL/文本截断形态，但没有严格的 JSONL 总帧上限，
+也没有本 Issue 的各通道内容边界（query prompt/result、error detail、stderr、
+未 trim 的原始行计数、LF-only wire）。`alexzhang13/rlm` 是同进程本地 REPL，
+完全不存在 TS↔Python wire。机制沿用参考实现，但"严格有界协议"是 dsh-rlm
+的专属加固；本项目不声称任一参考实现的测试套件覆盖了这些边界。
+
 ## V1 不采用
 
 - Prime Agent 的 daemon、TUI、安装器和完整故障恢复；

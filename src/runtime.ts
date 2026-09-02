@@ -17,6 +17,114 @@ const DEFAULT_TIMEOUT = 30_000
 const DEFAULT_MAX_STDOUT = 64 * 1024
 const DEFAULT_MAX_RESULT = 64 * 1024
 const DEFAULT_MAX_QUERIES = 16
+const MAX_FRAME_BYTES = 256 * 1024
+const MAX_STDERR_BYTES = 64 * 1024
+const MAX_QUERY_RESULT_BYTES = 64 * 1024
+const STDERR_TRUNCATED_MARKER = ' [stderr truncated]'
+const MAX_QUERY_ERROR_BYTES = 64 * 1024
+const QUERY_ERROR_TRUNCATED_MARKER = ' [query error truncated]'
+
+/**
+ * Cap one query-error text field to a total of at most `limit` UTF-8 bytes
+ * (the stable marker counts inside that budget). An over-limit field keeps a
+ * code-point-safe prefix and appends the marker so truncation is observable.
+ */
+function capQueryErrorText(s: string, limit: number): { text: string; truncated: boolean } {
+  if (byteLength(s) <= limit) return { text: s, truncated: false }
+  const markerBytes = byteLength(QUERY_ERROR_TRUNCATED_MARKER)
+  const prefix = truncateUtf8(s, Math.max(0, limit - markerBytes))
+  return { text: prefix + QUERY_ERROR_TRUNCATED_MARKER, truncated: true }
+}
+
+/** UTF-8 byte length of a string. */
+function byteLength(s: string): number {
+  return Buffer.byteLength(s, 'utf8')
+}
+
+/** Read one untrusted property without letting a throwing getter escape. */
+function safeReadField(obj: unknown, key: string): unknown {
+  if (obj === null || typeof obj !== 'object') return undefined
+  try {
+    return (obj as Record<string, unknown>)[key]
+  } catch {
+    return undefined
+  }
+}
+
+/** Non-throwing error text: message first, then String, then a fixed fallback. */
+function safeErrorText(value: unknown): string {
+  try {
+    if (typeof value === 'string') return value
+    if (value instanceof Error) return value.message
+    return String(value)
+  } catch {
+    // fall through
+  }
+  try {
+    return String(value)
+  } catch {
+    return 'query handler failed'
+  }
+}
+
+/** Non-throwing detail text: strings as-is; JSON-native structure kept as JSON. */
+function safeDetailText(value: unknown): string {
+  if (typeof value === 'string') return value
+  if (value === undefined || value === null) return ''
+  try {
+    const text = JSON.stringify(value)
+    if (typeof text === 'string') return text
+  } catch {
+    // fall through
+  }
+  try {
+    return String(value)
+  } catch {
+    return '[unprintable detail]'
+  }
+}
+
+/**
+ * Format a typed runtime error for the model-facing tool failure. The total
+ * UTF-8 size stays within one 64 KiB content budget: kind + message + the
+ * optional bounded detail + an explicit `[truncated]` marker; when the budget
+ * is exceeded the largest component is shrunk first (marker already counted).
+ */
+function formatToolError(error: RlmError): string {
+  let message = error.message
+  let detail = error.detailed ?? ''
+  for (let attempt = 0; attempt < 64; attempt++) {
+    const text =
+      `rlm_eval failed (${error.kind}): ${message}`
+      + (detail.length > 0 ? `\nDetail: ${detail}` : '')
+      + (error.truncated ? '\n[truncated]' : '')
+    if (byteLength(text) <= MAX_QUERY_ERROR_BYTES) return text
+    if (detail.length > 0 && byteLength(detail) > byteLength(message)) {
+      detail = truncateUtf8(detail, Math.max(0, Math.floor(byteLength(detail) / 2)))
+    } else {
+      message = truncateUtf8(message, Math.max(0, Math.floor(byteLength(message) / 2)))
+    }
+  }
+  return `rlm_eval failed (${error.kind}): [error text truncated]`
+}
+
+/**
+ * Truncate `s` to at most `limit` UTF-8 bytes without splitting a code point,
+ * so no U+FFFD is ever introduced. It iterates code points and stops before
+ * the first one that would cross the byte budget.
+ */
+function truncateUtf8(s: string, limit: number): string {
+  if (byteLength(s) <= limit) return s
+  let out = ''
+  let bytes = 0
+  for (const ch of s) {
+    const b = byteLength(ch)
+    if (bytes + b > limit) break
+    out += ch
+    bytes += b
+  }
+  return out
+}
 
 /**
  * Resolve the canonical Windows tree-kill tool. A bare `taskkill` name would
@@ -79,16 +187,19 @@ export class RlmError extends Error {
   readonly kind: RlmErrorKind
   readonly phase?: 'eval' | 'query'
   readonly detailed?: string
+  /** True when the underlying error frame reported a truncation. */
+  readonly truncated: boolean
   constructor(
     kind: RlmErrorKind,
     message: string,
-    opts: { phase?: 'eval' | 'query'; detailed?: string } = {},
+    opts: { phase?: 'eval' | 'query'; detailed?: string; truncated?: boolean } = {},
   ) {
     super(message)
     this.name = 'RlmError'
     this.kind = kind
     if (opts.phase !== undefined) this.phase = opts.phase
     if (opts.detailed !== undefined) this.detailed = opts.detailed
+    this.truncated = opts.truncated === true
   }
 }
 
@@ -124,6 +235,7 @@ class Kernel {
   private pending: PendingEval | null = null
   private nextId = 1
   private stderr = ''
+  private stderrTruncated = false
   private killStarted = false
   private ready: Promise<void>
   private resolveReady!: () => void
@@ -167,25 +279,53 @@ class Kernel {
     child.stderr?.setEncoding('utf8')
     child.stdout?.on('data', (d: string) => this.onData(d))
     child.stderr?.on('data', (d: string) => {
-      this.stderr += d
+      // Keep the truncation marker inside the 64 KiB stderr budget: reserve
+      // its bytes up front, so detailed (prefix + marker) always fits and the
+      // marker stays observable. After truncation no further bytes accumulate.
+      if (this.stderrTruncated) return
+      const budget = MAX_STDERR_BYTES - byteLength(STDERR_TRUNCATED_MARKER)
+      const combined = this.stderr + d
+      if (byteLength(combined) > budget) {
+        this.stderrTruncated = true
+        this.stderr = truncateUtf8(combined, budget)
+      } else {
+        this.stderr = combined
+      }
     })
     child.on('error', (err) => {
       this.handleExit(new RlmError('spawn', String(err)))
     })
     child.on('close', () => {
-      const detail = this.stderr.trim()
+      let detail = this.stderr.trim()
+      if (this.stderrTruncated) detail += STDERR_TRUNCATED_MARKER
       this.handleExit(new RlmError('closed', 'kernel exited', { detailed: detail }))
     })
   }
 
   private onData(chunk: string): void {
+    if (this.exited || this.disposed) return
     this.buf += chunk
     let i: number
-    while ((i = this.buf.indexOf('\n')) >= 0) {
-      const line = this.buf.slice(0, i).trim()
+    while (!this.exited && (i = this.buf.indexOf('\n')) >= 0) {
+      // Count the UNTRIMMED raw line (bytes before the LF, including any CR or
+      // trailing whitespace) plus the LF terminator. Trim only after the cap
+      // check, so a whitespace/CR-padded oversized raw line is a protocol
+      // fault instead of being accepted on its trimmed JSON.
+      const rawLine = this.buf.slice(0, i)
+      if (byteLength(rawLine) + 1 > MAX_FRAME_BYTES) {
+        this.handleExit(new RlmError('protocol', 'kernel frame exceeds 256 KiB'))
+        return
+      }
       this.buf = this.buf.slice(i + 1)
+      const line = rawLine.trim()
       if (!line) continue
       this.onFrame(this.parse(line))
+    }
+    if (this.exited || this.disposed) return
+    // The remaining buffer has no newline; if it can no longer fit the 256 KiB
+    // budget even after a newline, it is an oversized no-newline giant frame.
+    if (byteLength(this.buf) + 1 > MAX_FRAME_BYTES) {
+      this.handleExit(new RlmError('protocol', 'kernel frame exceeds 256 KiB without newline'))
     }
   }
 
@@ -272,18 +412,69 @@ class Kernel {
       .then(() => onQuery(String(frame.prompt ?? '')))
       .then((text) => {
         if (this.exited || this.disposed) return
-        this.write({ type: 'query_result', id: qid, text: String(text) })
+        const raw = String(text)
+        // First the 64 KiB payload budget, then the real JSONL wire budget:
+        // JSON.stringify inflates control characters sixfold, so a payload that
+        // fits the content cap can still serialize past 256 KiB. The wire fit
+        // is code-point safe and marks the frame truncated instead of letting
+        // the central outbound guard protocol-kill the kernel.
+        const payloadLimited = truncateUtf8(raw, MAX_QUERY_RESULT_BYTES)
+        let response: Frame = { type: 'query_result', id: qid, text: payloadLimited }
+        const payloadTruncated = byteLength(raw) > MAX_QUERY_RESULT_BYTES
+        const fit = this.fitFrameTextField(response, 'text', true)
+        response = { ...response, text: fit.text }
+        if (payloadTruncated || fit.truncated) response.truncated = true
+        this.write(response)
       })
       .catch((err) => {
         if (this.exited || this.disposed) return
-        const message = err instanceof Error ? err.message : String(err)
-        this.write({
-          type: 'error',
-          id: qid,
-          phase: 'query',
-          kind: 'query_error',
-          message,
-        })
+        try {
+          // A rejection is untrusted: message/detail/detailed getters and
+          // toString may throw, so every read goes through non-throwing
+          // helpers. The cell must always get a typed query error rather than
+          // an unhandled rejection with a hanging cell.
+          const source = err instanceof Error ? err : undefined
+          const rawMessage = safeErrorText(err)
+          const detailRaw = safeReadField(source, 'detail') ?? safeReadField(source, 'detailed')
+          const rawDetail = safeDetailText(detailRaw)
+          const m = capQueryErrorText(rawMessage, MAX_QUERY_ERROR_BYTES)
+          const d = capQueryErrorText(rawDetail, MAX_QUERY_ERROR_BYTES)
+          let response: Frame = {
+            type: 'error',
+            id: qid,
+            phase: 'query',
+            kind: 'query_error',
+            message: m.text,
+          }
+          if (d.text.length > 0) response.detail = d.text
+          // Fit the real serialized wire budget for message then detail, so a
+          // control-character error payload (budget-fine raw, sixfold when
+          // serialized) is truncated here instead of protocol-killing the kernel.
+          let truncated = m.truncated || d.truncated
+          const fitMessage = this.fitFrameTextField(response, 'message', true)
+          if (fitMessage.truncated) {
+            response = { ...response, message: fitMessage.text }
+            truncated = true
+          }
+          if (d.text.length > 0) {
+            const fitDetail = this.fitFrameTextField(response, 'detail', true)
+            if (fitDetail.truncated) {
+              response = { ...response, detail: fitDetail.text }
+              truncated = true
+            }
+          }
+          if (truncated) response.truncated = true
+          this.write(response)
+        } catch {
+          // Absolute last resort: never leave the cell hanging on a query.
+          this.write({
+            type: 'error',
+            id: qid,
+            phase: 'query',
+            kind: 'query_error',
+            message: 'query handler failed',
+          })
+        }
       })
   }
 
@@ -315,8 +506,12 @@ class Kernel {
     this.pending = null
     const phase = frame.phase === 'query' ? 'query' : 'eval'
     const kind = phase === 'query' ? 'query' : 'eval'
-    const message = String(frame.message ?? 'kernel reported an error')
-    p.reject(new RlmError(kind, message, { phase, detailed: String(frame.detail ?? '') }))
+    const message = safeErrorText(frame.message ?? 'kernel reported an error')
+    p.reject(new RlmError(kind, message, {
+      phase,
+      detailed: safeDetailText(frame.detail),
+      truncated: frame.truncated === true,
+    }))
   }
 
   private clearTimer(p: PendingEval): void {
@@ -452,6 +647,20 @@ class Kernel {
     const timeout = deadline === undefined
       ? input.timeout ?? this.config.timeout
       : Math.max(0, deadline - Date.now())
+    // Pre-check the exact JSONL wire bytes of the eval frame BEFORE installing
+    // the pending cell, timer, or abort listener, and before writing to stdin.
+    // An over-size frame is a host-side protocol error: reject it without
+    // touching the kernel so its PID and namespace are preserved.
+    const evalFrame: Frame = {
+      type: 'eval',
+      id,
+      code: input.code,
+      max_stdout: this.config.maxStdout,
+      max_result: this.config.maxResult,
+    }
+    if (this.outboundFrameBytes(evalFrame) > MAX_FRAME_BYTES) {
+      throw new RlmError('protocol', 'host frame exceeds 256 KiB')
+    }
     let resolve!: (out: RlmEvalOutput) => void
     let reject!: (err: RlmError) => void
     const promise = new Promise<RlmEvalOutput>((res, rej) => {
@@ -487,20 +696,68 @@ class Kernel {
     // A signal that was already aborted cancels the cell synchronously above;
     // only send the eval frame if this cell is still pending.
     if (this.pending !== p) return promise
-    this.write({
-      type: 'eval',
-      id,
-      code: input.code,
-      max_stdout: p.maxStdout,
-      max_result: p.maxResult,
-    })
+    this.write(evalFrame)
     return promise
+  }
+
+  /** Exact JSONL wire bytes for one Host→Python frame (JSON text + trailing '\n'). */
+  private outboundFrameBytes(frame: Frame): number {
+    return byteLength(JSON.stringify(frame)) + 1
+  }
+
+  /**
+   * Shrink one string field of `frame` so the serialized JSONL frame (JSON
+   * text + trailing '\n') fits MAX_FRAME_BYTES. JSON.stringify can inflate
+   * control characters sixfold, so a payload under the 64 KiB content budget
+   * can still serialize past 256 KiB; the search walks code-point prefixes so
+   * a surrogate pair is never split and no U+FFFD is introduced. The caller
+   * owns the `truncated` flag on the frame.
+   */
+  private fitFrameTextField(
+    frame: Frame,
+    key: string,
+    reserveTruncatedFlag = false,
+  ): { text: string; truncated: boolean } {
+    const original = String(frame[key] ?? '')
+    // A caller usually marks the frame truncated after fitting; reserve those
+    // wire bytes now so adding the flag can never push the line back over the
+    // budget through the central outbound guard.
+    const reserved = reserveTruncatedFlag
+      ? byteLength(JSON.stringify({ ...frame, truncated: true })) - byteLength(JSON.stringify(frame))
+      : 0
+    if (this.outboundFrameBytes(frame) + reserved <= MAX_FRAME_BYTES) {
+      return { text: original, truncated: false }
+    }
+    const base = this.outboundFrameBytes({ ...frame, [key]: '' })
+    const target = MAX_FRAME_BYTES - base - reserved
+    if (target < 2) return { text: '', truncated: true }
+    // JSON.stringify(s) includes the surrounding quotes; the incremental bytes
+    // over the empty-string value are its "content bytes", monotone in the
+    // code-point prefix length.
+    const contentBytes = (s: string): number => byteLength(JSON.stringify(s)) - 2
+    const points = Array.from(original)
+    let lo = 0
+    let hi = points.length
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2)
+      if (contentBytes(points.slice(0, mid).join('')) <= target) lo = mid
+      else hi = mid - 1
+    }
+    const text = points.slice(0, lo).join('')
+    return { text, truncated: lo < points.length }
   }
 
   private write(frame: Frame): void {
     if (this.exited || this.disposed) return
     const stdin = this.child?.stdin
     if (!stdin) return
+    // Central outbound guard: every Host→Python frame must fit the 256 KiB
+    // wire line budget. The eval path pre-checks and rejects without eviction;
+    // any other unexpectedly oversized frame is a terminal protocol fault.
+    if (this.outboundFrameBytes(frame) > MAX_FRAME_BYTES) {
+      this.handleExit(new RlmError('protocol', 'host frame exceeds 256 KiB'))
+      return
+    }
     try {
       stdin.write(JSON.stringify(frame) + '\n')
     } catch {
@@ -782,7 +1039,7 @@ export function registerRlmPlugin(
         // Surface the typed runtime error as a normal tool failure so the model
         // sees a useful, bounded message (the registry marks the call isError).
         if (error instanceof RlmError) {
-          throw new Error(`rlm_eval failed (${error.kind}): ${error.message}`)
+          throw new Error(formatToolError(error))
         }
         throw error
       }
