@@ -33,6 +33,20 @@ a real clean DSH Profile.
   guess DSH APIs from memory.
 - Keep `ref/` read-only. Use it only as pinned design evidence.
 
+## Official DSH Upstream Gate
+
+- Before changing production code or tests for any work item, point
+  `RLM_DSH_REPO_ROOT` at the selected DSH source checkout and run
+  `pnpm check:upstream`.
+- The fixed source-freshness authority is
+  `https://github.com/deepseek-ai/deepseek-harness.git:master`; installed or
+  published `@deepseek-ai/*` types and the exact loaded Profile runtime remain
+  the executable compatibility authorities.
+- A stale, diverged, wrong, unreachable, or tracked-dirty DSH checkout is not
+  ready for mutation. `ref/` remains pinned prior art, never freshness evidence.
+- Follow the authoritative [GitHub Issue Repair Playbook](docs/issue-repair-playbook.md#41-official-dsh-upstream-authority-gate)
+  for evidence, artifact mapping, failure handling, and final live re-checks.
+
 ## Architecture Contract and TDD
 
 - Freeze the affected architecture contract before production edits: observable

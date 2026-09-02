@@ -1,14 +1,47 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { test } from 'node:test'
 
 import {
   addedRecordText,
+  isAppendOnlyRecordText,
   materialPathReferenced,
   parseRecords,
+  rangeAppendOnlyErrors,
   removedRecordLines,
   validateEntry,
   validateRecordSet,
 } from '../scripts/check-development-memory.mjs'
+
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  }).trim()
+}
+
+function historyFixture(t: test.TestContext) {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'development-memory-range-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  git(root, 'init', '--initial-branch=main')
+  git(root, 'config', 'user.email', 'memory@example.invalid')
+  git(root, 'config', 'user.name', 'Memory Gate Test')
+  writeFileSync(path.join(root, 'README.md'), 'fixture\n')
+  git(root, 'add', 'README.md')
+  git(root, 'commit', '-m', 'base')
+  const base = git(root, 'rev-parse', 'HEAD')
+  const directory = path.join(root, 'docs', 'development-memory', 'records', '2026')
+  mkdirSync(directory, { recursive: true })
+  const shard = path.join(directory, 'issue-1.jsonl')
+  writeFileSync(shard, 'record-one\n')
+  git(root, 'add', '.')
+  git(root, 'commit', '-m', 'create shard')
+  return { root, base, directory, shard }
+}
 
 const validEntry = {
   schemaVersion: 1,
@@ -74,6 +107,85 @@ test('accepts an append after an unterminated final record without treating it a
 
   assert.deepEqual(removedRecordLines(diff), [])
   assert.equal(addedRecordText(diff), appended)
+})
+
+test('rejects inserting a new record before existing development-memory history', () => {
+  const prior = `${JSON.stringify(validEntry)}\n`
+  const inserted = JSON.stringify({ ...validEntry, recordId: 'mem-20260903-inserted-agent' })
+
+  assert.equal(isAppendOnlyRecordText(prior, `${inserted}\n${prior}`), false)
+})
+
+test('accepts only a true append to existing development-memory history', () => {
+  const prior = JSON.stringify(validEntry)
+  const appended = JSON.stringify({ ...validEntry, recordId: 'mem-20260903-appended-agent' })
+
+  assert.equal(isAppendOnlyRecordText(prior, `${prior}\n${appended}\n`), true)
+  assert.equal(isAppendOnlyRecordText(`${prior}\n`, `${prior}\n${appended}\n`), true)
+})
+
+test('range gate rejects an intermediate commit that inserts before existing history', (t) => {
+  const { root, base, shard } = historyFixture(t)
+  writeFileSync(shard, 'record-two\nrecord-one\n')
+  git(root, 'add', '.')
+  git(root, 'commit', '-m', 'insert before history')
+
+  assert.ok(rangeAppendOnlyErrors(`${base}..HEAD`, 'fixture range', root)
+    .some((error) => error.includes('exact prefix')))
+})
+
+test('range gate rejects renaming a development-memory shard', (t) => {
+  const { root, base, directory, shard } = historyFixture(t)
+  git(root, 'mv', shard, path.join(directory, 'issue-1-part-02.jsonl'))
+  git(root, 'commit', '-m', 'rename shard')
+
+  assert.ok(rangeAppendOnlyErrors(`${base}..HEAD`, 'fixture range', root)
+    .some((error) => error.includes('exact prefix')))
+})
+
+test('range gate rejects changing a development-memory shard into a symlink', (t) => {
+  const { root, base, shard } = historyFixture(t)
+  const linkTarget = path.join(root, 'link-target.txt')
+  writeFileSync(linkTarget, 'outside.jsonl')
+  const blob = git(root, 'hash-object', '-w', linkTarget)
+  const relativeShard = path.relative(root, shard).replaceAll('\\', '/')
+  git(root, 'update-index', '--cacheinfo', `120000,${blob},${relativeShard}`)
+  git(root, 'commit', '-m', 'change shard to symlink')
+
+  assert.ok(rangeAppendOnlyErrors(`${base}..HEAD`, 'fixture range', root)
+    .some((error) => error.includes('regular file mode')))
+})
+
+test('range gate rejects a base that is only a merge second parent', (t) => {
+  const { root, base } = historyFixture(t)
+  const secondParent = git(root, 'rev-parse', 'HEAD')
+  git(root, 'checkout', '-b', 'integration', base)
+  writeFileSync(path.join(root, 'integration.txt'), 'first parent\n')
+  git(root, 'add', '.')
+  git(root, 'commit', '-m', 'integration first parent')
+  git(root, 'merge', '--no-ff', secondParent, '-m', 'merge shard as second parent')
+
+  assert.ok(rangeAppendOnlyErrors(`${secondParent}..HEAD`, 'fixture range', root)
+    .some((error) => error.includes('first-parent ancestor')))
+})
+
+test('range gate accepts a root commit that creates the first regular shard', (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'development-memory-root-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  git(root, 'init', '--initial-branch=main')
+  git(root, 'config', 'user.email', 'memory@example.invalid')
+  git(root, 'config', 'user.name', 'Memory Gate Test')
+  const directory = path.join(root, 'docs', 'development-memory', 'records', '2026')
+  mkdirSync(directory, { recursive: true })
+  writeFileSync(path.join(directory, 'issue-1.jsonl'), 'record-one\n')
+  git(root, 'add', '.')
+  git(root, 'commit', '-m', 'root shard')
+
+  assert.deepEqual(rangeAppendOnlyErrors(
+    '4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD',
+    'fixture range',
+    root,
+  ), [])
 })
 
 test('still rejects changing an unterminated final record', () => {

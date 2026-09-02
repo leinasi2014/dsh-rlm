@@ -73,6 +73,13 @@ Before mutation, bind:
 ```yaml
 issue: "#<number>"
 base: "<full origin/main SHA>"
+dsh_authority: "https://github.com/deepseek-ai/deepseek-harness.git"
+dsh_branch: "master"
+dsh_local_sha: "<full SHA of the selected DSH checkout>"
+dsh_upstream_sha: "<full fetched authority SHA>"
+dsh_relation: "ahead=<n> behind=0"
+dsh_artifact_target: "<installed/published @deepseek-ai/* version or tested source-workspace SHA>"
+dsh_runtime_target: "<exact DSH/Profile build used for live acceptance>"
 branch: "codex/issue-<number>-<slug>"
 workspace: "<absolute owned worktree or controlled environment>"
 session: "<DSH workspace/team/Session identity>"
@@ -95,6 +102,47 @@ The work is ready only when the Issue outcome and non-goals are testable, the
 base and worktree state are known, access and mutable scope match the complete
 assignment, dependencies are explicit, writer/reviewer and integration capacity
 exist, and no other writer owns the same mutable surface.
+
+### 4.1 Official DSH upstream authority gate
+
+`ref/rlm` and `ref/prime-agent` are frozen prior art, not DSH freshness evidence.
+Before changing production code or tests, select the DSH source checkout whose
+freshness will be checked and run:
+
+```powershell
+$env:RLM_DSH_REPO_ROOT = 'C:\path\to\deepseek-harness'
+pnpm check:upstream
+```
+
+The production command fixes `origin` to the official repository and fixes the
+branch to `master`; neither environment nor command-line arguments may redefine
+that authority. It fetches the current tip without changing tracked files and
+reports only the normalized authority, branch, local/upstream SHAs, and
+ahead/behind counts. The selected checkout must have no tracked index/worktree
+changes, and `behind=0` is required. Untracked files do not change source at HEAD
+and are ignored. An isolated checkout may be ahead of the tip, but it must contain
+the fetched tip.
+
+If the command reports stale/diverged/wrong authority, use or create an isolated
+DSH checkout at the latest tip before mutation. If the authority cannot be
+reached, report `NOT_VERIFIED` and do not claim or begin latest-DSH development.
+Never auto-pull, reset, or rebase a user's DSH worktree as part of this gate.
+
+Official `master` is the live source-freshness authority, not automatically the
+plugin's executable compatibility target. Installed/published package types and
+the exact loaded Profile runtime remain executable authorities. After a PASS,
+inspect the latest source/types for every affected `@deepseek-ai/*` boundary and
+map the source SHA to a published package version or an explicitly tested source
+workspace. Compile/build against that artifact before RED when the contract
+changed. A source or type-level PASS does not replace clean-Profile evidence for
+runtime, Session, tool, Subagent, or lifecycle behavior.
+
+Record the source SHA, artifact/version mapping, exact runtime target, and results
+in the Issue and development-memory record. Git runs non-interactively with a
+bounded, credential-redacted diagnostic on failure. This is a pre-development
+gate, not a network-dependent commit hook or ordinary CI check. Re-run it before
+final live acceptance when the upstream tip may have moved; assess drift
+explicitly rather than silently invalidating or broadening the candidate.
 
 ## 5. DSH/PTC control-surface rules
 
@@ -217,6 +265,7 @@ Freeze one candidate packet:
 
 ```text
 Issue, base SHA, candidate SHA, changed paths,
+DSH authority branch/SHA and compatibility evidence,
 focused checks, full checks, development-memory record IDs,
 documentation impact, known limitations
 ```

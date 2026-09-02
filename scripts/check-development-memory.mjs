@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -7,6 +7,7 @@ export const RECORDS_ROOT = 'docs/development-memory/records'
 export const MAX_LINE_BYTES = 64 * 1024
 export const MAX_SHARD_BYTES = 2 * 1024 * 1024
 export const MAX_SHARD_RECORDS = 1000
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const RESULTS = new Set(['PASS', 'FAIL', 'FLAKY', 'NOT_RUN', 'NOT_CONFIGURED'])
@@ -195,6 +196,13 @@ export function removedRecordLines(diff) {
   return analyzeRecordDiff(diff).removed
 }
 
+export function isAppendOnlyRecordText(before, after) {
+  if (before === null) return after !== null
+  if (after === null || after === before) return after === before
+  const prefix = before.endsWith('\n') ? before : `${before}\n`
+  return after.startsWith(prefix)
+}
+
 function recordFiles(directory) {
   const files = []
   for (const item of readdirSync(directory, { withFileTypes: true })) {
@@ -223,16 +231,90 @@ function loadAllRecords() {
   return { records, entries: records.flatMap((record) => record.entries), errors }
 }
 
-function git(args) {
-  return execFileSync('git', args, { cwd: ROOT, encoding: 'utf8' })
+function git(args, root = ROOT) {
+  return execFileSync('git', args, { cwd: root, encoding: 'utf8' })
 }
 
-function changedPaths(args) {
-  return git(args).split('\0').filter(Boolean).map(normalizeRepositoryPath)
+function changedPaths(args, root = ROOT) {
+  return git(args, root).split('\0').filter(Boolean).map(normalizeRepositoryPath)
 }
 
 function recordDiff(args) {
   return git([...args, '--', RECORDS_ROOT])
+}
+
+function silentGit(args, root = ROOT) {
+  const result = spawnSync('git', args, {
+    cwd: root,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+  return result.status === 0 ? result.stdout : null
+}
+
+function gitFile(ref, file, root = ROOT) {
+  const revision = ref === ':' ? `:${file}` : `${ref}:${file}`
+  return silentGit(['show', revision], root)
+}
+
+function gitFileMode(ref, file, root = ROOT) {
+  const output = ref === ':'
+    ? silentGit(['ls-files', '-s', '--', file], root)
+    : silentGit(['ls-tree', ref, '--', file], root)
+  return /^(\d{6})\s/.exec(output ?? '')?.[1] ?? null
+}
+
+function appendOnlyRecordErrors(paths, beforeRef, afterRef, label, root = ROOT) {
+  const errors = []
+  const records = new Set(paths.filter((file) =>
+    file.startsWith(`${RECORDS_ROOT}/`) && file.endsWith('.jsonl')))
+  for (const file of records) {
+    const beforeMode = gitFileMode(beforeRef, file, root)
+    const afterMode = gitFileMode(afterRef, file, root)
+    if (afterMode !== null && afterMode !== '100644') {
+      errors.push(`${label}: ${file} must remain a non-executable regular file mode 100644`)
+    }
+    if (beforeMode !== null && afterMode !== null && beforeMode !== afterMode) {
+      errors.push(`${label}: ${file} file mode is immutable (${beforeMode} -> ${afterMode})`)
+    }
+    if (!isAppendOnlyRecordText(gitFile(beforeRef, file, root), gitFile(afterRef, file, root))) {
+      errors.push(`${label}: ${file} must preserve its prior content as an exact prefix and append new records only at EOF`)
+    }
+  }
+  return errors
+}
+
+function revisionEndpoints(range) {
+  const separator = range.indexOf('..')
+  if (separator < 1 || range[separator + 2] === '.' || range.slice(separator + 2).length === 0) {
+    throw new Error(`range ${range} must use base..head syntax`)
+  }
+  return [range.slice(0, separator), range.slice(separator + 2)]
+}
+
+export function rangeAppendOnlyErrors(range, label, root = ROOT) {
+  const [base, head] = revisionEndpoints(range)
+  const baseCommit = git(['rev-parse', base], root).trim()
+  const firstParentHistory = new Set(git(['rev-list', '--first-parent', head], root)
+    .split(/\r?\n/)
+    .filter(Boolean))
+  if (baseCommit !== EMPTY_TREE && !firstParentHistory.has(baseCommit)) {
+    return [`${label}: base ${baseCommit} must be a first-parent ancestor of ${head}`]
+  }
+  const commits = git(['rev-list', '--reverse', '--topo-order', range], root)
+    .split(/\r?\n/)
+    .filter(Boolean)
+  const errors = []
+  for (const commit of commits) {
+    const [, parent = EMPTY_TREE] = git(['rev-list', '--parents', '-n', '1', commit], root)
+      .trim()
+      .split(/\s+/)
+    const paths = changedPaths([
+      'diff', '--no-renames', '--name-only', '-z', '--diff-filter=ACMRTD', parent, commit,
+    ], root)
+    errors.push(...appendOnlyRecordErrors(paths, parent, commit, `${label} commit ${commit}`, root))
+  }
+  return errors
 }
 
 export function addedRecordText(diff) {
@@ -248,8 +330,8 @@ function issueFromBranch() {
   return match ? Number(match[1]) : null
 }
 
-function checkChangeSet(paths, diff, label) {
-  const errors = []
+function checkChangeSet(paths, diff, label, appendErrors = []) {
+  const errors = [...appendErrors]
   const removed = removedRecordLines(diff)
   if (removed.length > 0) {
     errors.push(`${label}: development-memory records are append-only; ${removed.length} existing line(s) changed or were removed`)
@@ -290,14 +372,16 @@ function main() {
   const [mode = '--all', value] = process.argv.slice(2)
 
   if (mode === '--staged') {
-    const paths = changedPaths(['diff', '--cached', '--name-only', '-z', '--diff-filter=ACMRD'])
-    const diff = recordDiff(['diff', '--cached', '--unified=0'])
-    errors.push(...checkChangeSet(paths, diff, 'staged change'))
+    const paths = changedPaths(['diff', '--cached', '--no-renames', '--name-only', '-z', '--diff-filter=ACMRTD'])
+    const diff = recordDiff(['diff', '--cached', '--no-renames', '--unified=0'])
+    const appendErrors = appendOnlyRecordErrors(paths, 'HEAD', ':', 'staged change')
+    errors.push(...checkChangeSet(paths, diff, 'staged change', appendErrors))
   } else if (mode === '--range') {
     const range = value || defaultRange()
-    const paths = changedPaths(['diff', range, '--name-only', '-z', '--diff-filter=ACMRD'])
-    const diff = recordDiff(['diff', '--unified=0', range])
-    errors.push(...checkChangeSet(paths, diff, `range ${range}`))
+    const paths = changedPaths(['diff', '--no-renames', range, '--name-only', '-z', '--diff-filter=ACMRTD'])
+    const diff = recordDiff(['diff', '--no-renames', '--unified=0', range])
+    const appendErrors = rangeAppendOnlyErrors(range, `range ${range}`)
+    errors.push(...checkChangeSet(paths, diff, `range ${range}`, appendErrors))
   } else if (mode !== '--all') {
     errors.push(`unknown mode ${mode}; use --all, --staged, or --range [base..head]`)
   }

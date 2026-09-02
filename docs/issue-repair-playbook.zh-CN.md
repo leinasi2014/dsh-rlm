@@ -61,6 +61,13 @@ OPEN -> REPRODUCED -> IMPLEMENTING -> CANDIDATE
 ```yaml
 issue: "#编号"
 base: "origin/main 完整 SHA"
+dsh_authority: "https://github.com/deepseek-ai/deepseek-harness.git"
+dsh_branch: "master"
+dsh_local_sha: "选定 DSH checkout 的完整 SHA"
+dsh_upstream_sha: "刚获取的官方完整 SHA"
+dsh_relation: "ahead=<n> behind=0"
+dsh_artifact_target: "已安装/发布的 @deepseek-ai/* 版本或已测试 source-workspace SHA"
+dsh_runtime_target: "真实验收所加载的精确 DSH/Profile build"
 branch: "codex/issue-编号-简名"
 workspace: "绝对路径的自有 worktree 或受控环境"
 session: "DSH workspace/team/Session 身份"
@@ -82,6 +89,37 @@ first_material_event: "失败复现或精确 blocker"
 Issue 结果和非目标必须可测试；base、工作树、访问模式与可变范围必须覆盖整个
 任务，依赖、writer/reviewer、集成容量必须已知；同一可变语义面不能存在第二个
 writer。
+
+### 4.1 DSH 官方上游权威门禁
+
+`ref/rlm` 与 `ref/prime-agent` 是固定的设计参考，不是 DSH 最新性证据。任何生产
+代码或测试变更之前，先选定要检查最新性的 DSH source checkout，并运行：
+
+```powershell
+$env:RLM_DSH_REPO_ROOT = 'C:\path\to\deepseek-harness'
+pnpm check:upstream
+```
+
+生产命令固定 `origin` 为官方仓库、固定分支为 `master`，环境变量和 CLI 参数都不能
+改写该权威。命令在不改变 tracked 文件的前提下 fetch 当前 tip，并且只输出规范化
+权威、分支、本地/上游 SHA 与 ahead/behind。选定 checkout 不能有 tracked index/
+worktree 改动，且只有 `behind=0` 才通过；untracked 文件不改变 HEAD 源码，因此忽略。
+隔离 checkout 可以包含额外提交，但必须包含刚获取的官方 tip。
+
+如果结果为 stale、diverged 或 wrong authority，必须先使用/创建位于最新 tip 的
+隔离 DSH checkout；若上游不可达，则记录 `NOT_VERIFIED`，不得声称或开始“面向最新
+DSH”的开发。门禁禁止自动 pull、reset 或 rebase 用户的 DSH 工作树。
+
+官方 `master` 是最新源码权威，不会自动成为插件的可执行兼容性目标。已安装/发布
+package 类型与实际加载的 Profile runtime 才是可执行权威。PASS 后检查所有受影响
+`@deepseek-ai/*` 边界，并把 source SHA 映射到已发布版本或明确测试的 source
+workspace；契约变化时进入 RED 前对该 artifact 完成 typecheck/build。源码或类型
+通过不能替代 runtime、Session、tool、Subagent 或生命周期的干净 Profile 验证。
+
+Issue 与 development-memory 必须记录 source SHA、artifact/version 映射、精确 runtime
+目标与结果。Git 以非交互模式运行，失败诊断限长并清除 URL 凭据。本检查只属于开工
+门禁，不进入普通 commit hook/CI。若最终真实验收前官方 tip 可能移动，则重新检查并
+显式评估漂移，不能静默扩大 Candidate。
 
 ## 5. DSH/PTC 控制面规则
 
@@ -176,8 +214,8 @@ UTF-8；query 检查 timeout/cancel/迟到结果；kernel 检查保留名称与�
 
 ### 6.6 冻结和审查
 
-Candidate packet 包含 Issue、base SHA、Candidate SHA、变更文件、定向/完整测试、
-development-memory record IDs、文档影响和已知限制。Reviewer 只读审查精确
+Candidate packet 包含 Issue、base SHA、Candidate SHA、变更文件、DSH 权威分支/SHA
+与兼容性证据、定向/完整测试、development-memory record IDs、文档影响和已知限制。Reviewer 只读审查精确
 Candidate，不得边审边修。
 
 阻塞问题形成 successor Candidate。架构和安全边界未改变时只做 delta review；
