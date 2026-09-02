@@ -196,11 +196,12 @@ class Kernel {
     switch (frame.type) {
       case 'ready': {
         if (frame.version !== PROTOCOL_VERSION) {
-          this.readyDone = true
-          this.rejectReady(
+          // A wrong protocol version is a startup protocol fault: route it
+          // through the single terminal transition so the process tree is
+          // killed, the kernel is evicted, and waiters settle exactly once.
+          this.handleExit(
             new RlmError('protocol', 'unsupported kernel protocol version: ' + String(frame.version)),
           )
-          this.kill()
           return
         }
         this.readyDone = true
@@ -365,11 +366,53 @@ class Kernel {
       this.pending = null
       p.reject(err)
     }
+    // Every terminal transition (protocol fault, timeout, cancel, dispose,
+    // spawn error, child close) must kill the owning process tree before the
+    // kernel is evicted, or the runtime loses its only handle to the PID.
+    this.kill()
     this.onExit?.(this)
   }
 
-  waitReady(): Promise<void> {
-    return this.ready
+  /**
+   * Wait for the ready handshake under the eval's startup deadline and the
+   * caller's abort signal. A deadline or abort here is a terminal kernel
+   * fault: it goes through `handleExit`, so the process tree is killed, the
+   * kernel evicted, and the waiter rejected exactly once.
+   */
+  waitReady(opts: { timeout: number; signal?: AbortSignal }): Promise<void> {
+    if (this.exited || this.disposed) {
+      return Promise.reject(new RlmError('closed', 'kernel is not running'))
+    }
+    if (this.readyDone) return this.ready
+    let cleanup = (): void => {}
+    const timer = setTimeout(() => {
+      cleanup()
+      this.handleExit(
+        new RlmError('timeout', 'kernel startup timed out after ' + opts.timeout + 'ms'),
+      )
+    }, opts.timeout)
+    cleanup = () => clearTimeout(timer)
+    const signal = opts.signal
+    if (signal) {
+      if (signal.aborted) {
+        cleanup()
+        this.handleExit(new RlmError('cancel', String(signal.reason ?? 'cancelled')))
+        return this.ready
+      }
+      const onAbort = (): void => {
+        cleanup()
+        this.handleExit(new RlmError('cancel', String(signal.reason ?? 'cancelled')))
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      const clearTimerOnly = cleanup
+      cleanup = () => {
+        clearTimerOnly()
+        signal.removeEventListener('abort', onAbort)
+      }
+    }
+    // The finally cleans the timer/listener on every settle path; a late abort
+    // after ready can no longer touch an idle kernel.
+    return this.ready.finally(cleanup)
   }
 
   async evalCell(input: RlmEvalInput): Promise<RlmEvalOutput> {
@@ -474,6 +517,13 @@ class Kernel {
   dispose(): void {
     if (this.disposed) return
     this.disposed = true
+    this.exited = true
+    // A dispose during the ready handshake must settle the waiting eval; the
+    // startup waiters share the ready promise, so rejecting it unblocks them.
+    if (!this.readyDone) {
+      this.readyDone = true
+      this.rejectReady(new RlmError('cancel', 'runtime disposed while the kernel was starting'))
+    }
     const p = this.pending
     if (p) {
       this.clearTimer(p)
@@ -499,6 +549,7 @@ export interface RlmRuntime {
 class RlmRuntimeImpl implements RlmRuntime {
   private kernels = new Map<string, Kernel>()
   private config: RlmRuntimeConfig
+  private disposed = false
   constructor(config: RlmRuntimeConfig) {
     this.config = config
   }
@@ -508,6 +559,10 @@ class RlmRuntimeImpl implements RlmRuntime {
     if (input.signal?.aborted) {
       throw new RlmError('cancel', String(input.signal.reason ?? 'cancelled'))
     }
+    // Dispose is terminal: reject without looking up or starting any kernel.
+    if (this.disposed) {
+      throw new RlmError('closed', 'runtime is disposed')
+    }
     let kernel = this.kernels.get(sessionKey)
     if (!kernel) {
       kernel = new Kernel(sessionKey, this.config)
@@ -516,11 +571,18 @@ class RlmRuntimeImpl implements RlmRuntime {
       }
       this.kernels.set(sessionKey, kernel)
     }
-    await kernel.waitReady()
+    // The ready handshake shares the eval's deadline and abort signal so a
+    // silent or cancelled startup can never wait forever.
+    await kernel.waitReady({
+      timeout: input.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT,
+      ...(input.signal ? { signal: input.signal } : {}),
+    })
     return kernel.evalCell(input)
   }
 
   dispose(): void {
+    if (this.disposed) return
+    this.disposed = true
     for (const kernel of this.kernels.values()) kernel.dispose()
     this.kernels.clear()
   }
