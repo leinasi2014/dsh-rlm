@@ -31,13 +31,15 @@ import inspect
 import json
 import os
 import platform
+import stat
 import sys
 import threading
 from typing import Any, Optional
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2
 DEFAULT_MAX_STDOUT = 64 * 1024
 DEFAULT_MAX_RESULT = 64 * 1024
+DEFAULT_MAX_CONTEXT_BYTES = 64 * 1024 * 1024
 MAX_QUERY_TEXT = 64 * 1024
 MAX_FRAME_BYTES = 256 * 1024
 MAX_ERROR_TEXT = 64 * 1024
@@ -84,6 +86,10 @@ class RlmQueryError(Exception):
         self.message = message
         self.detail = detail
         self.truncated = truncated
+
+
+class RlmContextError(Exception):
+    """Raised when a requested managed context cannot be published safely."""
 
 
 class _BoundedStdout:
@@ -186,6 +192,11 @@ class RlmKernel:
         self.seen_response_ids: set[int] = set()
         self.query_truncated = False
         self.failed: Optional[str] = None
+        # Context is kernel-owned persistent state. User cells get a fresh
+        # metadata copy at each boundary but never a mutable handle to this
+        # authority, so a failed load or cell mutation cannot corrupt it.
+        self.managed_context: Optional[str] = None
+        self.managed_context_meta: Optional[dict[str, Any]] = None
         # The pipe stream frames go to even while sys.stdout is swapped to a
         # bounded capture during a cell.
         self._real_stdout = sys.stdout
@@ -476,6 +487,43 @@ class RlmKernel:
         """
         self.namespace["rlm_query"] = self._rlm_query
 
+    def _restore_context(self) -> None:
+        """Publish the kernel-owned context with a fresh metadata dictionary."""
+        if self.managed_context is None:
+            self.namespace.pop("context", None)
+            self.namespace.pop("context_meta", None)
+            return
+        self.namespace["context"] = self.managed_context
+        self.namespace["context_meta"] = dict(self.managed_context_meta or {})
+
+    @staticmethod
+    def _read_context(path_text: str, max_bytes: int) -> "tuple[str, dict[str, Any]]":
+        if not os.path.isabs(path_text):
+            raise RlmContextError("contextPath must be an absolute path")
+        try:
+            with open(path_text, "rb") as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise RlmContextError("contextPath must name a regular file")
+                if info.st_size > max_bytes:
+                    raise RlmContextError("contextPath exceeds maxContextBytes")
+                payload = source.read(max_bytes + 1)
+        except RlmContextError:
+            raise
+        except OSError as exc:
+            raise RlmContextError("could not read contextPath: " + str(exc)) from exc
+        if len(payload) > max_bytes:
+            raise RlmContextError("contextPath exceeds maxContextBytes")
+        try:
+            text = payload.decode("utf-8", "strict")
+        except UnicodeDecodeError as exc:
+            raise RlmContextError("contextPath is not valid UTF-8") from exc
+        return text, {
+            "kind": "file",
+            "path": os.path.realpath(path_text),
+            "bytes": len(payload),
+        }
+
     @staticmethod
     def _compile_cell(code: str) -> "tuple[Any, Optional[Any]]":
         """Split a cell into its statement body and the final top-level
@@ -535,20 +583,40 @@ class RlmKernel:
             return
         max_stdout = frame.get("max_stdout", DEFAULT_MAX_STDOUT)
         max_result = frame.get("max_result", DEFAULT_MAX_RESULT)
+        max_context_bytes = frame.get("max_context_bytes", DEFAULT_MAX_CONTEXT_BYTES)
+        context_path = frame.get("context_path")
         if (
             not isinstance(max_stdout, int)
             or not isinstance(max_result, int)
+            or not isinstance(max_context_bytes, int)
             or max_stdout < 0
             or max_result < 0
+            or max_context_bytes < 0
         ):
             self._fatal("invalid limits in eval frame: " + repr(frame))
             return
+        if context_path is not None and not isinstance(context_path, str):
+            self._fatal("invalid context_path in eval frame: " + repr(frame))
+            return
+        if context_path is not None:
+            try:
+                context, context_meta = self._read_context(context_path, max_context_bytes)
+            except RlmContextError as exc:
+                self._send(self._error_frame(
+                    eval_id, "context", "context_error", exc, name="RlmContextError"
+                ))
+                return
+            # Atomic publish: no existing context changes until all source
+            # checks and strict decoding above succeed.
+            self.managed_context = context
+            self.managed_context_meta = context_meta
 
         # Reset the per-cell query truncation flag before the cell runs.
         self.query_truncated = False
         # Restore the official scaffold before every cell so a previous cell
         # that shadowed or deleted rlm_query cannot poison this one.
         self._restore_scaffold()
+        self._restore_context()
         # Begin a new cell epoch (Issue #4): a fresh task-local owner token is
         # published (create_task copies it automatically), old-token entries
         # are dropped, and answered ids rotate so duplicates of the previous
@@ -615,6 +683,7 @@ class RlmKernel:
         finally:
             sys.stdout = old_stdout
             self._restore_scaffold()
+            self._restore_context()
 
         stdout, stdout_cut = self._cut(capture.value(), max_stdout)
         frame_out: dict[str, Any] = {

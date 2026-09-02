@@ -13,11 +13,12 @@ const KERNEL_PATH = path.resolve(
   'python-runtime',
   'rlm_kernel.py',
 )
-const PROTOCOL_VERSION = 1
+const PROTOCOL_VERSION = 2
 const DEFAULT_TIMEOUT = 30_000
 const DEFAULT_MAX_STDOUT = 64 * 1024
 const DEFAULT_MAX_RESULT = 64 * 1024
 const DEFAULT_MAX_QUERIES = 16
+const DEFAULT_MAX_CONTEXT_BYTES = 64 * 1024 * 1024
 const MAX_FRAME_BYTES = 256 * 1024
 const MAX_STDERR_BYTES = 64 * 1024
 const MAX_QUERY_RESULT_BYTES = 64 * 1024
@@ -197,6 +198,8 @@ export interface RlmRuntimeConfig {
   maxResult?: number
   /** Max number of rlm_query calls a single cell may make. */
   maxQueries?: number
+  /** Byte cap for one kernel-managed UTF-8 context file. */
+  maxContextBytes?: number
 }
 
 /** Plugin-facing configuration: runtime settings plus the subagent provider. */
@@ -218,11 +221,14 @@ export const ConfigSchema: z<RlmPluginConfig> = z.object({
   maxStdout: z.natural().min(1024).max(262144).default(65536).description('Byte cap for a cell captured stdout.'),
   maxResult: z.natural().min(1024).max(262144).default(65536).description('Byte cap for a cell last-expression result.'),
   maxQueries: z.natural().min(1).max(4096).default(16).description('Max rlm_query calls per cell.'),
+  maxContextBytes: z.natural().min(1048576).max(1073741824).default(67108864).description('Byte cap for one kernel-managed UTF-8 context file.'),
 })
 
 export interface RlmEvalInput {
   /** Python source; top-level await is supported. */
   code: string
+  /** Optional absolute UTF-8 regular file loaded by the session kernel. */
+  contextPath?: string
   /** Overrides the runtime's total timeout budget for this call (startup + cell). */
   timeout?: number
   /**
@@ -255,18 +261,19 @@ export type RlmErrorKind =
   | 'busy' // a cell was still running on the same kernel
   | 'eval' // the Python cell failed with a typed error
   | 'query' // an rlm_query call failed
+  | 'context' // a managed context source was rejected atomically
   | 'protocol' // the kernel violated the protocol and was terminated
 
 export class RlmError extends Error {
   readonly kind: RlmErrorKind
-  readonly phase?: 'eval' | 'query'
+  readonly phase?: 'eval' | 'query' | 'context'
   readonly detailed?: string
   /** True when the underlying error frame reported a truncation. */
   readonly truncated: boolean
   constructor(
     kind: RlmErrorKind,
     message: string,
-    opts: { phase?: 'eval' | 'query'; detailed?: string; truncated?: boolean } = {},
+    opts: { phase?: 'eval' | 'query' | 'context'; detailed?: string; truncated?: boolean } = {},
   ) {
     super(message)
     this.name = 'RlmError'
@@ -322,7 +329,7 @@ class Kernel {
   readonly key: string
   child: ChildProcess | null = null
   private config: Required<
-    Pick<RlmRuntimeConfig, 'python' | 'timeout' | 'maxStdout' | 'maxResult' | 'maxQueries'>
+    Pick<RlmRuntimeConfig, 'python' | 'timeout' | 'maxStdout' | 'maxResult' | 'maxQueries' | 'maxContextBytes'>
   >
   private buf = ''
   private exited = false
@@ -354,6 +361,7 @@ class Kernel {
       maxStdout: config.maxStdout ?? DEFAULT_MAX_STDOUT,
       maxResult: config.maxResult ?? DEFAULT_MAX_RESULT,
       maxQueries: config.maxQueries ?? DEFAULT_MAX_QUERIES,
+      maxContextBytes: config.maxContextBytes ?? DEFAULT_MAX_CONTEXT_BYTES,
     }
     this.ready = new Promise<void>((resolve, reject) => {
       this.resolveReady = resolve
@@ -670,8 +678,8 @@ class Kernel {
     this.pending = null
     // Block routing now; the public settle waits for child quiescence.
     this.settling = true
-    const phase = frame.phase === 'query' ? 'query' : 'eval'
-    const kind = phase === 'query' ? 'query' : 'eval'
+    const phase = frame.phase === 'query' || frame.phase === 'context' ? frame.phase : 'eval'
+    const kind = phase === 'query' ? 'query' : phase === 'context' ? 'context' : 'eval'
     const message = safeErrorText(frame.message ?? 'kernel reported an error')
     if (!this.cellFinish) {
       this.cellFinish = this.finishCell(p, undefined, new RlmError(kind, message, {
@@ -831,7 +839,9 @@ class Kernel {
       code: input.code,
       max_stdout: this.config.maxStdout,
       max_result: this.config.maxResult,
+      max_context_bytes: this.config.maxContextBytes,
     }
+    if (input.contextPath !== undefined) evalFrame.context_path = input.contextPath
     if (this.outboundFrameBytes(evalFrame) > MAX_FRAME_BYTES) {
       throw new RlmError('protocol', 'host frame exceeds 256 KiB')
     }
@@ -1378,7 +1388,8 @@ export function registerRlmPlugin(
     order: 150,
     text:
       'Persistent globals and variables are kept across rlm_eval cells in one per-session Python kernel. '
-      + 'Cells may read files by absolute paths. Top-level await is supported, and '
+      + 'Pass contextPath to load one absolute UTF-8 regular file into persistent context; invalid sources leave the prior context intact. '
+      + 'Cells may also read files by absolute paths. Top-level await is supported, and '
       + 'await rlm_query(prompt) delegates the prompt to a one-shot subagent and returns its text. '
       + 'A later rlm_eval call reuses the same variables and can iterate on earlier results.',
   })
@@ -1396,6 +1407,10 @@ export function registerRlmPlugin(
         required: true,
         description: 'Python source to run; top-level await and persistent globals are supported.',
       },
+      contextPath: {
+        type: 'string',
+        description: 'Optional absolute UTF-8 regular file loaded atomically as persistent `context` for this session kernel.',
+      },
     },
     output: {
       schema: {
@@ -1409,7 +1424,7 @@ export function registerRlmPlugin(
       },
       render: (_args: unknown, value: RlmEvalValue) => [{ type: 'text', text: renderValue(value) }],
     },
-    async execute(args: { code: string }, exec): Promise<RlmEvalValue> {
+    async execute(args: { code: string; contextPath?: string }, exec): Promise<RlmEvalValue> {
       const parent = exec.agent
       if (!parent) {
         throw new Error('rlm_eval requires a calling agent (exec.agent was undefined)')
@@ -1418,12 +1433,14 @@ export function registerRlmPlugin(
       const sessionKey = String(parent.id)
       let output: Awaited<ReturnType<typeof runtime.eval>>
       try {
-        output = await runtime.eval(sessionKey, {
+        const input: RlmEvalInput = {
           code: args.code,
           signal: exec.signal,
           onQuery: async (prompt: string, cellSignal: AbortSignal) =>
             runQuery(ctx, provider, parent, prompt, cellSignal),
-        })
+        }
+        if (args.contextPath !== undefined) input.contextPath = args.contextPath
+        output = await runtime.eval(sessionKey, input)
       } catch (error) {
         // Surface the typed runtime error as a normal tool failure so the model
         // sees a useful, bounded message (the registry marks the call isError).

@@ -214,7 +214,8 @@ FIFO 队列串行化：
   传播到公开 `RlmError.truncated`；`detail` 以稳定文本呈现（字符串原样、
   数组/对象保留 JSON 结构）；面向模型的工具错误保持
   `kind + message + Detail + [truncated]` 且总字节 ≤ 64 KiB。
-  `PROTOCOL_VERSION` 保持 `1`；未新增协议消息、Service 或框架。
+   M3 将 `PROTOCOL_VERSION` 升至 `2`，从而避免旧内核静默忽略托管上下文描述符；
+   未新增公开 Service 或框架。
 
 ### Query/child 生命周期（Issue #4）
 
@@ -262,6 +263,8 @@ V1 通过一个 `Config` schema（`src/runtime.ts` 中的 `ConfigSchema`，由�
 - `maxStdout`（默认 `65536`）：整数 `1024..262144` UTF-8 字节（cell stdout）；
 - `maxResult`（默认 `65536`）：整数 `1024..262144` UTF-8 字节（cell 结果）；
 - `maxQueries`（默认 `16`）：整数 `1..4096`（每 cell 的 `rlm_query` 次数）。
+- `maxContextBytes`（默认 `67108864`）：整数 `1048576..1073741824`（一个由内核
+  托管的 UTF-8 文件上下文的源字节数）。
 
 校验后的 config 对象直接传给 `createRlmRuntime`；插件不提供环境变量透传，
 也没有 registry 或 Provider/framework 表面。未知 Provider、Python 启动失败

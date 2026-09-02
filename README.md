@@ -54,11 +54,14 @@ becomes a second Agent Loop and does not receive DSH Provider or Session objects
 - per-cell query count limit;
 - timeout/cancellation eviction and clean namespace recreation;
 - plugin teardown for owned Python kernels;
+- M3 managed context: an optional `contextPath` is kernel-read as one bounded,
+  strict UTF-8 regular file and published atomically as protected `context`;
 - offline tests plus a gated real clean-Profile smoke test.
 
 ## Next milestones and not implemented
 
-M3 and M4 are now scheduled, but not yet implemented:
+M3 is implemented on the current development branch and awaits clean-Profile
+acceptance; M4 remains planned:
 
 - [M3 Managed Context](docs/m3-managed-context.md);
 - [M4 Recursive Child RLM](docs/m4-recursive-child-rlm.md).
@@ -164,10 +167,11 @@ Enable it in the Profile's Cordis composition:
         maxStdout: 65536
         maxResult: 65536
         maxQueries: 16
+        maxContextBytes: 67108864
 ```
 
 The values above are the schema defaults. `provider` defaults to `spawn`. The
-five runtime settings are optional and validated by the single `Config` schema:
+six runtime settings are optional and validated by the single `Config` schema:
 
 | Setting | Default | Legal range / unit |
 |---|---|---|
@@ -176,16 +180,16 @@ five runtime settings are optional and validated by the single `Config` schema:
 | `maxStdout` | `65536` | integer `1024..262144` UTF-8 bytes of cell stdout |
 | `maxResult` | `65536` | integer `1024..262144` UTF-8 bytes of the cell result |
 | `maxQueries` | `16` | integer `1..4096` `rlm_query` calls per cell |
+| `maxContextBytes` | `67108864` | integer `1048576..1073741824` bytes of one managed UTF-8 context file |
 
 This repository has not published an npm package. The command above is a real
 local-package Profile installation, not a registry installation.
 
 ## Example
 
-The Agent can call `rlm_eval` with a cell such as:
+The Agent can call `rlm_eval` with an absolute `contextPath` and a cell such as:
 
 ```python
-context = open(path, encoding="utf-8").read()
 draft = await rlm_query("Summarize the key evidence in this context:\n" + context)
 draft
 ```

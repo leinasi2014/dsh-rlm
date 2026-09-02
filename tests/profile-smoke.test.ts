@@ -161,8 +161,10 @@ test('M1E: fresh isolated DSH Profile runs the real RLM loop', { timeout: 15 * 6
     const task = [
       'You are running an RLM acceptance test. Use the rlm_eval tool to complete EXACTLY these two steps.',
       '',
-      'Step 1: call rlm_eval ONCE with this exact Python source (do not change it):',
-      '    content = open(r\'' + fixture + '\', encoding=\'utf-8\').read()',
+      'Step 1: call rlm_eval ONCE with contextPath set exactly to this absolute file path:',
+      '    ' + fixture,
+      'Use this exact Python source (do not change it):',
+      '    content = context',
       '    q = await rlm_query(\'In one short English sentence, answer: what is 2 plus 2? Reply with only that sentence.\')',
       '    answer = content + \' || \' + q',
       '    answer',
@@ -170,7 +172,7 @@ test('M1E: fresh isolated DSH Profile runs the real RLM loop', { timeout: 15 * 6
       'The rlm_query call spawns a one-shot subagent whose final text is returned; the Python cell must continue after it.',
       '',
       'Step 2: call rlm_eval a SECOND time with this exact Python source:',
-      '    len(content) + len(q)',
+      '    len(context) + len(q)',
       '',
       'After both steps succeed, your final reply must be a single line beginning with RLM_ACCEPT_OK followed by the step-2 integer result.',
     ].join('\n')
