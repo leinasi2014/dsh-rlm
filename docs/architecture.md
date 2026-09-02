@@ -86,8 +86,22 @@ That process only:
 
 Later `rlm_eval` calls in the same Session reuse that process. The target
 boundary keeps credentials, Provider objects, DSH Agent objects, and Session
-transcripts out of Python. The current environment-inheritance gap is tracked
-in [Issue #7](https://github.com/leinasi2014/dsh-rlm/issues/7).
+transcripts out of Python. The child receives a fixed safe-name environment
+allowlist instead of the host `process.env`: Windows keeps `PATH`,
+`SystemRoot`, `WINDIR`, `COMSPEC`, `PATHEXT`, `SYSTEMDRIVE`, `USERPROFILE`,
+`TEMP`, and `TMP` (case-insensitive match, canonical output); POSIX keeps
+`PATH`, `HOME`, `TMPDIR`, `TEMP`, `TMP`, `LANG`, and only the exact standard
+`LC_*` category names; both platforms keep the public Python startup items
+`PYTHONIOENCODING`, `PYTHONUTF8`, `PYTHONUNBUFFERED`, and `PYTHONPATH`. No
+environment passthrough is exposed, and a custom `python` command uses the same
+allowlist, so it must resolve through the allowlisted `PATH` or an absolute
+path. Proxy variables, `VIRTUAL_ENV`/`CONDA_*`, `PYTHONHOME`,
+`LD_LIBRARY_PATH`, `DSH_*`, and credential-looking variables are never
+forwarded. The original environment-inheritance gap was audited and fixed in
+[Issue #7](https://github.com/leinasi2014/dsh-rlm/issues/7). This is credential
+hygiene, not a filesystem/process/network sandbox: trusted Python can still
+read host-user-readable files, use the network, start processes, and read
+on-disk credential files.
 
 ## 5. `rlm_query` round trip
 
