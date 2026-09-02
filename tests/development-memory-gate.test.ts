@@ -3,6 +3,7 @@ import { test } from 'node:test'
 
 import {
   addedRecordText,
+  isAppendOnlyRecordText,
   materialPathReferenced,
   parseRecords,
   removedRecordLines,
@@ -74,6 +75,21 @@ test('accepts an append after an unterminated final record without treating it a
 
   assert.deepEqual(removedRecordLines(diff), [])
   assert.equal(addedRecordText(diff), appended)
+})
+
+test('rejects inserting a new record before existing development-memory history', () => {
+  const prior = `${JSON.stringify(validEntry)}\n`
+  const inserted = JSON.stringify({ ...validEntry, recordId: 'mem-20260903-inserted-agent' })
+
+  assert.equal(isAppendOnlyRecordText(prior, `${inserted}\n${prior}`), false)
+})
+
+test('accepts only a true append to existing development-memory history', () => {
+  const prior = JSON.stringify(validEntry)
+  const appended = JSON.stringify({ ...validEntry, recordId: 'mem-20260903-appended-agent' })
+
+  assert.equal(isAppendOnlyRecordText(prior, `${prior}\n${appended}\n`), true)
+  assert.equal(isAppendOnlyRecordText(`${prior}\n`, `${prior}\n${appended}\n`), true)
 })
 
 test('still rejects changing an unterminated final record', () => {

@@ -195,6 +195,13 @@ export function removedRecordLines(diff) {
   return analyzeRecordDiff(diff).removed
 }
 
+export function isAppendOnlyRecordText(before, after) {
+  if (before === null) return after !== null
+  if (after === null || after === before) return after === before
+  const prefix = before.endsWith('\n') ? before : `${before}\n`
+  return after.startsWith(prefix)
+}
+
 function recordFiles(directory) {
   const files = []
   for (const item of readdirSync(directory, { withFileTypes: true })) {
@@ -235,6 +242,33 @@ function recordDiff(args) {
   return git([...args, '--', RECORDS_ROOT])
 }
 
+function gitFile(ref, file) {
+  const revision = ref === ':' ? `:${file}` : `${ref}:${file}`
+  try {
+    return git(['show', revision])
+  } catch {
+    return null
+  }
+}
+
+function appendOnlyRecordErrors(paths, beforeRef, afterRef, label) {
+  const errors = []
+  const records = new Set(paths.filter((file) =>
+    file.startsWith(`${RECORDS_ROOT}/`) && file.endsWith('.jsonl')))
+  for (const file of records) {
+    if (!isAppendOnlyRecordText(gitFile(beforeRef, file), gitFile(afterRef, file))) {
+      errors.push(`${label}: ${file} must preserve its prior content as an exact prefix and append new records only at EOF`)
+    }
+  }
+  return errors
+}
+
+function revisionEndpoints(range) {
+  const match = /^(.+?)\.\.\.?(.+)$/.exec(range)
+  if (!match) throw new Error(`range ${range} must use base..head or base...head syntax`)
+  return [match[1], match[2]]
+}
+
 export function addedRecordText(diff) {
   return analyzeRecordDiff(diff).added
     .map((line) => line.slice(1))
@@ -248,8 +282,8 @@ function issueFromBranch() {
   return match ? Number(match[1]) : null
 }
 
-function checkChangeSet(paths, diff, label) {
-  const errors = []
+function checkChangeSet(paths, diff, label, appendErrors = []) {
+  const errors = [...appendErrors]
   const removed = removedRecordLines(diff)
   if (removed.length > 0) {
     errors.push(`${label}: development-memory records are append-only; ${removed.length} existing line(s) changed or were removed`)
@@ -292,12 +326,15 @@ function main() {
   if (mode === '--staged') {
     const paths = changedPaths(['diff', '--cached', '--name-only', '-z', '--diff-filter=ACMRD'])
     const diff = recordDiff(['diff', '--cached', '--unified=0'])
-    errors.push(...checkChangeSet(paths, diff, 'staged change'))
+    const appendErrors = appendOnlyRecordErrors(paths, 'HEAD', ':', 'staged change')
+    errors.push(...checkChangeSet(paths, diff, 'staged change', appendErrors))
   } else if (mode === '--range') {
     const range = value || defaultRange()
     const paths = changedPaths(['diff', range, '--name-only', '-z', '--diff-filter=ACMRD'])
     const diff = recordDiff(['diff', '--unified=0', range])
-    errors.push(...checkChangeSet(paths, diff, `range ${range}`))
+    const [beforeRef, afterRef] = revisionEndpoints(range)
+    const appendErrors = appendOnlyRecordErrors(paths, beforeRef, afterRef, `range ${range}`)
+    errors.push(...checkChangeSet(paths, diff, `range ${range}`, appendErrors))
   } else if (mode !== '--all') {
     errors.push(`unknown mode ${mode}; use --all, --staged, or --range [base..head]`)
   }

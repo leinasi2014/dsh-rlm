@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -176,12 +176,59 @@ test('never echoes credentials when an identity-matching fetch fails', (t) => {
   assert.doesNotMatch(result.stderr, /user:secret/)
 })
 
+test('never echoes query tokens or fragments from a failed Git transport', (t) => {
+  const { work } = fixture(t)
+  const remote = 'https://127.0.0.1:1/private.git?access_token=query-secret#fragment-secret'
+  git(work, 'remote', 'set-url', 'origin', remote)
+  const result = runChecker(work, remote)
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /git fetch failed/)
+  assert.doesNotMatch(result.stderr, /access_token|query-secret|fragment-secret/)
+})
+
+test('overrides ambient Git and SSH askpass helpers with non-interactive sentinels', (t) => {
+  const { work } = fixture(t)
+  const root = path.dirname(work)
+  const invoked = path.join(root, 'askpass-invoked.txt')
+  const helper = process.platform === 'win32'
+    ? path.join(root, 'askpass.cmd')
+    : path.join(root, 'askpass.sh')
+  if (process.platform === 'win32') {
+    writeFileSync(helper, `@echo off\r\n>"${invoked}" echo invoked\r\n`)
+  } else {
+    writeFileSync(helper, `#!/bin/sh\nprintf invoked > '${invoked}'\n`)
+    chmodSync(helper, 0o755)
+  }
+  const remote = 'ssh://git@127.0.0.1:1/private.git'
+  git(work, 'remote', 'set-url', 'origin', remote)
+  const previousGitAskpass = process.env.GIT_ASKPASS
+  const previousSshAskpass = process.env.SSH_ASKPASS
+  process.env.GIT_ASKPASS = helper
+  process.env.SSH_ASKPASS = helper
+  try {
+    const result = runChecker(work, remote)
+    assert.notEqual(result.status, 0)
+    assert.match(result.stderr, /git fetch failed/)
+    assert.equal(existsSync(invoked), false)
+  } finally {
+    if (previousGitAskpass === undefined) delete process.env.GIT_ASKPASS
+    else process.env.GIT_ASKPASS = previousGitAskpass
+    if (previousSshAskpass === undefined) delete process.env.SSH_ASKPASS
+    else process.env.SSH_ASKPASS = previousSshAskpass
+  }
+})
+
 test('sanitizes URL userinfo from raw Git diagnostics', () => {
   const diagnostic = 'fatal: unable to access https://user:secret@example.invalid/private.git'
   assert.equal(
     redactGitDiagnostic(diagnostic),
     'fatal: unable to access https://example.invalid/private.git',
   )
+})
+
+test('sanitizes URL query and fragment secrets from raw diagnostics', () => {
+  const diagnostic = 'fatal: https://example.invalid/private.git?access_token=secret#fragment-secret'
+  assert.equal(redactGitDiagnostic(diagnostic), 'fatal: https://example.invalid/private.git')
 })
 
 test('the production CLI rejects authority override arguments', (t) => {

@@ -59,30 +59,42 @@ export function repositoryIdentity(value, repo = process.cwd(), platform = proce
 }
 
 export function redactGitDiagnostic(value) {
-  const redacted = value.replace(/\b([a-z][a-z\d+.-]*:\/\/)[^@\s/]+@/gi, '$1')
+  const redacted = value
+    .replace(/\b([a-z][a-z\d+.-]*:\/\/)[^@\s/'"]+@/gi, '$1')
+    .replace(/\b([a-z][a-z\d+.-]*:\/\/[^\s?#'"]+)[?#][^\s'"]*/gi, '$1')
   return redacted.length <= MAX_DIAGNOSTIC_CHARS
     ? redacted
     : `${redacted.slice(0, MAX_DIAGNOSTIC_CHARS)}…[diagnostic truncated]`
 }
 
 function git(repo, args) {
-  const result = spawnSync('git', ['-C', repo, ...args], {
+  const result = spawnSync('git', [
+    '-C', repo,
+    '-c', 'credential.helper=',
+    '-c', 'credential.interactive=false',
+    ...args,
+  ], {
     encoding: 'utf8',
     env: {
       ...process.env,
       GIT_TERMINAL_PROMPT: '0',
       GCM_INTERACTIVE: 'Never',
+      GIT_ASKPASS: process.execPath,
+      SSH_ASKPASS: process.execPath,
+      SSH_ASKPASS_REQUIRE: 'force',
+      GIT_SSH_COMMAND: 'ssh -o BatchMode=yes',
     },
     timeout: GIT_TIMEOUT_MS,
     windowsHide: true,
   })
   if (result.error) {
-    const reason = result.error.code === 'ETIMEDOUT' ? `timed out after ${GIT_TIMEOUT_MS}ms` : result.error.message
-    throw new Error(`git ${args[0]} ${redactGitDiagnostic(reason)}`)
+    const reason = result.error.code === 'ETIMEDOUT'
+      ? `timed out after ${GIT_TIMEOUT_MS}ms`
+      : 'could not start'
+    throw new Error(`git ${args[0]} failed: ${reason}`)
   }
   if (result.status !== 0) {
-    const raw = result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`
-    throw new Error(`git ${args[0]} failed: ${redactGitDiagnostic(raw)}`)
+    throw new Error(`git ${args[0]} failed (exit ${result.status ?? 'unknown'})`)
   }
   return result.stdout.trim()
 }
