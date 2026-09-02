@@ -6,6 +6,7 @@ import path from 'node:path'
 import test from 'node:test'
 import {
   checkDshUpstream,
+  gitInvocation,
   redactGitDiagnostic,
   repositoryIdentity,
 } from '../scripts/check-dsh-upstream.mjs'
@@ -216,6 +217,28 @@ test('overrides ambient Git and SSH askpass helpers with non-interactive sentine
     if (previousSshAskpass === undefined) delete process.env.SSH_ASKPASS
     else process.env.SSH_ASKPASS = previousSshAskpass
   }
+})
+
+test('constructs every Git operation with explicit non-interactive credential controls', () => {
+  const repo = path.resolve('fixture')
+  const invocation = gitInvocation(repo, ['fetch', 'origin'], {
+    GIT_ASKPASS: 'ambient-git-askpass',
+    SSH_ASKPASS: 'ambient-ssh-askpass',
+    GIT_SSH_COMMAND: 'ambient-ssh',
+  })
+
+  assert.deepEqual(invocation.args.slice(0, 7), [
+    '-C', repo,
+    '-c', 'credential.helper=',
+    '-c', 'credential.interactive=false',
+    'fetch',
+  ])
+  assert.equal(invocation.env.GIT_TERMINAL_PROMPT, '0')
+  assert.equal(invocation.env.GCM_INTERACTIVE, 'Never')
+  assert.equal(invocation.env.GIT_ASKPASS, process.execPath)
+  assert.equal(invocation.env.SSH_ASKPASS, process.execPath)
+  assert.equal(invocation.env.SSH_ASKPASS_REQUIRE, 'force')
+  assert.equal(invocation.env.GIT_SSH_COMMAND, 'ssh -o BatchMode=yes')
 })
 
 test('sanitizes URL userinfo from raw Git diagnostics', () => {

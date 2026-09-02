@@ -67,16 +67,16 @@ export function redactGitDiagnostic(value) {
     : `${redacted.slice(0, MAX_DIAGNOSTIC_CHARS)}…[diagnostic truncated]`
 }
 
-function git(repo, args) {
-  const result = spawnSync('git', [
+export function gitInvocation(repo, args, environment = process.env) {
+  return {
+    args: [
     '-C', repo,
     '-c', 'credential.helper=',
     '-c', 'credential.interactive=false',
     ...args,
-  ], {
-    encoding: 'utf8',
+    ],
     env: {
-      ...process.env,
+      ...environment,
       GIT_TERMINAL_PROMPT: '0',
       GCM_INTERACTIVE: 'Never',
       GIT_ASKPASS: process.execPath,
@@ -86,6 +86,16 @@ function git(repo, args) {
     },
     timeout: GIT_TIMEOUT_MS,
     windowsHide: true,
+  }
+}
+
+function git(repo, args) {
+  const invocation = gitInvocation(repo, args)
+  const result = spawnSync('git', invocation.args, {
+    encoding: 'utf8',
+    env: invocation.env,
+    timeout: invocation.timeout,
+    windowsHide: invocation.windowsHide,
   })
   if (result.error) {
     const reason = result.error.code === 'ETIMEDOUT'
