@@ -500,18 +500,57 @@ class RlmKernel:
     def _read_context(path_text: str, max_bytes: int) -> "tuple[str, dict[str, Any]]":
         if not os.path.isabs(path_text):
             raise RlmContextError("contextPath must be an absolute path")
+        canonical_path = os.path.realpath(path_text)
+        fd = -1
         try:
-            with open(path_text, "rb") as source:
-                info = os.fstat(source.fileno())
-                if not stat.S_ISREG(info.st_mode):
-                    raise RlmContextError("contextPath must name a regular file")
-                if info.st_size > max_bytes:
-                    raise RlmContextError("contextPath exceeds maxContextBytes")
-                payload = source.read(max_bytes + 1)
+            # Reject special files before opening them. O_NONBLOCK is also set
+            # when the platform exposes it, closing the lstat->open race where
+            # a regular path is swapped for a FIFO/device after this check.
+            path_info = os.lstat(canonical_path)
+            if not stat.S_ISREG(path_info.st_mode):
+                raise RlmContextError("contextPath must name a regular file")
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NONBLOCK"):
+                flags |= os.O_NONBLOCK
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(canonical_path, flags)
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise RlmContextError("contextPath must name a regular file")
+            fingerprint = (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
+            path_identity = (path_info.st_dev, path_info.st_ino)
+            if (before.st_dev, before.st_ino) != path_identity:
+                raise RlmContextError("contextPath changed before it could be read")
+            if before.st_size > max_bytes:
+                raise RlmContextError("contextPath exceeds maxContextBytes")
+            payload = os.read(fd, max_bytes + 1)
+            after = os.fstat(fd)
+            after_fingerprint = (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+            )
+            if after_fingerprint != fingerprint:
+                raise RlmContextError("contextPath changed while reading")
         except RlmContextError:
             raise
         except OSError as exc:
             raise RlmContextError("could not read contextPath: " + str(exc)) from exc
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         if len(payload) > max_bytes:
             raise RlmContextError("contextPath exceeds maxContextBytes")
         try:
@@ -520,7 +559,7 @@ class RlmKernel:
             raise RlmContextError("contextPath is not valid UTF-8") from exc
         return text, {
             "kind": "file",
-            "path": os.path.realpath(path_text),
+            "path": canonical_path,
             "bytes": len(payload),
         }
 

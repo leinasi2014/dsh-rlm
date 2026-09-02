@@ -3386,3 +3386,63 @@ test('M3 Issue#24: tool forwards contextPath and reports source-limit rejection 
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('M3 Issue#24: a FIFO is rejected before opening and preserves the live kernel', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('Windows has no portable filesystem FIFO for this black-box regression')
+    return
+  }
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-fifo-'))
+  const contextPath = path.join(dir, 'context.txt')
+  const fifoPath = path.join(dir, 'source.fifo')
+  writeFileSync(contextPath, 'stable', 'utf8')
+  const fifo = spawnSync(pythonCmd, ['-c', 'import os, sys; os.mkfifo(sys.argv[1])', fifoPath], { encoding: 'utf8' })
+  assert.equal(fifo.status, 0, 'could not create FIFO: ' + fifo.stderr)
+  const runtime = rt({ timeout: 500 })
+  try {
+    const before = await runtime.eval('m3-fifo', { code: 'import os\nos.getpid()', contextPath })
+    await assert.rejects(
+      runtime.eval('m3-fifo', { code: 'context', contextPath: fifoPath }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'context',
+    )
+    const after = await runtime.eval('m3-fifo', { code: 'import os\nstr(os.getpid()) + ":" + context' })
+    assert.equal(after.result, String(before.result) + ':stable')
+  } finally {
+    await runtime.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('M3 Issue#24: an in-read source mutation is rejected before atomic publication', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-race-'))
+  const contextPath = path.join(dir, 'context.txt')
+  writeFileSync(contextPath, 'before', 'utf8')
+  const script = [
+    'import importlib.util, os, sys',
+    'spec = importlib.util.spec_from_file_location("rlm_kernel_under_test", sys.argv[1])',
+    'module = importlib.util.module_from_spec(spec)',
+    'assert spec.loader is not None',
+    'spec.loader.exec_module(module)',
+    'path = sys.argv[2]',
+    'original_fstat = os.fstat',
+    'calls = 0',
+    'def raced_fstat(fd):',
+    '    global calls',
+    '    calls += 1',
+    '    if calls == 2:',
+    '        with open(path, "ab") as source: source.write(b"!")',
+    '    return original_fstat(fd)',
+    'os.fstat = raced_fstat',
+    'try:',
+    '    module.RlmKernel._read_context(path, 1024)',
+    'except module.RlmContextError:',
+    '    raise SystemExit(0)',
+    'raise SystemExit(1)',
+  ].join('\n')
+  try {
+    const result = spawnSync(pythonCmd, ['-c', script, kernelPath, contextPath], { encoding: 'utf8' })
+    assert.equal(result.status, 0, 'read-race must be a typed context failure; stderr: ' + result.stderr)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
