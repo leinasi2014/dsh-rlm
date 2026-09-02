@@ -571,6 +571,73 @@ test('M1A Issue#5: normal UTF-8 and Chinese text round-trip through the wire', a
   }
 })
 
+test('M1A Issue#5: a hostile metaclass __name__ is a typed error and the kernel survives', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'import os\nmarker = 5\nos.getpid()' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    const pid = Number(r1.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + r1.result)
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: [
+        'class Meta(type):',
+        '    def __getattribute__(self, name):',
+        '        if name == "__name__":',
+        '            raise RuntimeError("name boom")',
+        '        return super().__getattribute__(name)',
+        'class Evil(Exception, metaclass=Meta):',
+        '    pass',
+        'raise Evil("boom")',
+      ].join('\n'),
+    })
+    const e = await k.next(4000)
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'BaseException')
+    assert.equal(e.message, 'boom')
+    k.send({ type: 'eval', id: 3, code: 'import os\nmarker + 37' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, '42')
+    k.send({ type: 'eval', id: 4, code: 'import os\nos.getpid()' })
+    const r3 = await k.next()
+    assert.equal(r3.type, 'result')
+    assert.equal(r3.result, String(pid))
+    k.send({
+      type: 'eval',
+      id: 5,
+      code: [
+        'class Meta2(type):',
+        '    def __getattribute__(self, name):',
+        '        if name == "__name__":',
+        '            raise RuntimeError("name boom 2")',
+        '        return super().__getattribute__(name)',
+        'class Evil2(Exception, metaclass=Meta2):',
+        '    def __str__(self):',
+        '        raise RuntimeError("str boom")',
+        'raise Evil2("x")',
+      ].join('\n'),
+    })
+    const e2 = await k.next()
+    assert.equal(e2.type, 'error')
+    assert.equal(e2.phase, 'eval')
+    assert.equal(e2.kind, 'runtime_error')
+    assert.equal(e2.name, 'BaseException')
+    assert.equal(e2.message, 'BaseException')
+    k.send({ type: 'eval', id: 6, code: 'marker' })
+    const r4 = await k.next()
+    assert.equal(r4.type, 'result')
+    assert.equal(r4.result, '5')
+  } finally {
+    await k.close()
+  }
+})
+
 // ---- M1B: TypeScript runtime process protocol ----
 
 import { createRlmRuntime, RlmError } from '../src/runtime.ts'

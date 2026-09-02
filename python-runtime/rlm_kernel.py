@@ -94,7 +94,18 @@ def _safe_str(value: Any) -> str:
     try:
         return str(value)
     except BaseException:
+        return _safe_type_name(value)
+
+
+def _safe_type_name(value: Any) -> str:
+    """Best-effort exception class name that cannot raise: a hostile
+    metaclass whose __name__ access throws must never turn a typed cell
+    error into a kernel crash while building the error frame. The fallback
+    is a stable string that keeps the frame well-formed."""
+    try:
         return type(value).__name__
+    except BaseException:
+        return "BaseException"
 
 
 def _safe_attr(obj: Any, name: str) -> Any:
@@ -350,7 +361,7 @@ class RlmKernel:
             "phase": phase,
             "kind": kind,
             "message": _safe_str(exc),
-            "name": name or type(exc).__name__,
+            "name": name or _safe_type_name(exc),
         }
         lineno = _safe_attr(exc, "lineno")
         column = _safe_attr(exc, "offset")
