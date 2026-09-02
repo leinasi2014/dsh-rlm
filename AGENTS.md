@@ -36,22 +36,16 @@ a real clean DSH Profile.
 ## Official DSH Upstream Gate
 
 - Before changing production code or tests for any work item, point
-  `RLM_DSH_REPO_ROOT` at the DSH source checkout that will define compatibility
-  and run `pnpm check:upstream`.
-- The authority is `https://github.com/deepseek-ai/deepseek-harness.git` branch
-  `master`. The gate fetches its current tip without changing the DSH worktree
-  and passes only when the selected checkout contains that tip.
-- A stale, diverged, wrong, or unreachable authority is not ready for mutation.
-  Use an isolated checkout/worktree at the latest tip or explicitly resolve the
-  compatibility target; never claim that a frozen `ref/` snapshot is current DSH.
-- Record the authority URL, branch, local SHA, upstream SHA, and ahead/behind
-  result in the Issue and development-memory evidence. If relevant DSH packages
-  changed, inspect their current source/types and prove the plugin against those
-  versions before RED; add latest-DSH live evidence when the contract crosses a
-  runtime/Profile boundary.
-- This is a pre-development readiness gate, not a network-dependent commit hook
-  or ordinary CI check. Re-run it before final live acceptance if the upstream
-  tip may have moved.
+  `RLM_DSH_REPO_ROOT` at the selected DSH source checkout and run
+  `pnpm check:upstream`.
+- The fixed source-freshness authority is
+  `https://github.com/deepseek-ai/deepseek-harness.git:master`; installed or
+  published `@deepseek-ai/*` types and the exact loaded Profile runtime remain
+  the executable compatibility authorities.
+- A stale, diverged, wrong, unreachable, or tracked-dirty DSH checkout is not
+  ready for mutation. `ref/` remains pinned prior art, never freshness evidence.
+- Follow the authoritative [GitHub Issue Repair Playbook](docs/issue-repair-playbook.md#41-official-dsh-upstream-authority-gate)
+  for evidence, artifact mapping, failure handling, and final live re-checks.
 
 ## Architecture Contract and TDD
 

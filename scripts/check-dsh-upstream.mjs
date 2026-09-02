@@ -3,50 +3,86 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const OFFICIAL_REPOSITORY = 'https://github.com/deepseek-ai/deepseek-harness.git'
-const DEFAULT_BRANCH = 'master'
+const OFFICIAL_REMOTE = 'origin'
+const OFFICIAL_BRANCH = 'master'
 const GIT_TIMEOUT_MS = 45_000
+const MAX_DIAGNOSTIC_CHARS = 2_000
 
-function parseArgs(argv) {
-  const values = new Map()
+function parseRepoArg(argv) {
+  let repo
   for (let index = 0; index < argv.length; index += 2) {
     const name = argv[index]
     const value = argv[index + 1]
-    if (!name?.startsWith('--') || value === undefined) {
-      throw new Error(`expected --name value arguments; received ${name ?? '(end)'}`)
-    }
-    values.set(name.slice(2), value)
+    if (name !== '--repo') throw new Error(`unsupported argument ${name ?? '(end)'}`)
+    if (value === undefined) throw new Error('expected a value after --repo')
+    if (repo !== undefined) throw new Error('--repo may be specified only once')
+    repo = value
   }
-  return values
+  return repo
 }
 
-function repositoryIdentity(value) {
+function nativePathIdentity(input, repo, platform) {
+  const implementation = platform === 'win32' ? path.win32 : path.posix
+  const resolved = implementation.isAbsolute(input)
+    ? implementation.normalize(input)
+    : implementation.resolve(repo, input)
+  const withoutSuffix = resolved.replace(/\.git$/i, '')
+  return platform === 'win32' ? withoutSuffix.toLowerCase() : withoutSuffix
+}
+
+export function repositoryIdentity(value, repo = process.cwd(), platform = process.platform) {
   const input = value.trim()
-  const scp = /^([^@]+@)?([^:]+):(.+)$/.exec(input)
-  if (scp && !input.includes('://') && !/^[A-Za-z]:[\\/]/.test(input)) {
-    return `${scp[2].toLowerCase()}/${scp[3].replace(/\.git\/?$/i, '').replace(/^\/+|\/+$/g, '').toLowerCase()}`
+  const native = platform === 'win32' ? path.win32 : path.posix
+  const isWindowsPath = /^[A-Za-z]:[\\/]/.test(input) || /^\\\\/.test(input)
+  if (native.isAbsolute(input) || isWindowsPath) {
+    return nativePathIdentity(input, repo, isWindowsPath ? 'win32' : platform)
   }
+
+  const scp = /^([^@]+@)?([^:]+):(.+)$/.exec(input)
+  if (scp && !input.includes('://')) {
+    const host = scp[2].toLowerCase()
+    const repository = scp[3].replace(/\.git\/?$/i, '').replace(/^\/+|\/+$/g, '')
+    return `${host}/${host === 'github.com' ? repository.toLowerCase() : repository}`
+  }
+
   try {
     const url = new URL(input)
-    if (url.protocol === 'file:') return path.normalize(fileURLToPath(url)).toLowerCase().replace(/\.git$/i, '')
-    return `${url.hostname.toLowerCase()}/${url.pathname.replace(/\.git\/?$/i, '').replace(/^\/+|\/+$/g, '').toLowerCase()}`
+    if (url.protocol === 'file:') {
+      return nativePathIdentity(fileURLToPath(url), repo, platform)
+    }
+    const host = url.host.toLowerCase()
+    const repository = url.pathname.replace(/\.git\/?$/i, '').replace(/^\/+|\/+$/g, '')
+    return `${host}/${url.hostname.toLowerCase() === 'github.com' ? repository.toLowerCase() : repository}`
   } catch {
-    return path.resolve(input).toLowerCase().replace(/\.git$/i, '')
+    return nativePathIdentity(input, repo, platform)
   }
+}
+
+export function redactGitDiagnostic(value) {
+  const redacted = value.replace(/\b([a-z][a-z\d+.-]*:\/\/)[^@\s/]+@/gi, '$1')
+  return redacted.length <= MAX_DIAGNOSTIC_CHARS
+    ? redacted
+    : `${redacted.slice(0, MAX_DIAGNOSTIC_CHARS)}…[diagnostic truncated]`
 }
 
 function git(repo, args) {
   const result = spawnSync('git', ['-C', repo, ...args], {
     encoding: 'utf8',
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: '0',
+      GCM_INTERACTIVE: 'Never',
+    },
     timeout: GIT_TIMEOUT_MS,
     windowsHide: true,
   })
   if (result.error) {
     const reason = result.error.code === 'ETIMEDOUT' ? `timed out after ${GIT_TIMEOUT_MS}ms` : result.error.message
-    throw new Error(`git ${args[0]} ${reason}`)
+    throw new Error(`git ${args[0]} ${redactGitDiagnostic(reason)}`)
   }
   if (result.status !== 0) {
-    const detail = result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`
-    throw new Error(`git ${args[0]} failed: ${detail}`)
+    const raw = result.stderr.trim() || result.stdout.trim() || `exit ${result.status}`
+    throw new Error(`git ${args[0]} failed: ${redactGitDiagnostic(raw)}`)
   }
   return result.stdout.trim()
 }
@@ -56,26 +92,29 @@ function defaultRepo() {
   return path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', '..')
 }
 
-function main() {
-  const args = parseArgs(process.argv.slice(2))
-  const repo = path.resolve(args.get('repo') ?? defaultRepo())
-  const remote = args.get('remote') ?? process.env.DSH_UPSTREAM_REMOTE ?? 'origin'
-  const branch = args.get('branch') ?? process.env.DSH_UPSTREAM_BRANCH ?? DEFAULT_BRANCH
-  const expectedRepository = args.get('expected-repository')
-    ?? process.env.DSH_UPSTREAM_REPOSITORY
-    ?? OFFICIAL_REPOSITORY
-
-  const actualRepository = git(repo, ['remote', 'get-url', remote])
-  const actualIdentity = repositoryIdentity(actualRepository)
-  const expectedIdentity = repositoryIdentity(expectedRepository)
+export function checkDshUpstream({
+  repo,
+  remote = OFFICIAL_REMOTE,
+  branch = OFFICIAL_BRANCH,
+  expectedRepository = OFFICIAL_REPOSITORY,
+}) {
+  const root = path.resolve(repo)
+  const actualRepository = git(root, ['remote', 'get-url', remote])
+  const actualIdentity = repositoryIdentity(actualRepository, root)
+  const expectedIdentity = repositoryIdentity(expectedRepository, root)
   if (actualIdentity !== expectedIdentity) {
     throw new Error(`repository authority mismatch: ${remote} is ${actualIdentity}; expected ${expectedIdentity}`)
   }
 
-  git(repo, ['fetch', '--no-tags', '--filter=blob:none', remote, `refs/heads/${branch}`])
-  const local = git(repo, ['rev-parse', 'HEAD'])
-  const upstream = git(repo, ['rev-parse', 'FETCH_HEAD'])
-  const [aheadText, behindText] = git(repo, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`]).split(/\s+/)
+  const trackedChanges = git(root, ['status', '--porcelain', '--untracked-files=no'])
+  if (trackedChanges.length !== 0) {
+    throw new Error('selected DSH checkout has tracked index/worktree changes; local SHA would not identify tested source')
+  }
+
+  git(root, ['fetch', '--no-tags', '--filter=blob:none', remote, `refs/heads/${branch}`])
+  const local = git(root, ['rev-parse', 'HEAD'])
+  const upstream = git(root, ['rev-parse', 'FETCH_HEAD'])
+  const [aheadText, behindText] = git(root, ['rev-list', '--left-right', '--count', `HEAD...${upstream}`]).split(/\s+/)
   const ahead = Number(aheadText)
   const behind = Number(behindText)
   const evidence = `authority=${actualIdentity} branch=${branch} local=${local} upstream=${upstream} ahead=${ahead} behind=${behind}`
@@ -83,13 +122,24 @@ function main() {
     throw new Error(`could not parse ahead/behind relationship: ${evidence}`)
   }
   if (behind !== 0) throw new Error(`local DSH does not contain the latest authority tip: ${evidence}`)
+  return evidence
+}
+
+function main() {
+  const repoArg = parseRepoArg(process.argv.slice(2))
+  const evidence = checkDshUpstream({ repo: path.resolve(repoArg ?? defaultRepo()) })
   process.stdout.write(`dsh-upstream: PASS ${evidence}\n`)
 }
 
-try {
-  main()
-} catch (error) {
-  const message = error instanceof Error ? error.message : String(error)
-  process.stderr.write(`dsh-upstream: FAIL ${message}\n`)
-  process.exitCode = 1
+const isMain = process.argv[1] !== undefined
+  && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url))
+
+if (isMain) {
+  try {
+    main()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    process.stderr.write(`dsh-upstream: FAIL ${message}\n`)
+    process.exitCode = 1
+  }
 }

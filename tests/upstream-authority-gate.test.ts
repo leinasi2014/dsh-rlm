@@ -4,6 +4,11 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import {
+  checkDshUpstream,
+  redactGitDiagnostic,
+  repositoryIdentity,
+} from '../scripts/check-dsh-upstream.mjs'
 
 const projectRoot = path.resolve(import.meta.dirname, '..')
 const checker = path.join(projectRoot, 'scripts', 'check-dsh-upstream.mjs')
@@ -40,13 +45,18 @@ function fixture(t: test.TestContext): { remote: string; seed: string; work: str
 }
 
 function runChecker(repo: string, expectedRepository: string) {
-  return spawnSync(process.execPath, [
-    checker,
-    '--repo', repo,
-    '--remote', 'origin',
-    '--branch', 'master',
-    '--expected-repository', expectedRepository,
-  ], { cwd: projectRoot, encoding: 'utf8' })
+  try {
+    const evidence = checkDshUpstream({
+      repo,
+      remote: 'origin',
+      branch: 'master',
+      expectedRepository,
+    })
+    return { status: 0, stdout: `dsh-upstream: PASS ${evidence}\n`, stderr: '' }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return { status: 1, stdout: '', stderr: `dsh-upstream: FAIL ${message}\n` }
+  }
 }
 
 test('passes when the local DSH checkout contains the fetched authority tip', (t) => {
@@ -55,6 +65,45 @@ test('passes when the local DSH checkout contains the fetched authority tip', (t
   assert.equal(result.status, 0, result.stderr)
   assert.match(result.stdout, /dsh-upstream: PASS/)
   assert.match(result.stdout, /ahead=0 behind=0/)
+})
+
+test('passes when a clean local checkout is ahead of and contains the authority tip', (t) => {
+  const { remote, work } = fixture(t)
+  writeFileSync(path.join(work, 'local.txt'), 'local\n')
+  git(work, 'add', 'local.txt')
+  git(work, 'commit', '-m', 'local compatible work')
+  const result = runChecker(work, remote)
+  assert.equal(result.status, 0, result.stderr)
+  assert.match(result.stdout, /ahead=1 behind=0/)
+})
+
+test('fails closed when tracked DSH content differs from the recorded local SHA', (t) => {
+  const { remote, work } = fixture(t)
+  writeFileSync(path.join(work, 'contract.txt'), 'dirty\n')
+  const result = runChecker(work, remote)
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /tracked index\/worktree changes/)
+  assert.doesNotMatch(result.stderr, /contract\.txt/)
+})
+
+test('ignores untracked DSH files because they do not alter tracked source at HEAD', (t) => {
+  const { remote, work } = fixture(t)
+  writeFileSync(path.join(work, 'untracked.txt'), 'local material\n')
+  const result = runChecker(work, remote)
+  assert.equal(result.status, 0, result.stderr)
+})
+
+test('resolves a relative remote URL against the inspected DSH checkout', (t) => {
+  const { remote, work } = fixture(t)
+  git(work, 'remote', 'set-url', 'origin', path.relative(work, remote))
+  const result = runChecker(work, remote)
+  assert.equal(result.status, 0, result.stderr)
+})
+
+test('preserves case for native repository paths on case-sensitive platforms', () => {
+  const upper = repositoryIdentity('/tmp/DSH.git', '/tmp/work', 'linux')
+  const lower = repositoryIdentity('/tmp/dsh.git', '/tmp/work', 'linux')
+  assert.notEqual(upper, lower)
 })
 
 test('fails closed when the local DSH checkout is behind the authority tip', (t) => {
@@ -100,4 +149,48 @@ test('never echoes remote URL credentials in authority failures', (t) => {
   assert.notEqual(result.status, 0)
   assert.match(result.stderr, /example\.invalid\/private/)
   assert.doesNotMatch(result.stderr, /user:secret/)
+})
+
+test('the production CLI cannot redefine the official authority from environment', (t) => {
+  const { remote, work } = fixture(t)
+  const result = spawnSync(process.execPath, [checker, '--repo', work], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      DSH_UPSTREAM_REMOTE: 'origin',
+      DSH_UPSTREAM_BRANCH: 'master',
+      DSH_UPSTREAM_REPOSITORY: remote,
+    },
+  })
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /repository authority mismatch/)
+})
+
+test('never echoes credentials when an identity-matching fetch fails', (t) => {
+  const { work } = fixture(t)
+  git(work, 'remote', 'set-url', 'origin', 'https://user:secret@127.0.0.1:1/private.git')
+  const result = runChecker(work, 'https://127.0.0.1:1/private.git')
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /git fetch failed/)
+  assert.doesNotMatch(result.stderr, /user:secret/)
+})
+
+test('sanitizes URL userinfo from raw Git diagnostics', () => {
+  const diagnostic = 'fatal: unable to access https://user:secret@example.invalid/private.git'
+  assert.equal(
+    redactGitDiagnostic(diagnostic),
+    'fatal: unable to access https://example.invalid/private.git',
+  )
+})
+
+test('the production CLI rejects authority override arguments', (t) => {
+  const { remote, work } = fixture(t)
+  const result = spawnSync(process.execPath, [
+    checker,
+    '--repo', work,
+    '--expected-repository', remote,
+  ], { cwd: projectRoot, encoding: 'utf8' })
+  assert.notEqual(result.status, 0)
+  assert.match(result.stderr, /unsupported argument --expected-repository/)
 })
