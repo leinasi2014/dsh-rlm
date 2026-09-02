@@ -10,15 +10,18 @@ DSH Agent -> rlm_eval(code) -> Session Python kernel
   -> text returns to Python -> cell continues -> next rlm_eval can reuse globals
 ```
 
-Do not add a second agent loop, public service, storage domain, checkpoint system,
-recursive child RLM, UI, Workflow, Jobs, or provider framework before M1 passes in
-a real clean DSH Profile.
+M1/M2 are delivered. Extend the same loop in strict order: M3 Managed Context,
+then M4 Recursive Child RLM. Do not add a second agent loop, public service,
+storage domain, checkpoint system, UI, Workflow, Jobs, or provider framework.
 
 ## Development Rules
 
 - Treat `docs/architecture.md`, `docs/directory-structure.md`,
   `docs/milestones.md`, and `docs/future-extensions.md` as the current product
   boundary.
+- For M3/M4, also treat `docs/m3-managed-context.md`,
+  `docs/m4-recursive-child-rlm.md`, and `docs/m3-m4-development-contract.md` as
+  binding; English is authoritative and each has a Chinese mirror.
 - Keep the V1 source layout small:
   - `src/index.ts`
   - `src/runtime.ts`
@@ -84,6 +87,10 @@ a real clean DSH Profile.
    and dispose.
 6. Prove the M1 loop in tests and in a clean DSH Profile using the configured
    `DeepSeek-V4-Flash-Vision-Exp` vLLM/PTC model path.
+7. Implement M3 Managed Context only after its docs slice is integrated; close
+   it through TDD, independent review, CI, remote-main read-back, and live smoke.
+8. Implement M4 Recursive Child RLM only after M3 is accepted on `main`; reuse
+   official DSH depth/Session/Subagent authority and prove depth 2 and 3 live.
 
 ## Milestone Split
 
@@ -98,6 +105,8 @@ a real clean DSH Profile.
 - M1E: clean Profile smoke. Prove the full architecture path in a fresh DSH
   Profile and record the exact command/result.
 - M2: local reliability baseline after M1 passes.
+- M3: managed absolute UTF-8 context loading with atomic Session-local state.
+- M4: depth-bounded recursive child DSH Sessions with isolated RLM kernels.
 
 ## PTC / Multi-Agent Coordination
 
@@ -125,6 +134,10 @@ a real clean DSH Profile.
   active assignment.
 - A model report is not completion. Completion needs committed code plus local
   checks and the clean Profile smoke required by the milestone.
+- During M3/M4, dogfood the latest completed plugin through the real DSH UI.
+  Aggregate incidental findings, reproduce and classify them, then create a
+  separate GitHub Issue; do not opportunistically fold them into the active
+  milestone unless they block its acceptance.
 
 ## Execution Access Policy
 

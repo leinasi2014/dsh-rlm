@@ -5,24 +5,27 @@
 ## Language boundary
 
 - **TypeScript/Node.js** registers the DSH tool, manages processes by Session,
-  invokes the one-shot Subagent, propagates cancellation, and handles plugin
-  disposal.
+  invokes official depth-bounded Subagents/Sessions, propagates cancellation,
+  and handles plugin disposal.
 - **Python 3.11+** owns globals, executes cells, and implements
-  `await rlm_query()` through a host callback.
+  `await rlm_query()` through a host callback. In M3 it also performs bounded,
+  strict-UTF-8 managed file loading so context bytes never cross a host frame.
 
-V1 is one npm package plus one Python script. It does not split out a Service,
-Provider, or protocol package.
+M3/M4 retain the V1 shape: one npm package plus one Python script. They do not
+split out a Service, Provider, context domain, recursive scheduler, or protocol
+package. A source file may be split only when a real testable responsibility
+crosses the existing project size gate.
 
-## V1 layout
+## M1-M4 layout target
 
 ```text
 dsh-rlm/
 ├─ package.json
 ├─ src/
 │  ├─ index.ts              # config, system prompt, tool registration, dispose
-│  └─ runtime.ts            # Session kernels, protocol, one-shot query bridge
+│  └─ runtime.ts            # Session kernels, protocol, managed context, query bridge
 ├─ python-runtime/
-│  └─ rlm_kernel.py         # globals, top-level await, rlm_query
+│  └─ rlm_kernel.py         # globals, top-level await, managed load, rlm_query
 ├─ tests/
 │  ├─ rlm-loop.test.ts      # Python/query/cross-cell loop
 │  ├─ profile-smoke.test.ts # real DSH Profile composition
@@ -35,7 +38,8 @@ dsh-rlm/
 └─ ref/
 ```
 
-The governance files do not change the V1 runtime boundary. Do not split runtime
-code further until a file reaches the project size limit, a second
-independent consumer appears, or a second real kernel implementation starts.
+The governance files do not change the runtime boundary. Do not split runtime
+code further until a file reaches the project size limit, a distinct testable
+responsibility needs isolation, a second independent consumer appears, or a
+second real kernel implementation starts.
 At that point, follow the triggers in [Future extensions](future-extensions.md).

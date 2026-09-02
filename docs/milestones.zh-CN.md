@@ -46,7 +46,44 @@ M1 通过前，不实现 snapshot、spawn、Storage、公共 Service 或第二 P
 6. query 超过每 cell 次数上限时拒绝新调用；
 7. 插件卸载后没有插件拥有的 Python 进程存活。
 
-## 条件里程碑
+## M3：托管上下文
+
+**结果**：`rlm_eval(code, contextPath?)` 把一个有界的绝对 UTF-8 文件原子加载
+到受保护的 Session 本地 `context`，不经模型可见工具输入复制正文。
+
+**退出条件**：
+
+1. 省略 `contextPath` 与 M1/M2 向后兼容；
+2. 当前 cell 立即看到上下文，后续 cell 可复用；
+3. 其他 Session 不可见，cell 代码不能永久替换受保护的 `context`/
+   `context_meta`；
+4. 非法路径、目标类型、大小、UTF-8 与读取竞态错误类型化且具有原子性，旧
+   内核/上下文保持存活；
+5. 协议版本不匹配显式失败；文件正文不出现在宿主帧、模型可见工具输入或
+   工具结果中；
+6. 单元/集成测试、独立审查、CI、远端 main 回读和干净 DSV4-FVE Profile
+   冒烟全部通过。
+
+见 [M3 架构](m3-managed-context.zh-CN.md)。
+
+## M4：递归子 RLM
+
+**结果**：`rlm_query` 通过官方 DSH Session/Subagent 创建受深度限制的子节点；
+上限以下的子节点拥有自己的 `rlm_eval` 内核，上限处叶子保持 one-shot 禁用。
+
+**退出条件**：
+
+1. `maxDepth=1` 保持 M1/M2 已交付行为；
+2. 深度 2/3 路径经官方 API 完成，并将可见文本返回父 Python cell；
+3. 官方深度上限阻止更深子节点，Provider 缺少能力时在部分递归工作开始前失败；
+4. 父、子、兄弟和后代 Python 命名空间隔离，官方 Session 元数据/日志保留谱系；
+5. 超时、取消、协议失败和插件卸载使整个所属后代分支静止，不影响无关 Session；
+6. 单元/集成测试、独立审查、CI、远端 main 回读和干净 DSV4-FVE 深度 2/3
+   Profile 冒烟全部通过。
+
+见 [M4 架构](m4-recursive-child-rlm.zh-CN.md)。
+
+## M4 之后的条件里程碑
 
 以下里程碑没有预定顺序。只有
 [后续扩展架构](future-extensions.zh-CN.md) 中对应触发条件成立才启动。
@@ -54,8 +91,6 @@ M1 通过前，不实现 snapshot、spawn、Storage、公共 Service 或第二 P
 | 里程碑 | 完成结果 |
 |---|---|
 | F1 Snapshot 恢复 | kernel 被杀后恢复支持的变量，并报告跳过项 |
-| F2 递归子 RLM | 子 Session 拥有自己的内核，可在深度限制内迭代并返回文本 |
-| F3 受管上下文来源 | 稳定文件/附件句柄直接加载大文本，不复制全文进模型参数 |
 | F4 Batched query | 有界并发、顺序稳定、可取消的批量查询 |
 | F5 第二内核实现 | 第二实现与本地实现通过同一端到端闭环 |
 | F6 外部 Consumer | Jobs、UI 或 swarm 复用现有 runtime，不产生第二权威循环 |

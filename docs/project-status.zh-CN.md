@@ -2,8 +2,8 @@
 
 > [English](project-status.md) | 简体中文
 
-本文记录首次公开发布时的实现边界。后续缺陷和验收进度以 GitHub Issues、
-`docs/milestones.md` 与代码测试共同为准。
+本文记录已接受实现边界和下一批有序里程碑。实时进度以 GitHub Issues、
+[里程碑](milestones.zh-CN.md) 与可执行测试共同为准。
 
 ## 目标
 
@@ -22,10 +22,11 @@ Host；Python kernel 只执行代码、维护 Session 内 globals，并通过宿
 
 ## 发布基线
 
-- 审查基线：`e1ce33e0d984a340e949768975e2397d8b62bd0b`
-- 审查日期：2026-09-02
+- 已接受 M1/M2 基线：`260484d7d92e43fcb99c54ab987436d494501845`
+- 状态日期：2026-09-03
 - 固定参考：`ref/rlm` 与 `ref/prime-agent`，只作为设计证据，不作为逐字兼容目标
-- 当前阶段：M1 主闭环已实现并做过真实干净 Profile 验证；M2 可靠性基线未完成
+- 当前阶段：M1/M2 已通过本地、审查、CI、远端 main 回读及真实干净 Profile
+  门禁；M3 架构/契约正在集成
 
 ## 已完成
 
@@ -60,26 +61,27 @@ Host；Python kernel 只执行代码、维护 Session 内 globals，并通过宿
 
 活体测试默认由 `RLM_LIVE_SMOKE=1` 设门，避免普通单元测试意外调用模型。
 
-## 未完成
+## 已接受的 M2 可靠性
 
-M2 仍有以下确认缺口。首次发布后按这 7 组修正任务登记，并以公开 GitHub
-Issues 作为 live authority：
+公开 M2 修复 Issues 均已关闭。已接受基线包含 Session FIFO 串行化、有界协议帧
+和错误、query/child 静止、scaffold/result 隔离、配置与系统提示校验，以及
+Python 安全名称环境白名单。完整基线共有 138 项测试（136 通过，2 项按设计
+由 live 开关设门），并通过 DSV4-FVE 干净 Profile 路径。
 
-1. kernel 生命周期：协议故障孤儿、ready deadline，以及 dispose 终态；
-2. Session 串行队列：同 Session 并发 cell 不应直接返回 `busy`；
-3. 有界协议：stderr、未换行缓冲、query 与 error 等载荷的统一字节上限；
-4. query/child 生命周期：timeout、取消、故障和卸载时取消并等待 child，拒绝
-   completed 但无可见文本，并保持 query 错误 taxonomy；
-5. scaffold 与结果隔离：`repr()`、内部结果槽和 `rlm_query` binding 的 cell
-   级失败隔离；
-6. 配置与 system prompt：公开完整 V1 runtime 配置并注册简短使用提示；
-7. Python 环境隔离：不默认继承可能包含 Provider 凭据的宿主环境变量。
+## 有序待办
 
-因此当前准确状态是：**M1 核心闭环已交付，M1 收口与 M2 可靠性仍开放**。
+1. [M3 托管上下文](m3-managed-context.zh-CN.md)：有界、原子、受保护的绝对
+   文件加载，正文不经模型可见输入复制；
+2. [M4 递归子 RLM](m4-recursive-child-rlm.zh-CN.md)：官方深度限制子 Session、
+   隔离内核和整分支静止。
+
+[开发契约](m3-m4-development-contract.zh-CN.md) 要求文档先行、WIP=1、TDD、
+独立审查、CI、远端 main 回读，并为每个里程碑完成真实 DSH/Profile 验收。
+dogfood 发现先复现、汇总并独立提 Issue，不静默扩张 M3/M4。
 
 ## 有条件的未来工作
 
 以下能力尚未开始，而且不是 M1 缺陷：snapshot/restore、Storage Domain、run
-record、continuable spawn、递归 RLM、批量查询、第二种 kernel、跨 Host
+record、continuable spawn、批量查询、第二种 kernel、跨 Host
 恢复、费用账本、UI、Workflow、Jobs 与 swarm。只有在真实需求和验收证据出现后
 才会进入里程碑。

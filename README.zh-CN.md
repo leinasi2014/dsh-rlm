@@ -10,10 +10,10 @@ Python cell 支持 top-level `await`，并可调用 `await rlm_query(prompt)`。
 宿主通过官方 one-shot DSH Subagent 完成查询，把可见文本返回 Python，然后让
 当前 cell 继续执行。
 
-> 状态：M1 端到端核心闭环已经实现并通过真实干净 Profile 冒烟；公开审查发现的
-> 生命周期和有界协议问题仍在 M2 修复。参见
-> [项目状态](docs/project-status.zh-CN.md)和
-> [审查结论](docs/review-findings.zh-CN.md)。
+> 状态：M1 与 M2 可靠性基线均已实现、审查并通过干净 Profile 验证。下一步
+> 按顺序交付 M3 托管上下文和 M4 递归子 RLM；生产开发前先冻结架构契约。
+> 参见[项目状态](docs/project-status.zh-CN.md)和
+> [里程碑](docs/milestones.zh-CN.md)。
 
 ![dsh-rlm 英文架构图](docs/dsh-rlm-architecture.visual-check.1440x900.light.png)
 
@@ -53,12 +53,16 @@ Loop，也不会接收 DSH Provider 或 Session 对象。
 - 插件 teardown 释放所拥有的 Python kernel；
 - 离线测试和设门的真实干净 Profile 冒烟测试。
 
-## 未实现
+## 下一里程碑与未实现
 
-以下能力在真实需求触发前不属于 V1：
+M3、M4 已排期但尚未实现：
+
+- [M3 托管上下文](docs/m3-managed-context.zh-CN.md)；
+- [M4 递归子 RLM](docs/m4-recursive-child-rlm.zh-CN.md)。
+
+以下仍是条件性未来工作：
 
 - snapshot/restore 或跨 Host 持久化；
-- 递归子 RLM；
 - continuable/background spawn；
 - batched query；
 - 公共 `RlmService` 或 Kernel Provider 框架；
@@ -186,8 +190,21 @@ revision
 - [目录与语言边界](docs/directory-structure.zh-CN.md)
 - [参考项目取舍](docs/reference-analysis.zh-CN.md)
 - [后续扩展](docs/future-extensions.zh-CN.md)
+- [M3 托管上下文](docs/m3-managed-context.zh-CN.md)
+- [M4 递归子 RLM](docs/m4-recursive-child-rlm.zh-CN.md)
+- [M3/M4 开发契约](docs/m3-m4-development-contract.zh-CN.md)
 - [贡献指南](CONTRIBUTING.md)
 - [安全策略](SECURITY.md)
+
+## 参考来源
+
+仓库记录的是固定来源身份，而不是上游源码副本：
+
+- `PrimeIntellect-ai/prime-agent@6179a608f394d0858d463e40d648df0def6dbb7a`；
+- `alexzhang13/rlm@854e688fbba9d8f8989e3da9989812e4b6dfe270`。
+
+参见 [ref/README.md](ref/README.md)。被忽略的 `ref/*/source/` checkout 是本地、
+只读审查证据，不随仓库发布。
 
 ## License
 

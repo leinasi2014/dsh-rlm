@@ -2,42 +2,166 @@
   "schema_version": 1,
   "diagram_type": "architecture",
   "meta": {
-    "title": "dsh-rlm Core Architecture",
+    "title": "dsh-rlm M3/M4 Target Architecture",
     "locale": "en",
     "quality_profile": "showcase",
-    "viewBox": [1080, 620],
+    "viewBox": [1200, 630],
     "views": [
       {
-        "id": "rlm-loop",
-        "label": "RLM loop",
-        "focus": ["agentLoop", "rlmEval", "sessionKernel", "queryBridge", "subagent"],
-        "note": "One rlm_eval cell can call a one-shot Subagent, receive visible text, and continue in Python."
+        "id": "managed-context",
+        "label": "M3 managed context",
+        "focus": ["contextSource", "sessionKernel", "rlmEval"],
+        "note": "An absolute UTF-8 file becomes a protected Session-local context variable without copying its contents through the model-facing tool call."
       },
       {
-        "id": "iteration-loop",
-        "label": "Iterative reuse",
-        "focus": ["agentLoop", "rlmEval", "sessionKernel"],
-        "note": "A later rlm_eval call in the same DSH Session reuses the persistent Python globals."
+        "id": "recursive-child",
+        "label": "M4 recursive child RLM",
+        "focus": ["queryBridge", "recursiveChild", "leafChild", "sessionKernel"],
+        "note": "Depth below the configured cap creates a child DSH Session with its own rlm_eval kernel; the leaf remains a one-shot child."
+      },
+      {
+        "id": "authority-lifecycle",
+        "label": "Authority and lifecycle",
+        "focus": ["agentLoop", "rlmEval", "sessionKernel", "queryBridge", "recursiveChild"],
+        "note": "DSH owns Agent turns and Session logs; dsh-rlm owns only Session kernels, managed context state, and query cleanup."
       }
     ]
   },
   "components": [
-    { "id": "agentLoop", "type": "external", "label": "DSH Agent Loop", "sublabel": "Official turns and Session log", "pos": [35, 270], "size": [165, 70] },
-    { "id": "rlmEval", "type": "frontend", "label": "rlm_eval", "sublabel": "The only model-facing tool", "pos": [300, 270], "size": [155, 70] },
-    { "id": "sessionKernel", "type": "security", "label": "Session Python Kernel", "sublabel": "Persistent globals · trusted local", "pos": [585, 270], "size": [205, 70] },
-    { "id": "queryBridge", "type": "backend", "label": "rlm_query Bridge", "sublabel": "Prompt to visible text", "pos": [585, 70], "size": [205, 68] },
-    { "id": "subagent", "type": "external", "label": "DSH One-shot Subagent", "sublabel": "rlm_eval denied", "pos": [890, 70], "size": [165, 68] },
-    { "id": "contextFile", "type": "external", "label": "Local Context File", "sublabel": "Python reads UTF-8 data", "pos": [585, 445], "size": [205, 68] }
+    {
+      "id": "agentLoop",
+      "type": "external",
+      "label": "DSH Agent Loop",
+      "sublabel": "Turns · answer · Session log",
+      "pos": [35, 300],
+      "size": [175, 72]
+    },
+    {
+      "id": "rlmEval",
+      "type": "frontend",
+      "label": "rlm_eval",
+      "sublabel": "code + contextPath",
+      "pos": [275, 300],
+      "size": [165, 72]
+    },
+    {
+      "id": "sessionKernel",
+      "type": "security",
+      "label": "Session Python Kernel",
+      "sublabel": "globals · protected context",
+      "pos": [535, 300],
+      "size": [205, 72]
+    },
+    {
+      "id": "queryBridge",
+      "type": "backend",
+      "label": "Depth-aware Query Bridge",
+      "sublabel": "signal · absolute depth cap",
+      "pos": [815, 300],
+      "size": [205, 72]
+    },
+    {
+      "id": "recursiveChild",
+      "type": "external",
+      "label": "Recursive Child DSH Session",
+      "sublabel": "own tool · kernel · globals",
+      "pos": [995, 115],
+      "size": [190, 76]
+    },
+    {
+      "id": "leafChild",
+      "type": "external",
+      "label": "Leaf One-shot Subagent",
+      "sublabel": "rlm_eval denied at maxDepth",
+      "pos": [995, 485],
+      "size": [190, 72]
+    },
+    {
+      "id": "contextSource",
+      "type": "external",
+      "label": "Absolute UTF-8 File",
+      "sublabel": "trusted local · bounded bytes",
+      "pos": [265, 510],
+      "size": [180, 70]
+    }
   ],
   "connections": [
-    { "id": "agent-eval", "from": "agentLoop", "to": "rlmEval", "label": "eval / result", "variant": "emphasis" },
-    { "id": "eval-kernel", "from": "rlmEval", "to": "sessionKernel", "label": "cell / result", "variant": "emphasis" },
-    { "id": "kernel-query", "from": "sessionKernel", "to": "queryBridge", "label": "query / text", "variant": "security" },
-    { "id": "query-subagent", "from": "queryBridge", "to": "subagent", "label": "one-shot / text" },
-    { "id": "context-kernel", "from": "contextFile", "to": "sessionKernel", "label": "read file" }
+    {
+      "id": "agentEval",
+      "from": "agentLoop",
+      "to": "rlmEval",
+      "label": "tool call / bounded result",
+      "variant": "emphasis",
+      "labelDy": -30
+    },
+    {
+      "id": "evalKernel",
+      "from": "rlmEval",
+      "to": "sessionKernel",
+      "label": "protocol v2 cell",
+      "variant": "emphasis"
+    },
+    {
+      "id": "sourceLoader",
+      "from": "contextSource",
+      "to": "sessionKernel",
+      "label": "kernel strict UTF-8 read + atomic publish",
+      "variant": "security"
+    },
+    {
+      "id": "kernelQuery",
+      "from": "sessionKernel",
+      "to": "queryBridge",
+      "label": "prompt / visible text",
+      "variant": "security",
+      "labelDy": -30
+    },
+    {
+      "id": "bridgeRecursive",
+      "from": "queryBridge",
+      "to": "recursiveChild",
+      "label": "depth < max · run / final text",
+      "variant": "emphasis",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "bridgeLeaf",
+      "from": "queryBridge",
+      "to": "leafChild",
+      "label": "depth = max · one-shot / text",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    }
   ],
   "cards": [
-    { "dot": "cyan", "title": "One V1 execution path", "items": ["One tool, one Session kernel, one synchronous query bridge", "No public Service, Storage, snapshot, spawn, or recursive child RLM"] },
-    { "dot": "emerald", "title": "Two iteration levels", "items": ["Inside a cell: Python loops, queries, branches, and revision", "Across cells: the Agent calls rlm_eval again and reuses the same globals"] }
+    {
+      "dot": "cyan",
+      "title": "M3 Context Contract",
+      "items": [
+        "Host sends only the path descriptor; the kernel loader reads bytes",
+        "Load succeeds atomically or preserves the previous managed context",
+        "No URL fetch, glob, directory walk, attachment domain, or snapshot"
+      ]
+    },
+    {
+      "dot": "violet",
+      "title": "M4 Recursion Contract",
+      "items": [
+        "Root depth is 0; maxDepth=1 preserves today's one-shot behavior",
+        "Every recursive child owns a separate DSH Session and Python kernel",
+        "The max-depth leaf has no rlm_eval tool and cannot recurse"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Shared Safety",
+      "items": [
+        "Caller cancellation and cell timeout quiesce the whole owned child branch",
+        "Official DSH lineage, tool restriction, model route, and Session log stay authoritative",
+        "M3 integrates before M4 starts; each milestone has its own RED and live Profile proof"
+      ]
+    }
   ]
 }

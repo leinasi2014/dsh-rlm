@@ -11,10 +11,11 @@ Python cells support top-level `await` and can call
 `await rlm_query(prompt)`. The host answers that call through an official
 one-shot DSH Subagent, returns visible text to Python, and lets the cell continue.
 
-> Status: the end-to-end M1 loop is implemented and has passed a real clean
-> Profile smoke test. M2 reliability is still open because the public audit
-> found lifecycle and bounded-protocol defects. See [Project status](docs/project-status.md)
-> and [Review findings](docs/review-findings.md).
+> Status: M1 and the M2 reliability baseline are implemented, reviewed, and
+> clean-Profile verified. M3 Managed Context and M4 Recursive Child RLM are the
+> next ordered milestones; their architecture contracts are frozen before
+> production work. See [Project status](docs/project-status.md) and
+> [Milestones](docs/milestones.md).
 
 ![dsh-rlm architecture](docs/dsh-rlm-architecture.visual-check.1440x900.light.png)
 
@@ -55,12 +56,16 @@ becomes a second Agent Loop and does not receive DSH Provider or Session objects
 - plugin teardown for owned Python kernels;
 - offline tests plus a gated real clean-Profile smoke test.
 
-## Not implemented
+## Next milestones and not implemented
 
-These are intentionally outside V1 unless a real use case triggers them:
+M3 and M4 are now scheduled, but not yet implemented:
+
+- [M3 Managed Context](docs/m3-managed-context.md);
+- [M4 Recursive Child RLM](docs/m4-recursive-child-rlm.md).
+
+The following remain conditional future work:
 
 - snapshot/restore or cross-host persistence;
-- recursive child RLMs;
 - continuable/background spawn;
 - batched queries;
 - a public `RlmService` or Kernel Provider framework;
