@@ -3302,3 +3302,31 @@ test('M2 Issue#6: teardown removes the prompt section with the tool and releases
   assert.equal(m.sections.length, 0)
   assert.ok(released != null && typeof (released as any).then === 'function', 'teardown must return the runtime dispose barrier')
 })
+
+// ---- M3 Issue #24: kernel-owned managed file context ----
+
+test('M3 Issue#24 RED: a contextPath loads once into one session kernel and persists there', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-context-'))
+  const contextPath = path.join(dir, 'context.txt')
+  const contents = 'managed context\n'
+  writeFileSync(contextPath, contents, 'utf8')
+  const runtime = rt({ maxContextBytes: 1024 * 1024 })
+  try {
+    const first = await runtime.eval('m3-managed', {
+      code: 'context',
+      contextPath,
+    } as any)
+    assert.equal(first.result, "'managed context\\n'")
+
+    const later = await runtime.eval('m3-managed', { code: 'context_meta["bytes"]' } as any)
+    assert.equal(later.result, String(Buffer.byteLength(contents, 'utf8')))
+
+    await assert.rejects(
+      runtime.eval('m3-other-session', { code: 'context' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+  } finally {
+    await runtime.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
