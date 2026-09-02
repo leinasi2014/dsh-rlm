@@ -530,7 +530,15 @@ class RlmKernel:
                 raise RlmContextError("contextPath changed before it could be read")
             if before.st_size > max_bytes:
                 raise RlmContextError("contextPath exceeds maxContextBytes")
-            payload = os.read(fd, max_bytes + 1)
+            chunks: list[bytes] = []
+            remaining = max_bytes + 1
+            while remaining > 0:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            payload = b"".join(chunks)
             after = os.fstat(fd)
             after_fingerprint = (
                 after.st_dev,
@@ -541,6 +549,14 @@ class RlmKernel:
             )
             if after_fingerprint != fingerprint:
                 raise RlmContextError("contextPath changed while reading")
+            path_after = os.lstat(canonical_path)
+            if (
+                not stat.S_ISREG(path_after.st_mode)
+                or (path_after.st_dev, path_after.st_ino) != (after.st_dev, after.st_ino)
+            ):
+                raise RlmContextError("contextPath was replaced while reading")
+            if len(payload) != before.st_size:
+                raise RlmContextError("contextPath could not be read completely")
         except RlmContextError:
             raise
         except OSError as exc:

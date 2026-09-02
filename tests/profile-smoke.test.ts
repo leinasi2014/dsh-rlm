@@ -156,7 +156,8 @@ test('M1E: fresh isolated DSH Profile runs the real RLM loop', { timeout: 15 * 6
 
     // 3. Local UTF-8 Chinese fixture, referenced by absolute path.
     const fixture = path.join(home, 'fixture.txt')
-    const fixtureText = '这是中文夹具内容。深度求索强化学习闭环。\nM3_CONTEXT_LOADER_SENTINEL_4b9d8e。\n第二行：模型通过 rlm_eval 读取本文件到上下文。\n'
+    const fixtureSentinel = 'M3_CONTEXT_LOADER_SENTINEL_4b9d8e'
+    const fixtureText = '这是中文夹具内容。深度求索强化学习闭环。\n' + fixtureSentinel + '。\n第二行：模型通过 rlm_eval 读取本文件到上下文。\n'
     fs.writeFileSync(fixture, fixtureText, 'utf8')
 
     const task = [
@@ -216,8 +217,8 @@ test('M1E: fresh isolated DSH Profile runs the real RLM loop', { timeout: 15 * 6
     ))
     assert.ok(managedCall, 'no persisted rlm_eval call carried the exact contextPath')
     assert.ok(
-      !JSON.stringify(managedCall).includes(fixtureText),
-      'managed loader copied fixture bytes into model-visible rlm_eval arguments',
+      rlmArguments.every((args) => !JSON.stringify(args).includes(fixtureSentinel)),
+      'managed loader copied the unique fixture sentinel into model-visible rlm_eval arguments',
     )
 
     // Point 2 & 3: the step-1 result carries the Chinese fixture INTO context and,

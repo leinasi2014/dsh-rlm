@@ -3446,3 +3446,71 @@ test('M3 Issue#24: an in-read source mutation is rejected before atomic publicat
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('M3 Issue#24: a short descriptor read is rejected instead of publishing partial context', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-short-read-'))
+  const contextPath = path.join(dir, 'context.txt')
+  writeFileSync(contextPath, 'complete source', 'utf8')
+  const script = [
+    'import importlib.util, os, sys',
+    'spec = importlib.util.spec_from_file_location("rlm_kernel_under_test", sys.argv[1])',
+    'module = importlib.util.module_from_spec(spec)',
+    'assert spec.loader is not None',
+    'spec.loader.exec_module(module)',
+    'path = sys.argv[2]',
+    'original_read = os.read',
+    'calls = 0',
+    'def short_read(fd, size):',
+    '    global calls',
+    '    calls += 1',
+    '    if calls == 1: return original_read(fd, 1)',
+    '    return b""',
+    'os.read = short_read',
+    'try:',
+    '    module.RlmKernel._read_context(path, 1024)',
+    'except module.RlmContextError:',
+    '    raise SystemExit(0)',
+    'raise SystemExit(1)',
+  ].join('\n')
+  try {
+    const result = spawnSync(pythonCmd, ['-c', script, kernelPath, contextPath], { encoding: 'utf8' })
+    assert.equal(result.status, 0, 'short read must be a typed context failure; stderr: ' + result.stderr)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('M3 Issue#24: a post-read pathname identity change is rejected before publication', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-path-race-'))
+  const contextPath = path.join(dir, 'context.txt')
+  const replacementPath = path.join(dir, 'replacement.txt')
+  writeFileSync(contextPath, 'original', 'utf8')
+  writeFileSync(replacementPath, 'replacement', 'utf8')
+  const script = [
+    'import importlib.util, os, sys',
+    'spec = importlib.util.spec_from_file_location("rlm_kernel_under_test", sys.argv[1])',
+    'module = importlib.util.module_from_spec(spec)',
+    'assert spec.loader is not None',
+    'spec.loader.exec_module(module)',
+    'path, replacement = sys.argv[2], sys.argv[3]',
+    'original_lstat = os.lstat',
+    'calls = 0',
+    'def replaced_lstat(target):',
+    '    global calls',
+    '    calls += 1',
+    '    if calls == 2: return original_lstat(replacement)',
+    '    return original_lstat(target)',
+    'os.lstat = replaced_lstat',
+    'try:',
+    '    module.RlmKernel._read_context(path, 1024)',
+    'except module.RlmContextError:',
+    '    raise SystemExit(0)',
+    'raise SystemExit(1)',
+  ].join('\n')
+  try {
+    const result = spawnSync(pythonCmd, ['-c', script, kernelPath, contextPath, replacementPath], { encoding: 'utf8' })
+    assert.equal(result.status, 0, 'path replacement must be a typed context failure; stderr: ' + result.stderr)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
