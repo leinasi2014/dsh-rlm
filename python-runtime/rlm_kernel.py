@@ -128,7 +128,11 @@ class RlmKernel:
     # ---- framing ----
 
     def _send(self, frame: dict[str, Any]) -> None:
-        self._real_stdout.write(json.dumps(frame, ensure_ascii=False) + "\n")
+        # ASCII-safe wire encoding: every frame is written as pure-ASCII JSON
+        # escapes, so a lone surrogate anywhere in a frame (message, detail,
+        # text, result, stdout, query prompt) can never crash the strict UTF-8
+        # pipe; the host JSON parser restores the original Unicode semantics.
+        self._real_stdout.write(json.dumps(frame, ensure_ascii=True) + "\n")
         self._real_stdout.flush()
 
     def _fatal(self, message: str) -> None:
