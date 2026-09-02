@@ -298,7 +298,7 @@ export function rangeAppendOnlyErrors(range, label, root = ROOT) {
   const firstParentHistory = new Set(git(['rev-list', '--first-parent', head], root)
     .split(/\r?\n/)
     .filter(Boolean))
-  if (!firstParentHistory.has(baseCommit)) {
+  if (baseCommit !== EMPTY_TREE && !firstParentHistory.has(baseCommit)) {
     return [`${label}: base ${baseCommit} must be a first-parent ancestor of ${head}`]
   }
   const commits = git(['rev-list', '--reverse', '--topo-order', range], root)

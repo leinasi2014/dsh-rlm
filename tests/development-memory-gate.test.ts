@@ -169,6 +169,25 @@ test('range gate rejects a base that is only a merge second parent', (t) => {
     .some((error) => error.includes('first-parent ancestor')))
 })
 
+test('range gate accepts a root commit that creates the first regular shard', (t) => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'development-memory-root-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  git(root, 'init', '--initial-branch=main')
+  git(root, 'config', 'user.email', 'memory@example.invalid')
+  git(root, 'config', 'user.name', 'Memory Gate Test')
+  const directory = path.join(root, 'docs', 'development-memory', 'records', '2026')
+  mkdirSync(directory, { recursive: true })
+  writeFileSync(path.join(directory, 'issue-1.jsonl'), 'record-one\n')
+  git(root, 'add', '.')
+  git(root, 'commit', '-m', 'root shard')
+
+  assert.deepEqual(rangeAppendOnlyErrors(
+    '4b825dc642cb6eb9a060e54bf8d69288fbee4904..HEAD',
+    'fixture range',
+    root,
+  ), [])
+})
+
 test('still rejects changing an unterminated final record', () => {
   const diffs = [
     '-old record\n\\ No newline at end of file\n+changed record\n+new record',
