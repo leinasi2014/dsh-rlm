@@ -33,7 +33,13 @@ V1 不包含公共 Service、Storage Domain、run ID、checkpoint、restore、
 | Agent Loop | 拥有外层“执行、观察、再执行或回答”循环 |
 | Subagent | 为 `rlm_query` 执行一次 one-shot 调用 |
 | Session log | 保存官方工具调用、结果和最终模型消息 |
-| System Prompt | 说明持久变量、文件读取和迭代方式 |
+| System Prompt | 一段短 `tool:rlm_eval` section：持久变量、绝对路径、顶层 await 与迭代 |
+
+启用时插件恰好注册一个名为 `tool:rlm_eval`、order `150` 的 system-prompt
+section：说明持久 globals/variables、按绝对路径读取文件、顶层 `await`、
+`await rlm_query(prompt)`，以及后续 `rlm_eval` 复用同一批变量继续迭代。
+禁用或卸载其 fiber 时，该 section 与工具和 runtime 一起移除；这里没有
+registry、public service 或 Provider framework。
 
 插件是一个 Host-only 函数插件。只有一个工具、一个实现和一个 Consumer，
 因此不建立 `RlmService`。运行时是插件内部对象，按当前 `exec.agent` 的
@@ -246,16 +252,19 @@ Subagent：
 
 ## 8. 最小配置
 
-V1 只需要：
+V1 通过一个 `Config` schema（`src/runtime.ts` 中的 `ConfigSchema`，由插件入口
+别名引用）配置，默认值与范围如下：
 
-- one-shot Subagent Provider 名称；
-- Python 命令；
-- cell 总超时；
-- 最大输出字节数；
-- 每 cell 最大 query 次数。
+- `enabled`（默认 `false`）与 `provider`（默认 `spawn`）；
+- `python`（默认 `python`）：非空解释器命令；
+- `timeout`（默认 `30000`）：整数 `1000..3600000` ms（每次 eval）；
+- `maxStdout`（默认 `65536`）：整数 `1024..262144` UTF-8 字节（cell stdout）；
+- `maxResult`（默认 `65536`）：整数 `1024..262144` UTF-8 字节（cell 结果）；
+- `maxQueries`（默认 `16`）：整数 `1..4096`（每 cell 的 `rlm_query` 次数）。
 
-未知 Provider、Python 启动失败或 Provider 无法禁用 RLM 工具时，插件在首次
-使用时明确失败，不静默切换实现。
+校验后的 config 对象直接传给 `createRlmRuntime`；插件不提供环境变量透传，
+也没有 registry 或 Provider/framework 表面。未知 Provider、Python 启动失败
+或 Provider 无法禁用 RLM 工具时，插件在首次使用时明确失败，不静默切换实现。
 
 ## 9. 首个验收场景
 
