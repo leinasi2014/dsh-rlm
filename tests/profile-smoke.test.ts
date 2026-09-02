@@ -185,17 +185,25 @@ test('M1E: fresh isolated DSH Profile runs the real RLM loop', { timeout: 15 * 6
     const logs = await readSessionLogs(home)
     assert.ok(logs.size >= 2, 'expected a main agent session and at least one subagent child session')
 
+    // Structured session selection: main is the depth-0 session with the most
+    // rlm_eval tool calls; every depth>0 session is collected as a child.
+    const children: string[] = []
     let main: string | undefined
-    let child: string | undefined
+    let mainCalls = -1
     for (const [id, text] of logs) {
       const header = JSON.parse(text.split('\n')[0])
-      if (header.delegationDepth === 0 && /rlm_eval/.test(text)) main = text
-      else if (header.delegationDepth > 0) child = text
+      if (header.delegationDepth === 0) {
+        const calls = countToolCalls(text, 'rlm_eval')
+        if (main === undefined || calls > mainCalls) {
+          main = text
+          mainCalls = calls
+        }
+      } else if (header.delegationDepth > 0) {
+        children.push(text)
+      }
     }
-    assert.ok(main, 'no main agent session contains a rlm_eval tool call')
-
-    const calls = [...main.matchAll(/\{"type":"tool\/call"[^\n]*?"name":"rlm_eval"/g)]
-    assert.ok(calls.length >= 2, 'expected at least two rlm_eval tool calls, got ' + calls.length)
+    assert.ok(main, 'no depth-0 main agent session was persisted')
+    assert.ok(mainCalls >= 2, 'expected at least two rlm_eval tool calls in the main session, got ' + mainCalls)
 
     // Point 2 & 3: the step-1 result carries the Chinese fixture INTO context and,
     // after await rlm_query, the subagent's sentence after the ' || ' separator
@@ -211,9 +219,13 @@ test('M1E: fresh isolated DSH Profile runs the real RLM loop', { timeout: 15 * 6
     assert.match(main, /tool\/call/, 'session log missing tool/call record')
     assert.match(main, /tool\/result/, 'session log missing tool/result record')
 
-    // Point 5: the child agent's tool set has no rlm_eval (no recursion).
-    assert.ok(child, 'no subagent child session was persisted')
-    assert.ok(!/rlm_eval/.test(child), 'child agent logged an rlm_eval tool call (recursion leak)')
+    // Point 5: no child agent actually invoked rlm_eval. A mention in
+    // prompt/system-visible text is not a tool call; only a persisted
+    // tool/call record with that exact name counts as recursion.
+    assert.ok(children.length >= 1, 'no subagent child session was persisted')
+    for (const child of children) {
+      assert.equal(countToolCalls(child, 'rlm_eval'), 0, 'child agent logged an rlm_eval tool call (recursion leak)')
+    }
   } finally {
     try {
       assert.ok(ambientSettingsBytes.equals(fs.readFileSync(ambientSettingsPath)), 'ambient settings.yaml was modified by the live smoke')
@@ -247,10 +259,12 @@ const SAFE_MODEL_SCALAR = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
  * Deterministically rewrite the top-level `agent-default-model` block (its
  * `provider` and `model` scalars) in a DSH settings text copy. Line-oriented
  * and YAML-dependency-free: the input EOL style is detected once, unrelated
- * lines are preserved byte-for-byte, and only the two 2-space-indented scalars
- * inside the block are replaced. Throws when the block is missing, duplicated,
- * malformed (missing/duplicate/unknown child lines) or when a new scalar is
- * unsafe (must match [A-Za-z0-9][A-Za-z0-9._-]*).
+ * lines inside the block (comments, blank lines, sibling scalar keys such as
+ * `reasoningEffort`, future sibling keys) are preserved byte-for-byte and in
+ * order, and only the two 2-space-indented provider/model scalar lines are
+ * replaced. Throws when the block is missing or duplicated, when provider or
+ * model is missing or duplicated, or when a new scalar is unsafe (must match
+ * [A-Za-z0-9][A-Za-z0-9._-]*). Unrelated YAML is not validated.
  */
 function replaceAgentDefaultModel(settingsText: string, provider: string, model: string): string {
   if (!SAFE_MODEL_SCALAR.test(provider) || !SAFE_MODEL_SCALAR.test(model)) {
@@ -276,16 +290,15 @@ function replaceAgentDefaultModel(settingsText: string, provider: string, model:
   let modelIndex = -1
   for (let i = start + 1; i < end; i++) {
     const line = lines[i]
-    if (line === '') continue
-    const match = /^ {2}(provider|model):\s*\S+$/.exec(line)
-    if (!match) throw new Error('agent-default-model block is malformed')
-    if (match[1] === 'provider') {
+    if (/^ {2}provider:\s*\S+$/.test(line)) {
       if (providerIndex !== -1) throw new Error('agent-default-model block is malformed')
       providerIndex = i
-    } else {
+    } else if (/^ {2}model:\s*\S+$/.test(line)) {
       if (modelIndex !== -1) throw new Error('agent-default-model block is malformed')
       modelIndex = i
     }
+    // Every other line (reasoningEffort, comments, blank lines, sibling
+    // keys) is preserved byte-for-byte; only provider/model are rewritten.
   }
   if (providerIndex === -1 || modelIndex === -1) throw new Error('agent-default-model block is malformed')
   lines[providerIndex] = '  provider: ' + provider
@@ -293,17 +306,59 @@ function replaceAgentDefaultModel(settingsText: string, provider: string, model:
   return lines.join(eol)
 }
 
+/**
+ * Count persisted JSONL SessionEvents of exactly one tool call using the
+ * authoritative DSH contract: `row.type === 'tool/call'` AND `row.data` is a
+ * non-null object AND `row.data.name === toolName`. Lines are parsed
+ * defensively; torn, non-JSON and empty lines are ignored (they are not
+ * evidence of a call). A model-visible text mention is zero, and a wrong
+ * top-level `row.name` without `data.name` is zero.
+ */
+function countToolCalls(logText: string, toolName: string): number {
+  let count = 0
+  for (const raw of logText.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (line === '') continue
+    let row: unknown
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (
+      row !== null
+      && typeof row === 'object'
+      && !Array.isArray(row)
+      && (row as { type?: unknown }).type === 'tool/call'
+      && (row as { data?: unknown }).data !== null
+      && typeof (row as { data?: unknown }).data === 'object'
+      && (row as { data: { name?: unknown } }).data.name === toolName
+    ) {
+      count += 1
+    }
+  }
+  return count
+}
+
 test('M2 Issue#18: isolated smoke deterministically pins agent-default-model to DSV4-FVE', () => {
   const unrelated = 'agent-presets:\n  defaultPreset: dsh\nproviders:\n  deepseek:\n    models:\n      - DeepSeek-V4-Flash-Vision-Exp\n'
-  const lfInput = unrelated + 'agent-default-model:\n  provider: qwen38-207\n  model: qwen38-flash-next\n'
+  const lfInput = unrelated + 'agent-default-model:\n  provider: qwen38-207\n  model: qwen38-flash-next\n  reasoningEffort: max\n'
   const lfOut = replaceAgentDefaultModel(lfInput, 'vllm', 'DeepSeek-V4-Flash-Vision-Exp')
   assert.match(lfOut, /agent-default-model:\n {2}provider: vllm\n {2}model: DeepSeek-V4-Flash-Vision-Exp/)
+  assert.ok(
+    lfOut.includes('agent-default-model:\n  provider: vllm\n  model: DeepSeek-V4-Flash-Vision-Exp\n  reasoningEffort: max'),
+    'reasoningEffort child must remain exactly unchanged',
+  )
   assert.ok(lfOut.startsWith(unrelated), 'unrelated settings must be preserved')
   assert.ok(!lfOut.includes('\r\n'), 'LF style must be preserved when the input uses LF')
 
   const crlfInput = lfInput.replace(/\n/g, '\r\n')
   const crlfOut = replaceAgentDefaultModel(crlfInput, 'vllm', 'DeepSeek-V4-Flash-Vision-Exp')
   assert.match(crlfOut, /agent-default-model:\r\n {2}provider: vllm\r\n {2}model: DeepSeek-V4-Flash-Vision-Exp/)
+  assert.ok(
+    crlfOut.includes('agent-default-model:\r\n  provider: vllm\r\n  model: DeepSeek-V4-Flash-Vision-Exp\r\n  reasoningEffort: max'),
+    'CRLF reasoningEffort child must remain exactly unchanged',
+  )
   assert.ok(!/[^\r]\n/.test(crlfOut), 'CRLF style must be preserved when the input uses CRLF')
 
   assert.throws(() => replaceAgentDefaultModel('a: 1\n', 'vllm', 'DeepSeek-V4-Flash-Vision-Exp'), /agent-default-model/)
@@ -329,4 +384,16 @@ test('M2 Issue#18: isolated smoke deterministically pins agent-default-model to 
     if (prevRepoRoot === undefined) delete process.env.RLM_DSH_REPO_ROOT
     else process.env.RLM_DSH_REPO_ROOT = prevRepoRoot
   }
+
+  // Structured tool-call oracle (official DSH SessionEvent shape): a parsed
+  // event counts only when row.type === 'tool/call' AND row.data is a non-null
+  // object AND row.data.name === toolName. A plain-text mention is zero, and a
+  // wrong top-level row.name without data.name is zero.
+  const mentionJsonl = '{"type":"text","text":"persistent rlm_eval instructions"}\n'
+  const officialCall = '{"type":"tool/call","data":{"turn":1,"step":1,"callId":"c1","name":"rlm_eval","arguments":"{}"}}\n'
+  const wrongTopLevel = '{"type":"tool/call","name":"rlm_eval","arguments":"{}"}\n'
+  assert.equal(countToolCalls(mentionJsonl, 'rlm_eval'), 0, 'text mention must not count as a tool call')
+  assert.equal(countToolCalls(officialCall, 'rlm_eval'), 1, 'official nested data.name record must count as one')
+  assert.equal(countToolCalls(wrongTopLevel, 'rlm_eval'), 0, 'top-level name without data.name must not count')
+  assert.equal(countToolCalls(officialCall + '{"type":"tool/call","data":{\n', 'rlm_eval'), 1, 'torn non-JSON line must be ignored')
 })
