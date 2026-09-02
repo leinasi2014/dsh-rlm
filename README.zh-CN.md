@@ -133,7 +133,23 @@ pnpm dsh plugin --profile <profile> add -w /absolute/path/to/dsh-rlm
       config:
         enabled: true
         provider: spawn
+        python: python
+        timeout: 30000
+        maxStdout: 65536
+        maxResult: 65536
+        maxQueries: 16
 ```
+
+以上即 schema 默认值；`provider` 默认为 `spawn`。五个运行时设置均为可选，
+由唯一 `Config` schema 校验：
+
+| 设置 | 默认 | 合法范围/单位 |
+|---|---|---|
+| `python` | `python` | 非空解释器命令；经白名单 `PATH` 或绝对路径解析 |
+| `timeout` | `30000` | 整数 `1000..3600000` ms（每次 eval） |
+| `maxStdout` | `65536` | 整数 `1024..262144` UTF-8 字节（cell stdout） |
+| `maxResult` | `65536` | 整数 `1024..262144` UTF-8 字节（cell 结果） |
+| `maxQueries` | `16` | 整数 `1..4096`（每 cell 的 `rlm_query` 次数） |
 
 本仓库尚未发布 npm registry 包；这里是真实本地包安装。
 

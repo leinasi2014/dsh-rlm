@@ -1,21 +1,14 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { registerRlmPlugin } from './runtime.js'
+import type {} from '@deepseek-ai/dsh-system-prompt'
+import { ConfigSchema, registerRlmPlugin, type RlmPluginConfig } from './runtime.js'
 
 export const name = 'rlm'
-export const inject = ['tools', 'subagents']
+export const inject = ['tools', 'subagents', 'systemPrompt']
 
-export interface Config {
-  /** When false, the plugin registers no tool and starts no runtime. */
-  enabled?: boolean
-  /** The `ctx.subagents` provider used for each one-shot rlm_query child. */
-  provider?: string
-}
+export type Config = RlmPluginConfig
 
-export const Config: z<Config> = z.object({
-  enabled: z.boolean().default(false).description('Enable dsh-rlm after the local kernel/query loop is implemented.'),
-  provider: z.string().default('spawn').description('The ctx.subagents provider used to answer each rlm_query call.'),
-})
+export const Config: z<Config> = ConfigSchema
 
 /**
  * M1C/M1D entrypoint: delegate to the testable registration helper in

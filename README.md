@@ -143,7 +143,23 @@ Enable it in the Profile's Cordis composition:
       config:
         enabled: true
         provider: spawn
+        python: python
+        timeout: 30000
+        maxStdout: 65536
+        maxResult: 65536
+        maxQueries: 16
 ```
+
+The values above are the schema defaults. `provider` defaults to `spawn`. The
+five runtime settings are optional and validated by the single `Config` schema:
+
+| Setting | Default | Legal range / unit |
+|---|---|---|
+| `python` | `python` | non-empty interpreter command; resolved through the allowlisted `PATH` or an absolute path |
+| `timeout` | `30000` | integer `1000..3600000` ms per eval |
+| `maxStdout` | `65536` | integer `1024..262144` UTF-8 bytes of cell stdout |
+| `maxResult` | `65536` | integer `1024..262144` UTF-8 bytes of the cell result |
+| `maxQueries` | `16` | integer `1..4096` `rlm_query` calls per cell |
 
 This repository has not published an npm package. The command above is a real
 local-package Profile installation, not a registry installation.

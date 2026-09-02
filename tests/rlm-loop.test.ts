@@ -858,11 +858,13 @@ interface MockCtx {
   run: any
   teardown: (() => void) | undefined
   label: string | undefined
+  sections: any[]
 }
 
 function makeMockCtx(options: { queryText?: string } = {}): MockCtx {
   const registered: any[] = []
   const starts: { provider: string; request: any }[] = []
+  const sections: any[] = []
   const run: any = {
     disposed: false,
     result: Promise.resolve({ output: [{ type: 'text', text: options.queryText ?? '4' }], stopReason: 'completed' }),
@@ -870,7 +872,7 @@ function makeMockCtx(options: { queryText?: string } = {}): MockCtx {
   }
   // Build the mutable mock first; ctx.effect writes straight onto it (not a
   // closure local, which the returned object would capture as stale undefined).
-  const m: MockCtx = { ctx: undefined as any, registered, starts, run, teardown: undefined, label: undefined }
+  const m: MockCtx = { ctx: undefined as any, registered, starts, run, teardown: undefined, label: undefined, sections }
   m.ctx = {
     tools: {
       register(def: any) {
@@ -882,6 +884,14 @@ function makeMockCtx(options: { queryText?: string } = {}): MockCtx {
       async start(provider: string, request: any) {
         starts.push({ provider, request })
         return run
+      },
+    },
+    // Issue #6: real Context augmentation from @deepseek-ai/dsh-system-prompt
+    // (section registers a PromptSection and returns the effect disposer).
+    systemPrompt: {
+      section(def: any) {
+        sections.push(def)
+        return () => { const i = sections.indexOf(def); if (i >= 0) sections.splice(i, 1) }
       },
     },
     effect(execute: () => () => void, effectLabel: string) {
@@ -2222,6 +2232,13 @@ function makeLifecycleMockCtx(options: {
         }
       },
     },
+    // Real-shape systemPrompt service stub: Issue #6 registers one section on
+    // every enabled plugin; these lifecycle tests do not assert section content.
+    systemPrompt: {
+      section(_def: any) {
+        return () => {}
+      },
+    },
     effect(execute: () => () => void, effectLabel: string) {
       m.teardown = execute()
     },
@@ -3184,4 +3201,88 @@ test('M2 Issue#7: explicit custom python command obeys the same filtered env', a
       runtime.dispose()
     }
   })
+})
+
+// ---- M2 Issue #6: runtime config schema, propagation, and system prompt lifecycle ----
+
+test('M2 Issue#6: Config schema defaults and range-validates the five runtime settings', async () => {
+  const rt = (await import('../src/runtime.ts')) as { ConfigSchema?: any }
+  assert.equal(typeof rt.ConfigSchema, 'function', 'Issue #6 ConfigSchema must be exported from runtime.ts')
+  const S: any = rt.ConfigSchema
+  const parsed = S({ enabled: true, provider: 'spawn' })
+  assert.equal(parsed.enabled, true)
+  assert.equal(parsed.provider, 'spawn')
+  assert.equal(parsed.python, 'python')
+  assert.equal(parsed.timeout, 30000)
+  assert.equal(parsed.maxStdout, 65536)
+  assert.equal(parsed.maxResult, 65536)
+  assert.equal(parsed.maxQueries, 16)
+  assert.throws(() => S({ python: '' }))
+  assert.throws(() => S({ timeout: 999 }))
+  assert.throws(() => S({ timeout: 3600001 }))
+  assert.equal(S({ timeout: 3600000 }).timeout, 3600000)
+  assert.throws(() => S({ maxStdout: 1023 }))
+  assert.throws(() => S({ maxStdout: 262145 }))
+  assert.equal(S({ maxStdout: 262144 }).maxStdout, 262144)
+  assert.throws(() => S({ maxResult: 1023 }))
+  assert.throws(() => S({ maxQueries: 0 }))
+  assert.throws(() => S({ maxQueries: 4097 }))
+  assert.equal(S({ maxQueries: 4096 }).maxQueries, 4096)
+})
+
+test('M2 Issue#6: parsed runtime settings propagate end to end (maxQueries limit observable)', async () => {
+  const rt = (await import('../src/runtime.ts')) as { ConfigSchema?: any }
+  assert.equal(typeof rt.ConfigSchema, 'function', 'Issue #6 ConfigSchema must be exported from runtime.ts')
+  const config = rt.ConfigSchema({ enabled: true, maxQueries: 1, timeout: 20000, maxStdout: 4096, maxResult: 4096 })
+  const m = makeMockCtx()
+  registerRlmPlugin(m.ctx, config)
+  try {
+    assert.equal(m.registered.length, 1)
+    const tool = m.registered[0]
+    const ctl = new AbortController()
+    await assert.rejects(
+      tool.execute(
+        { code: 'a = await rlm_query("one")\nb = await rlm_query("two")' },
+        { agent: { id: 'issue6-prop' }, signal: ctl.signal },
+      ),
+      (err: unknown) => err instanceof Error && /query limit/.test(err.message),
+    )
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M2 Issue#6: enabled registers the tool:rlm_eval system prompt section; disabled registers neither', () => {
+  const enabled = makeMockCtx()
+  registerRlmPlugin(enabled.ctx, { enabled: true })
+  try {
+    assert.equal(enabled.sections.length, 1, 'enabled must register exactly one system prompt section')
+    const section = enabled.sections[0]
+    assert.equal(section.name, 'tool:rlm_eval')
+    assert.equal(section.order, 150)
+    assert.equal(typeof section.text, 'string')
+    assert.match(section.text, /persistent globals|persistent variables/i)
+    assert.match(section.text, /absolute (file )?paths?/i)
+    assert.match(section.text, /top[- ]level await/i)
+    assert.match(section.text, /rlm_query/i)
+    assert.match(section.text, /(subsequent|later|next) rlm_eval/i)
+    assert.match(section.text, /iterat|reuse/i)
+  } finally {
+    enabled.teardown?.()
+  }
+  const disabled = makeMockCtx()
+  registerRlmPlugin(disabled.ctx, { enabled: false })
+  assert.equal(disabled.registered.length, 0)
+  assert.equal(disabled.sections.length, 0)
+})
+
+test('M2 Issue#6: teardown removes the prompt section with the tool and releases the runtime', () => {
+  const m = makeMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true })
+  assert.equal(m.sections.length, 1, 'enabled must register the prompt section before teardown')
+  assert.equal(typeof m.teardown, 'function')
+  const released = m.teardown!()
+  assert.equal(m.registered.length, 0)
+  assert.equal(m.sections.length, 0)
+  assert.ok(released != null && typeof (released as any).then === 'function', 'teardown must return the runtime dispose barrier')
 })

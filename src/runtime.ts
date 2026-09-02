@@ -1,4 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -197,6 +198,27 @@ export interface RlmRuntimeConfig {
   /** Max number of rlm_query calls a single cell may make. */
   maxQueries?: number
 }
+
+/** Plugin-facing configuration: runtime settings plus the subagent provider. */
+export interface RlmPluginConfig extends RlmRuntimeConfig {
+  /** The `ctx.subagents` provider used for each one-shot rlm_query child. */
+  provider?: string
+}
+
+/**
+ * Single authoritative Config schema for the plugin. `src/index.ts` re-exports
+ * this exact schema as its public `Config`; it is also the in-source test seam
+ * that `tests/rlm-loop.test.ts` reads dynamically.
+ */
+export const ConfigSchema: z<RlmPluginConfig> = z.object({
+  enabled: z.boolean().default(false).description('Enable dsh-rlm after the local kernel/query loop is implemented.'),
+  provider: z.string().default('spawn').description('The ctx.subagents provider used to answer each rlm_query call.'),
+  python: z.string().min(1).default('python').description('Python interpreter command; defaults to the python on PATH.'),
+  timeout: z.natural().min(1000).max(3600000).default(30000).description('Per-eval total timeout in milliseconds.'),
+  maxStdout: z.natural().min(1024).max(262144).default(65536).description('Byte cap for a cell captured stdout.'),
+  maxResult: z.natural().min(1024).max(262144).default(65536).description('Byte cap for a cell last-expression result.'),
+  maxQueries: z.natural().min(1).max(4096).default(16).description('Max rlm_query calls per cell.'),
+})
 
 export interface RlmEvalInput {
   /** Python source; top-level await is supported. */
@@ -1345,11 +1367,21 @@ function renderValue(value: RlmEvalValue): string {
  */
 export function registerRlmPlugin(
   ctx: Context,
-  config: RlmRuntimeConfig & { provider?: string },
+  config: RlmPluginConfig,
 ): void {
   if (config.enabled !== true) return
   const provider = config.provider ?? 'spawn'
   const runtime = createRlmRuntime(ctx, config)
+
+  const disposeSection = ctx.systemPrompt.section({
+    name: 'tool:' + TOOL_NAME,
+    order: 150,
+    text:
+      'Persistent globals and variables are kept across rlm_eval cells in one per-session Python kernel. '
+      + 'Cells may read files by absolute paths. Top-level await is supported, and '
+      + 'await rlm_query(prompt) delegates the prompt to a one-shot subagent and returns its text. '
+      + 'A later rlm_eval call reuses the same variables and can iterate on earlier results.',
+  })
 
   const disposeTool = ctx.tools.register(defineTool({
     name: TOOL_NAME,
@@ -1415,6 +1447,7 @@ export function registerRlmPlugin(
   // unloads, so no plugin-owned Python process survives the plugin.
   ctx.effect(() => () => {
     disposeTool()
+    disposeSection()
     return runtime.dispose()
   }, 'rlm runtime teardown')
 }

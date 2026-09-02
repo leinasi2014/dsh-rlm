@@ -35,7 +35,14 @@ UI, Workflow, or Team.
 | Agent Loop | Own the outer execute, observe, iterate, or answer loop |
 | Subagent | Execute each `rlm_query` as a one-shot child call |
 | Session log | Persist official tool calls, results, and model messages |
-| System Prompt | Explain persistent variables, file reads, and iteration |
+| System Prompt | One short `tool:rlm_eval` section: persistent variables, absolute paths, top-level await, and iteration |
+
+When enabled, the plugin registers exactly one system-prompt section named
+`tool:rlm_eval` at order `150`; it explains persistent globals/variables,
+reading files by absolute paths, top-level `await`, `await rlm_query(prompt)`,
+and later `rlm_eval` calls reusing the same variables. Disabling the plugin or
+unloading its fiber removes that section together with the tool and the
+runtime, so there is no registry, public service, or provider framework.
 
 The plugin is a host-only function plugin. With one tool, one implementation,
 and one consumer, V1 does not create an `RlmService`. The private runtime selects
@@ -277,16 +284,21 @@ the cell that issued it:
 
 ## 8. Minimal configuration
 
-V1 needs:
+V1 is configured through one `Config` schema (`ConfigSchema` in
+`src/runtime.ts`, aliased by the plugin entry) with these defaults and ranges:
 
-- one-shot Subagent Provider name;
-- Python command;
-- total cell timeout;
-- maximum output bytes;
-- maximum queries per cell.
+- `enabled` (default `false`) and `provider` (default `spawn`);
+- `python` (default `python`): a non-empty interpreter command;
+- `timeout` (default `30000`): integer `1000..3600000` ms per eval;
+- `maxStdout` (default `65536`): integer `1024..262144` UTF-8 bytes of cell stdout;
+- `maxResult` (default `65536`): integer `1024..262144` UTF-8 bytes of the cell result;
+- `maxQueries` (default `16`): integer `1..4096` `rlm_query` calls per cell.
 
-An unknown Provider, Python startup failure, or Provider that cannot deny the
-RLM tool must fail explicitly rather than silently switching implementation.
+The validated config object is passed directly to `createRlmRuntime`; the
+plugin adds no environment passthrough and no registry or Provider/framework
+surface. An unknown Provider, Python startup failure, or Provider that cannot
+deny the RLM tool must fail explicitly rather than silently switching
+implementation.
 
 ## 9. First acceptance scenario
 
