@@ -113,8 +113,15 @@ RLM_LIVE_SMOKE=1 DSH_HOME=/path/to/configured/dsh-home \
   node --test tests/profile-smoke.test.ts
 ```
 
-测试会把完整 `settings.yaml`，以及存在时的完整 `.credentials.yaml` 复制进临时
-DSH home。临时配置和 Session logs 绝不能提交或上传。
+不要把 live smoke 指向未验证或用户自有的目标。它会创建并删除一个隔离的临时
+DSH home。完整 `settings.yaml` 以及存在时的完整 `.credentials.yaml` 会从给定
+`DSH_HOME` 逐字节复制；**仅在可弃置副本中**，顶层 `agent-default-model` 块会被
+确定性改写为 provider `vllm`、model `DeepSeek-V4-Flash-Vision-Exp`，使隔离
+运行使用显式 vLLM/PTC 路由而非 ambient 默认模型。必要时可用 `RLM_LIVE_PROVIDER`
+和 `RLM_LIVE_MODEL` 覆盖。对外部 worktree，可用 `RLM_DSH_REPO_ROOT` 把测试指向
+权威 harness checkout（解析为绝对路径）；未设置时沿用包内三上级默认，若该根缺少
+`apps/cli/src/bin.ts`，测试会以有界、非机密的信息快速失败。ambient settings 与
+凭据从不被改写，运行后会断言其逐字节未变。临时配置和 Session logs 绝不能提交或上传。
 
 ## 安装到 DSH Profile
 
