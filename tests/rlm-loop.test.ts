@@ -1155,11 +1155,27 @@ test('M2: cancelling and disposing leaves no orphaned kernel process', async () 
 async function waitForPidFile(pidFile: string, timeoutMs = 5000): Promise<number> {
   const start = Date.now()
   while (Date.now() - start < timeoutMs) {
-    if (existsSync(pidFile)) return Number(readFileSync(pidFile, 'utf8'))
+    if (existsSync(pidFile)) {
+      const pid = Number(readFileSync(pidFile, 'utf8').trim())
+      if (Number.isSafeInteger(pid) && pid > 0) return pid
+    }
     await new Promise((r) => setTimeout(r, 25))
   }
-  throw new Error('silent kernel pid marker was not written in time')
+  throw new Error('silent kernel pid marker did not publish a valid PID in time')
 }
+
+test('Issue#26 RED: pid marker wait ignores an empty file until a positive PID is published', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-pid-marker-'))
+  const pidFile = path.join(dir, 'pid.txt')
+  writeFileSync(pidFile, '')
+  const timer = setTimeout(() => writeFileSync(pidFile, '4242'), 50)
+  try {
+    assert.equal(await waitForPidFile(pidFile, 1000), 4242)
+  } finally {
+    clearTimeout(timer)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
 
 /**
  * Run the very next Python process with a `sitecustomize` that writes its own
