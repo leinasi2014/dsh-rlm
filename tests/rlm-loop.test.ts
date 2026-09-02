@@ -916,3 +916,104 @@ test('M2: dispose is terminal and a later eval is rejected without spawning', as
   assert.ok(Date.now() - start < 500, 'post-dispose eval must reject immediately')
   runtime.dispose()
 })
+
+// ---- M2 Issue #1 successor: Windows kill fallback, shared deadline, ready guards ----
+
+test('M2 Issue#1 successor: a taskkill startup failure falls back and never crashes the host', {
+  skip: process.platform !== 'win32',
+}, async () => {
+  const runtime = rt({ timeout: 5000 })
+  const savedPath = process.env.PATH
+  const savedSystemRoot = process.env.SystemRoot
+  try {
+    // Live kernel so a terminal transition has a real OS pid to kill.
+    const idOut = await runtime.eval('tkfail', { code: 'import os\nos.getpid()' })
+    const pid = Number(idOut.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + idOut.result)
+
+    const ctl = new AbortController()
+    const pending = runtime.eval('tkfail', { code: runningCell(), signal: ctl.signal })
+    await new Promise((r) => setTimeout(r, SHORT_DELAY))
+    const rejection = assert.rejects(
+      pending,
+      (err: unknown) => err instanceof RlmError && err.kind === 'cancel',
+    )
+
+    // Make both the bare-name taskkill (the b1f13ae bug) and the canonical
+    // SystemRoot\System32\taskkill.exe resolution fail, then restore before any
+    // further probe so no other tooling sees a stripped environment.
+    const bogus = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-no-taskkill-'))
+    process.env.PATH = bogus
+    process.env.SystemRoot = bogus
+    try {
+      ctl.abort('tkfail-cancel')
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH
+      else process.env.PATH = savedPath
+      if (savedSystemRoot === undefined) delete process.env.SystemRoot
+      else process.env.SystemRoot = savedSystemRoot
+      rmSync(bogus, { recursive: true, force: true })
+    }
+
+    await rejection
+    const gone = await waitForPidGone(pid)
+    assert.ok(gone, 'kernel pid ' + pid + ' survived a taskkill startup failure without a fallback')
+
+    // The host survived the failed taskkill spawn (any unhandled ChildProcess
+    // 'error' would have exited the test process) and can still start kernels.
+    const out = await runtime.eval('tkfail-other', { code: '2 + 2' })
+    assert.equal(out.result, '4')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#1 successor: startup and cell share one total deadline', async () => {
+  const runtime = rt({ timeout: 1200 })
+  try {
+    await withPressedKernel(
+      `import time
+time.sleep(0.5)
+import sys, json
+sys.stdout.write(json.dumps({"type": "ready", "version": 1}) + "\\n")
+sys.stdout.flush()`,
+      async (pidFile) => {
+        const start = Date.now()
+        const pending = runtime.eval('shared-budget', { code: 'import time\ntime.sleep(60)' })
+        const rejection = assert.rejects(
+          pending,
+          (err: unknown) => err instanceof RlmError && err.kind === 'timeout',
+        )
+        const pid = await waitForPidFile(pidFile)
+        await rejection
+        const elapsed = Date.now() - start
+        // b1f13ae charges the full timeout to startup AND the cell (~0.5s+1.2s);
+        // the successor charges one budget (~1.2s) from eval entry.
+        assert.ok(elapsed < 1600, `eval exceeded a single 1200ms budget (${elapsed}ms)`)
+        const gone = await waitForPidGone(pid)
+        assert.ok(gone, 'shared-budget kernel pid ' + pid + ' is still alive after the deadline')
+      },
+    )
+    const out = await runtime.eval('shared-budget-other', { code: '2 + 2' })
+    assert.equal(out.result, '4')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M2 Issue#1 successor: a late abort after a settled eval cannot evict the idle kernel', async () => {
+  const runtime = rt()
+  try {
+    await runtime.eval('late-abort', { code: 'marker = 1' })
+    const ctl = new AbortController()
+    const out = await runtime.eval('late-abort', { code: 'marker + 1', signal: ctl.signal })
+    assert.equal(out.result, '2')
+    // The ready waiters' abort listener is removed synchronously when ready
+    // settles; a late abort must be a no-op on the idle kernel and its globals.
+    ctl.abort('too-late')
+    const again = await runtime.eval('late-abort', { code: 'marker + 2' })
+    assert.equal(again.result, '3')
+  } finally {
+    runtime.dispose()
+  }
+})
