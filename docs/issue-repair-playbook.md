@@ -74,12 +74,17 @@ Before mutation, bind:
 issue: "#<number>"
 base: "<full origin/main SHA>"
 branch: "codex/issue-<number>-<slug>"
+workspace: "<absolute owned worktree or controlled environment>"
+session: "<DSH workspace/team/Session identity>"
 model: "DeepSeek-V4-Flash-Vision-Exp"
 runtime: "vLLM/PTC"
 reasoning: "medium | high | max"
+access: "Read Only | Full Access"
+access_basis: "<why the complete assignment is no-mutation or needs full execution>"
 writer: "<single writer identity>"
 reviewer: "<non-author identity>"
 owned_paths: []
+mutable_scope: [] # Git/config/Profile/process/port/external resources authorized by the task
 forbidden_scope: []
 acceptance_tests: []
 memory_stream: "docs/development-memory/records/<year>/issue-<number>.jsonl"
@@ -87,8 +92,9 @@ first_material_event: "<failing reproduction or exact blocker>"
 ```
 
 The work is ready only when the Issue outcome and non-goals are testable, the
-base and worktree state are known, dependencies are explicit, writer/reviewer and
-integration capacity exist, and no other writer owns the same mutable surface.
+base and worktree state are known, access and mutable scope match the complete
+assignment, dependencies are explicit, writer/reviewer and integration capacity
+exist, and no other writer owns the same mutable surface.
 
 ## 5. DSH/PTC control-surface rules
 
@@ -97,8 +103,20 @@ When dispatching through the local DSH control surface:
 - use the in-app browser at `http://127.0.0.1:49321/` through real UI actions;
 - never use the page's API as an implementation shortcut;
 - keep one tab only, close it when finished, and reopen only when needed;
+- use `Read Only` only for an assignment confirmed to make no file, Git,
+  configuration, Profile, process, port, build/test-artifact, or external-state
+  change;
+- start implementation, repair, test/build, integration, live verification,
+  and task-owned cleanup assignments in `Full Access`; do not rely on repeated
+  approval escalation after work has started;
+- treat `Full Access` as execution capability, not expanded authorization:
+  assigned paths, non-goals, destructive-action safeguards, credential
+  boundaries, and push/merge/release limits remain unchanged;
+- if a read-only task discovers a required mutation, stop and redispatch it
+  with explicit write scope and `Full Access`; a reviewer that becomes a fixer
+  loses independence for that candidate;
 - before the first prompt, read back candidate/base, workspace, team/Session,
-  model, vLLM/PTC route, and reasoning effort;
+  model, vLLM/PTC route, reasoning effort, access mode, and write scope;
 - keep model-facing development and acceptance state isolated per candidate;
 - do not treat an agent report as code, review, integration, or acceptance proof.
 

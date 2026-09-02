@@ -83,6 +83,25 @@ a real clean DSH Profile.
 - A model report is not completion. Completion needs committed code plus local
   checks and the clean Profile smoke required by the milestone.
 
+## Execution Access Policy
+
+- Classify access before every DSH dispatch. Use `Read Only` only after
+  confirming that the entire assignment will not modify files, Git state,
+  configuration, Profiles, processes, ports, build/test artifacts, or external
+  state.
+- Start every other assignment in `Full Access`, including implementation,
+  repair, test/build execution, integration, clean-Profile verification, and
+  task-owned artifact cleanup. Do not start write-capable work in a restricted
+  mode and depend on repeated mid-task approvals.
+- `Full Access` grants execution capability, not broader authority. Owned paths,
+  forbidden scope, destructive-action safeguards, credential rules, the ban on
+  DSH API shortcuts, and push/merge/release limits still apply.
+- If a read-only assignment later needs mutation, stop it and issue a new
+  explicitly scoped `Full Access` assignment. A reviewer that becomes a fixer
+  is no longer the independent reviewer for that candidate.
+- Record and read back the selected access mode with the workspace, base,
+  model, runtime, reasoning level, and write scope before the first prompt.
+
 ## Development Memory Gate
 
 - Follow [Development Memory](docs/development-memory/README.md). Its English

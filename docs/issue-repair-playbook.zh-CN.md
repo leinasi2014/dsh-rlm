@@ -56,34 +56,48 @@ OPEN -> REPRODUCED -> IMPLEMENTING -> CANDIDATE
 
 ## 4. 开工门禁
 
-写代码前绑定：
+任何变更开始前绑定：
 
 ```yaml
 issue: "#编号"
 base: "origin/main 完整 SHA"
 branch: "codex/issue-编号-简名"
+workspace: "绝对路径的自有 worktree 或受控环境"
+session: "DSH workspace/team/Session 身份"
 model: "DeepSeek-V4-Flash-Vision-Exp"
 runtime: "vLLM/PTC"
 reasoning: "medium | high | max"
+access: "Read Only | Full Access"
+access_basis: "整个任务为何无变更，或为何需要完整执行能力"
 writer: "唯一写入者"
 reviewer: "非作者"
 owned_paths: []
+mutable_scope: [] # 任务授权的 Git/配置/Profile/进程/端口/外部资源
 forbidden_scope: []
 acceptance_tests: []
 memory_stream: "docs/development-memory/records/<年份>/issue-<编号>.jsonl"
 first_material_event: "失败复现或精确 blocker"
 ```
 
-Issue 结果和非目标必须可测试；base、工作树、依赖、writer/reviewer、集成容量必须
-已知；同一可变语义面不能存在第二个 writer。
+Issue 结果和非目标必须可测试；base、工作树、访问模式与可变范围必须覆盖整个
+任务，依赖、writer/reviewer、集成容量必须已知；同一可变语义面不能存在第二个
+writer。
 
 ## 5. DSH/PTC 控制面规则
 
 - 只通过内置浏览器真实操作 `http://127.0.0.1:49321/`。
 - 禁止调用页面 API 代替 UI 操作。
 - 只保留一个标签页，用完关闭，需要时再开。
+- 只有预先确认整个任务不会修改文件、Git、配置、Profile、进程、端口、构建/
+  测试产物或外部状态时，才使用 `Read Only`。
+- 实现、修复、测试/构建、集成、真实验收和任务自有产物清理，从会话开始即使用
+  `Full Access`；禁止先用受限模式启动可写任务，再依赖反复的中途审批升级。
+- `Full Access` 只扩大执行能力，不扩大任务授权；允许路径、非目标、破坏性操作
+  保护、凭据边界以及 push/merge/release 限制保持不变。
+- 只读任务发现必须写入时，停止并以明确写域和 `Full Access` 重新派发；reviewer
+  一旦成为 fixer，就失去该 Candidate 的独立审查身份。
 - 首次派发前回读 Candidate/base、workspace、团队/Session、模型、vLLM/PTC 和
-  reasoning 强度。
+  reasoning 强度、访问模式与写入范围。
 - 每个 Candidate 使用隔离的模型开发/验收状态。
 - 模型报告不等于代码、审查、集成或验收证据。
 
