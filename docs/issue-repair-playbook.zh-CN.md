@@ -103,12 +103,26 @@ writer。
 
 ## 6. 修复循环
 
-### 6.1 先复现
+Issue 修复默认采用“架构契约优先”的 TDD 循环：
+
+```text
+契约 -> RED -> GREEN -> REFACTOR -> 完整门禁 -> CANDIDATE
+```
+
+进入 RED 前先冻结可观察行为、状态/所有权边界、失败语义、限制、兼容性和非目标。
+RED 与 GREEN 可以由不同轮次执行，但必须属于同一个 Issue 和同一 Candidate 血统。
+
+### 6.1 RED：先复现
 
 修改生产代码前，至少获得一个当前 base 必然失败的回归测试、确定性最小复现、
 PID/状态证据、类型化错误/终态偏差，或绑定 Candidate 的真实 DSH 观察。
 
-没有复现就不实现。真实失败 attempt 是证据，不能在原运行状态上修补成绿色。
+回归必须在已接受 base 或当前前序 Candidate 上因目标原因失败。原本就通过、因环境
+噪声失败，或真实缺陷跨越进程/协议边界却只测 mock 的用例，都不算 RED。
+
+没有复现就不实现。真实失败 attempt 是证据，不能在原运行状态上修补成绿色。暂时
+无法自动化时，先保存确定性命令、进程/状态探针或绑定 Candidate 的真实观察；契约
+可执行后立即补上最近的有效自动回归。
 
 ### 6.2 Reference-first
 
@@ -122,7 +136,7 @@ PID/状态证据、类型化错误/终态偏差，或绑定 Candidate 的真实 
 只有本地和固定 ref 仍留下关键不确定性时才查上游权威来源。不能因为症状类似就
 复制 daemon、Storage、旧帧名或第二权威。
 
-### 6.3 最小修复
+### 6.3 GREEN：最小修复
 
 - 只修改 Issue 拥有的边界和验收行为。
 - 优先直接代码和小型 private helper，禁止先建 framework/registry。
@@ -131,7 +145,18 @@ PID/状态证据、类型化错误/终态偏差，或绑定 Candidate 的真实 
 - 不提交 `lib/`、`node_modules/`、Profile、Session log、凭据、coverage、日志或
   `ref/*/source/`。
 
-### 6.4 作者自证
+生产修改后先运行 RED 用例。GREEN 只证明被冻结且被测试覆盖的行为，不授权顺带
+重构相邻架构。
+
+### 6.4 REFACTOR：不改变契约
+
+- 只有已有定向 GREEN 证据后才能重构。
+- 每次结构调整后保持定向回归和邻近代表性检查绿色。
+- 禁止为了“更整洁”引入 framework、公共抽象或未来功能脚手架。
+- 重构若改变可观察行为或发现另一个缺陷，停止并建立 successor RED，不能混入
+  当前证明。
+
+### 6.5 完整门禁：作者自证
 
 每个 Candidate 至少运行：
 
@@ -149,7 +174,7 @@ UTF-8；query 检查 timeout/cancel/迟到结果；kernel 检查保留名称与�
 每个实质参与的智能体都要在该 Issue 的 development-memory 流中追加本人记录，写明
 相关文件和语义指针、步骤、证据与限制；协调者不得冒充作者。
 
-### 6.5 冻结和审查
+### 6.6 冻结和审查
 
 Candidate packet 包含 Issue、base SHA、Candidate SHA、变更文件、定向/完整测试、
 development-memory record IDs、文档影响和已知限制。Reviewer 只读审查精确
@@ -157,6 +182,9 @@ Candidate，不得边审边修。
 
 阻塞问题形成 successor Candidate。架构和安全边界未改变时只做 delta review；
 改变时重新完整审查。
+
+阻塞性语义发现必须先形成新的失败回归或等价可重复观察，再由作者执行 successor
+GREEN；reviewer 不得一边修改 Candidate 一边保留独立审查身份。
 
 ## 7. Git 与 PR
 

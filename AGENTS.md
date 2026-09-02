@@ -33,6 +33,31 @@ a real clean DSH Profile.
   guess DSH APIs from memory.
 - Keep `ref/` read-only. Use it only as pinned design evidence.
 
+## Architecture Contract and TDD
+
+- Freeze the affected architecture contract before production edits: observable
+  behavior, state and ownership boundaries, failure semantics, byte/time/resource
+  limits, compatibility, and explicit non-goals. Resolve material uncertainty
+  against the current code, installed DSH types, and pinned `ref/` evidence.
+- Bug repair defaults to strict test-driven development:
+  1. **RED:** add the smallest regression test or executable reproduction and
+     prove that it fails for the intended reason on the accepted base/candidate;
+  2. **GREEN:** make the smallest causal production change that passes that test;
+  3. **REFACTOR:** improve structure only while the focused and representative
+     checks remain green;
+  4. **FULL GATE:** run the required build, full tests, memory gate, independent
+     review, integration read-back, and real-boundary checks.
+- New features start with a thin architecture contract and a user-observable
+  acceptance example. Once the example is testable, implement each behavior with
+  the same RED -> GREEN -> REFACTOR loop.
+- Do not write a ceremonial test for documentation-only work, exploratory spikes,
+  or a live boundary that cannot yet be automated. Preserve a repeatable failing
+  observation first, then add the nearest useful automated regression as soon as
+  the contract is executable.
+- A test that passes before the fix is not RED evidence. Do not weaken assertions,
+  broaden timeouts, or test a mock-only path when the defect crosses a real process,
+  protocol, Session, or Profile boundary.
+
 ## Implementation Order
 
 1. Make the Python kernel execute one cell with persistent globals and top-level
@@ -69,6 +94,10 @@ a real clean DSH Profile.
 - The coordinator owns `main`, integration, and final verification.
 - Development agents may work only on a clearly assigned milestone slice and
   must report changed files, checks run, and any unverified assumption.
+- Every implementation or repair dispatch states its current TDD phase and the
+  frozen contract. Test-only RED work must not edit production files; GREEN work
+  must not silently expand the contract. A review finding that changes behavior
+  creates a successor RED before the next production correction.
 - Parallel work must have disjoint write scopes. Shared files are integrated
   serially by the coordinator.
 - Use `DeepSeek-V4-Flash-Vision-Exp` through the configured vLLM/PTC path when
