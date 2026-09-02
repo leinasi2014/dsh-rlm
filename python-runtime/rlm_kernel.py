@@ -97,6 +97,16 @@ def _safe_str(value: Any) -> str:
         return type(value).__name__
 
 
+def _safe_attr(obj: Any, name: str) -> Any:
+    """getattr that cannot raise: a hostile exception whose attribute reads
+    (e.g. lineno/offset/text/detail properties) throw again must not let
+    error-frame construction escape as a kernel crash."""
+    try:
+        return getattr(obj, name)
+    except BaseException:
+        return None
+
+
 class RlmKernel:
     def __init__(self) -> None:
         # Persistent globals shared across every cell of this process.
@@ -338,21 +348,26 @@ class RlmKernel:
             "message": _safe_str(exc),
             "name": name or type(exc).__name__,
         }
-        lineno = getattr(exc, "lineno", None)
-        column = getattr(exc, "offset", None)
-        text = getattr(exc, "text", None)
-        if lineno is not None:
+        lineno = _safe_attr(exc, "lineno")
+        column = _safe_attr(exc, "offset")
+        text = _safe_attr(exc, "text")
+        if isinstance(lineno, int):
             frame["line"] = lineno
-        if column is not None:
+        if isinstance(column, int):
             frame["column"] = column
-        if text is not None:
+        if isinstance(text, str):
             frame["text"] = text
-        detail = getattr(exc, "detail", None)
+        detail = _safe_attr(exc, "detail")
         if detail is not None:
             try:
-                json.dumps(detail)
-                frame["detail"] = detail
-            except (TypeError, ValueError):
+                # Detach into pure JSON-native values so the frame's send-time
+                # serialization can never re-enter a hostile object: serialize
+                # once (no NaN, non-ASCII kept) and re-parse immediately. Any
+                # BaseException or NaN falls back to a safe string.
+                frame["detail"] = json.loads(
+                    json.dumps(detail, ensure_ascii=False, allow_nan=False)
+                )
+            except BaseException:
                 frame["detail"] = _safe_str(detail)
         return frame
 

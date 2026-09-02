@@ -260,22 +260,24 @@ test('M1A Issue#5: deleting rlm_query in a failing cell is restored before the n
   }
 })
 
-test('M1A Issue#5: an assignment-only cell after a result cell returns no stale result', async () => {
+test('M1A Issue#5: a failed result leaves no stale result and keeps user __rlm_result__', async () => {
   const k = new Kernel()
   try {
     await ready(k)
-    k.send({ type: 'eval', id: 1, code: '21 * 2' })
-    const r1 = await k.next()
-    assert.equal(r1.type, 'result')
-    assert.equal(r1.result, '42')
+    k.send({ type: 'eval', id: 1, code: '__rlm_result__ = "stale"\n1 / 0' })
+    const e = await k.next()
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'ZeroDivisionError')
     k.send({ type: 'eval', id: 2, code: 'x = 5' })
     const r2 = await k.next()
     assert.equal(r2.type, 'result')
     assert.equal(r2.result, undefined)
-    k.send({ type: 'eval', id: 3, code: 'x' })
+    k.send({ type: 'eval', id: 3, code: '__rlm_result__' })
     const r3 = await k.next()
     assert.equal(r3.type, 'result')
-    assert.equal(r3.result, '5')
+    assert.equal(r3.result, 'stale')
   } finally {
     await k.close()
   }
@@ -334,6 +336,132 @@ test('M1A Issue#5: a bare awaitable last expression is not auto-awaited', async 
     assert.equal(r.type, 'result')
     assert.equal(typeof r.result, 'string')
     assert.match(r.result as string, /<coroutine object .* at 0x[0-9a-fA-F]+>/)
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: hostile exception attributes cannot escape as a kernel fatal', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'import os\nmarker = 1\nos.getpid()' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    const pid = Number(r1.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + r1.result)
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: [
+        'class Evil(Exception):',
+        '    @property',
+        '    def lineno(self):',
+        '        raise RuntimeError("lineno boom")',
+        '    @property',
+        '    def offset(self):',
+        '        raise RuntimeError("offset boom")',
+        '    @property',
+        '    def text(self):',
+        '        raise RuntimeError("text boom")',
+        '    @property',
+        '    def detail(self):',
+        '        raise RuntimeError("detail boom")',
+        '    def __str__(self):',
+        '        return "evil repr"',
+        'class Boom:',
+        '    def __repr__(self):',
+        '        raise Evil("repr boom")',
+        'Boom()',
+      ].join('\n'),
+    })
+    const e = await k.next(4000)
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'Evil')
+    assert.equal(e.message, 'evil repr')
+    assert.equal(e.line, undefined)
+    assert.equal(e.column, undefined)
+    k.send({ type: 'eval', id: 3, code: 'import os\nmarker + 40' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, '41')
+    k.send({ type: 'eval', id: 4, code: 'import os\nos.getpid()' })
+    const r3 = await k.next()
+    assert.equal(r3.type, 'result')
+    assert.equal(r3.result, String(pid))
+  } finally {
+    await k.close()
+  }
+})
+
+test('M1A Issue#5: flaky or NaN result detail cannot escape error-frame construction', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'import os\nmarker = 1\nos.getpid()' })
+    const r1 = await k.next()
+    assert.equal(r1.type, 'result')
+    const pid = Number(r1.result)
+    assert.ok(Number.isInteger(pid) && pid > 0, 'expected a valid kernel pid, got ' + r1.result)
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: [
+        'class FlakyDetail(list):',
+        '    def __init__(self):',
+        '        list.__init__(self, [1, 2, 3])',
+        '        self.calls = 0',
+        '    def __iter__(self):',
+        '        self.calls += 1',
+        '        if self.calls > 1:',
+        '            raise RuntimeError("detail boom on second pass")',
+        '        return list.__iter__(self)',
+        'class Boom:',
+        '    def __repr__(self):',
+        '        e = RuntimeError("repr boom")',
+        '        e.detail = FlakyDetail()',
+        '        raise e',
+        'Boom()',
+      ].join('\n'),
+    })
+    const e = await k.next(4000)
+    assert.equal(e.type, 'error')
+    assert.equal(e.phase, 'eval')
+    assert.equal(e.kind, 'runtime_error')
+    assert.equal(e.name, 'RuntimeError')
+    assert.equal(e.message, 'repr boom')
+    assert.deepEqual(e.detail, [1, 2, 3])
+    k.send({ type: 'eval', id: 3, code: 'import os\nmarker + 40' })
+    const r2 = await k.next()
+    assert.equal(r2.type, 'result')
+    assert.equal(r2.result, '41')
+    k.send({ type: 'eval', id: 4, code: 'import os\nos.getpid()' })
+    const r3 = await k.next()
+    assert.equal(r3.type, 'result')
+    assert.equal(r3.result, String(pid))
+    k.send({
+      type: 'eval',
+      id: 5,
+      code: [
+        'class BoomNaN:',
+        '    def __repr__(self):',
+        '        e = RuntimeError("nan repr")',
+        '        e.detail = float("nan")',
+        '        raise e',
+        'BoomNaN()',
+      ].join('\n'),
+    })
+    const e2 = await k.next()
+    assert.equal(e2.type, 'error')
+    assert.equal(e2.name, 'RuntimeError')
+    assert.equal(e2.message, 'nan repr')
+    assert.equal(e2.detail, 'nan')
+    k.send({ type: 'eval', id: 6, code: 'marker' })
+    const r4 = await k.next()
+    assert.equal(r4.type, 'result')
+    assert.equal(r4.result, '1')
   } finally {
     await k.close()
   }
