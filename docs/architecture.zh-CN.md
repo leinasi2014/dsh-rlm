@@ -153,6 +153,30 @@ V1 不承诺故障后恢复变量。恢复能力只有在真实使用需要时�
   `removeEventListener`，避免迟到的 abort 误杀已空闲的 kernel。
 - 取消复用 `Kernel` 的 kill/evict 路径，不新建抽象。
 
+#### Session 串行化（Issue #2）
+
+同一 Session 的并发 `rlm_eval` 不再被 `busy` 拒绝，而是由最小 per-Session
+FIFO 队列串行化：
+
+- 每个 Session key 拥有一队列与一个 drain worker，至多一个 active cell；
+  请求按提交顺序执行，后一个 cell 能在同一 kernel 上读取前一个成功写入的 globals。
+- 总 deadline 在 `eval()` 提交时冻结：排队等待与启动消耗同一预算。在出队前
+  预算耗尽的请求以 `timeout` 拒绝且从不启动 kernel；一旦 active，由 Kernel
+  接管剩余预算（启动 + cell 共享一个 deadline）。
+- 排队请求立即观察自己的 `AbortSignal`：abort（或排队期超时）只以 `cancel`
+  （或 `timeout`）结算该 entry，绝不触碰正在运行的 kernel，因此取消排队项
+  不会驱逐同 Session kernel。
+- kernel 只在 dequeue 时 lookup/create；前序 fatal（timeout、cancel、协议
+  故障、崩溃）后旧 kernel 通过 identity-check 的 `onExit` 驱逐，下一 entry
+  出队前驱逐已完成，后继只能使用新 kernel，且 namespace 丢失可观察
+  （旧 globals 消失、新 PID）。
+- `runtime.dispose()` 为终态：同步以 `cancel` 拒绝所有尚未 active 的排队项，
+  active 项经由既有 `Kernel.dispose` child cleanup barrier 结算；返回的
+  barrier 同时等待 kernels 与 drain workers；dispose 后不得再启动排队工作。
+- 队列按 Session 隔离：不同 Session 仍并行、kernel 与 globals 相互隔离；
+  不存在全局 scheduler 或跨进程队列。`RlmError kind='busy'` 仅作为
+  `Kernel.evalCell` 不可达的内部防御保留。
+
 #### 有界协议契约（Issue #3）
 
 - 总帧预算 `MAX_FRAME_BYTES = 256 * 1024` 按**实际序列化后的 JSONL 行**计，
@@ -186,9 +210,11 @@ Subagent：
   解析前都包含 `run.dispose()`，所有终态路径在拒绝或解析 cell 前等待该
   cleanup barrier。没有任何 one-shot child 会越过其 cell 的终态帧存活。
 - 终态转换使用显式的 `active -> settling -> settled` 形态：首个终态边沿
-  同步阻断路由与 child 发布（barrier 运行期间 `evalCell` 返回 `busy` 或
-  `closed`），Session map 驱逐与公开的 cell Promise 结算只在 child 静默
-  完成后发生——任何下一 cell 都无法穿过结算窗口。
+  同步阻断路由与 child 发布，Session map 驱逐与公开的 cell Promise 结算只在
+  child 静默完成后发生。并发同 Session eval 由 Issue #2 的 per-Session FIFO
+  排队——它无法穿过结算窗口，只能在窗口关闭后启动：live 结算后在同一个
+  kernel 上运行，fatal 结算后在新 kernel 上运行。`Kernel.busy` 只是不可达的
+  内部防御，不是契约。
 - 插件卸载返回可等待的 disposal barrier：`runtime.dispose()` 同步置为
   terminal（后续 eval 拒绝 `closed`），并在每个 kernel 的 child cleanup
   barrier 完成后 resolve，使 Cordis teardown 可以真正等待 child 静默。

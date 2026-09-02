@@ -227,6 +227,23 @@ interface PendingEval {
   reject: (err: RlmError) => void
 }
 
+/** One queued same-session eval request; the runtime owns its lifecycle. */
+interface QueuedEval {
+  sessionKey: string
+  input: RlmEvalInput
+  /** Total deadline frozen at eval() submission; queue wait consumes it. */
+  deadline: number
+  signal: AbortSignal | undefined
+  /** Queued-phase abort listener; removed before the entry becomes active. */
+  onAbort: (() => void) | undefined
+  timer: ReturnType<typeof setTimeout> | undefined
+  settled: boolean
+  active: boolean
+  resolve: (out: RlmEvalOutput) => void
+  reject: (err: RlmError) => void
+  promise: Promise<RlmEvalOutput>
+}
+
 interface Frame {
   type: string
   [key: string]: unknown
@@ -961,6 +978,8 @@ export interface RlmRuntime {
 
 class RlmRuntimeImpl implements RlmRuntime {
   private kernels = new Map<string, Kernel>()
+  private queues = new Map<string, QueuedEval[]>()
+  private drains = new Map<string, Promise<void>>()
   private config: RlmRuntimeConfig
   private disposed = false
   private disposePromise: Promise<void> | undefined
@@ -969,42 +988,222 @@ class RlmRuntimeImpl implements RlmRuntime {
   }
 
   async eval(sessionKey: string, input: RlmEvalInput): Promise<RlmEvalOutput> {
-    // A pre-aborted signal never starts a session kernel.
+    // A pre-aborted signal never starts a session kernel and never queues work.
     if (input.signal?.aborted) {
       throw new RlmError('cancel', String(input.signal.reason ?? 'cancelled'))
     }
-    // Dispose is terminal: reject without looking up or starting any kernel.
+    // Dispose is terminal: reject without looking up, queueing, or starting anything.
     if (this.disposed) {
       throw new RlmError('closed', 'runtime is disposed')
     }
-    // One effective timeout is the total budget for the whole eval: it is taken
-    // at the true entry so the synchronous kernel lookup/construction (spawn)
-    // is already charged to the same deadline that waitReady and evalCell
-    // consume; a slow startup can never stack a second full timeout.
+    // One effective timeout is the total budget for the whole eval: it is frozen
+    // at submission so startup, queue wait, and cell execution share one deadline.
     const budget = input.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT
-    const deadline = Date.now() + budget
-    let kernel = this.kernels.get(sessionKey)
-    if (!kernel) {
-      kernel = new Kernel(sessionKey, this.config)
-      kernel.onExit = () => {
-        if (this.kernels.get(sessionKey) === kernel) this.kernels.delete(sessionKey)
-      }
-      this.kernels.set(sessionKey, kernel)
-    }
-    await kernel.waitReady({
-      timeout: Math.max(0, deadline - Date.now()),
-      ...(input.signal ? { signal: input.signal } : {}),
+    const entry = this.enqueue(sessionKey, input, Date.now() + budget)
+    void this.ensureDrain(sessionKey)
+    return entry.promise
+  }
+
+  private enqueue(sessionKey: string, input: RlmEvalInput, deadline: number): QueuedEval {
+    let resolve!: (out: RlmEvalOutput) => void
+    let reject!: (err: RlmError) => void
+    const promise = new Promise<RlmEvalOutput>((res, rej) => {
+      resolve = res
+      reject = rej
     })
-    return kernel.evalCell(input, deadline)
+    const entry: QueuedEval = {
+      sessionKey,
+      input,
+      deadline,
+      signal: input.signal,
+      onAbort: undefined,
+      timer: undefined,
+      settled: false,
+      active: false,
+      resolve,
+      reject,
+      promise,
+    }
+    const signal = input.signal
+    if (signal) {
+      const onAbort = (): void => this.cancelQueued(entry, String(signal.reason ?? 'cancelled'))
+      entry.onAbort = onAbort
+      signal.addEventListener('abort', onAbort, { once: true })
+      // Close the race between the eval() pre-check and the listener
+      // registration: an abort that landed in between must still settle as a
+      // queued cancel, without enqueueing or starting anything.
+      if (signal.aborted) {
+        this.cancelQueued(entry, String(signal.reason ?? 'cancelled'))
+        return entry
+      }
+    }
+    // Budget already exhausted at submission: reject without queue or kernel.
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      this.settleEntry(entry, undefined, new RlmError('timeout', 'cell timed out before it could start'))
+      return entry
+    }
+    // The queued-phase deadline timer settles ONLY this entry; once the entry
+    // becomes active the Kernel owns the same deadline (remaining budget).
+    entry.timer = setTimeout(() => this.expireQueued(entry), remaining)
+    let queue = this.queues.get(sessionKey)
+    if (!queue) {
+      queue = []
+      this.queues.set(sessionKey, queue)
+    }
+    queue.push(entry)
+    return entry
+  }
+
+  /** Queued-phase abort: settles only this entry; the running kernel is untouched. */
+  private cancelQueued(entry: QueuedEval, message: string): void {
+    if (entry.settled || entry.active) return
+    this.settleEntry(entry, undefined, new RlmError('cancel', message))
+  }
+
+  /** Queued-phase budget exhaustion: settles only this entry; no kernel action. */
+  private expireQueued(entry: QueuedEval): void {
+    if (entry.settled || entry.active) return
+    this.settleEntry(entry, undefined, new RlmError('timeout', 'cell timed out before it could start'))
+  }
+
+  private settleEntry(entry: QueuedEval, out: RlmEvalOutput | undefined, err?: RlmError): void {
+    if (entry.settled) return
+    entry.settled = true
+    if (entry.timer !== undefined) {
+      clearTimeout(entry.timer)
+      entry.timer = undefined
+    }
+    const onAbort = entry.onAbort
+    if (onAbort !== undefined) {
+      entry.onAbort = undefined
+      entry.signal?.removeEventListener('abort', onAbort)
+    }
+    this.removeQueued(entry)
+    if (err !== undefined) entry.reject(err)
+    else if (out !== undefined) entry.resolve(out)
+  }
+
+  private removeQueued(entry: QueuedEval): void {
+    const queue = this.queues.get(entry.sessionKey)
+    if (!queue) return
+    const index = queue.indexOf(entry)
+    if (index >= 0) queue.splice(index, 1)
+    if (queue.length === 0) this.queues.delete(entry.sessionKey)
+  }
+
+  /** One drain worker per session; a new eval joins the running worker. */
+  private ensureDrain(sessionKey: string): Promise<void> {
+    let drain = this.drains.get(sessionKey)
+    if (drain) return drain
+    const loop = this.drainLoop(sessionKey)
+    drain = loop.finally(() => {
+      if (this.drains.get(sessionKey) !== drain) return
+      this.drains.delete(sessionKey)
+      // Lost-wakeup guard: an eval may have been enqueued after this worker
+      // observed an empty queue but before this finally removed it from
+      // `drains`; that eval attached to the about-to-finish worker. If
+      // unsettled work remains, start a fresh worker (unless disposed).
+      if (!this.disposed) {
+        const queue = this.queues.get(sessionKey)
+        if (queue && queue.some((entry) => !entry.settled)) {
+          void this.ensureDrain(sessionKey)
+        }
+      }
+    })
+    this.drains.set(sessionKey, drain)
+    return drain
+  }
+
+  private async drainLoop(sessionKey: string): Promise<void> {
+    for (;;) {
+      if (this.disposed) return
+      const queue = this.queues.get(sessionKey)
+      const entry = queue?.[0]
+      if (!entry) return
+      if (entry.settled) {
+        this.removeQueued(entry)
+        continue
+      }
+      if (entry.deadline - Date.now() <= 0) {
+        this.settleEntry(entry, undefined, new RlmError('timeout', 'cell timed out before it could start'))
+        continue
+      }
+      await this.runEntry(sessionKey, entry)
+    }
+  }
+
+  /**
+   * Run one dequeued entry. The queued-phase listener/timer are removed before
+   * the entry becomes active; from here on the Kernel owns the caller signal and
+   * the remaining deadline, and the outer promise settles only after the
+   * Kernel's existing child-cleanup barrier completes.
+   */
+  private async runEntry(sessionKey: string, entry: QueuedEval): Promise<void> {
+    entry.active = true
+    if (entry.timer !== undefined) {
+      clearTimeout(entry.timer)
+      entry.timer = undefined
+    }
+    const onAbort = entry.onAbort
+    if (onAbort !== undefined) {
+      entry.onAbort = undefined
+      entry.signal?.removeEventListener('abort', onAbort)
+    }
+    try {
+      if (this.disposed || entry.settled) {
+        if (!entry.settled) {
+          this.settleEntry(entry, undefined, new RlmError('closed', 'runtime is disposed'))
+        }
+        return
+      }
+      if (entry.deadline - Date.now() <= 0) {
+        this.settleEntry(entry, undefined, new RlmError('timeout', 'cell timed out before it could start'))
+        return
+      }
+      // Dequeue-time kernel capture: a fatal eviction (by identity) removes the
+      // old kernel before the next dequeue, so an entry can never reuse a dead one.
+      let kernel = this.kernels.get(sessionKey)
+      if (!kernel) {
+        kernel = new Kernel(sessionKey, this.config)
+        kernel.onExit = () => {
+          if (this.kernels.get(sessionKey) === kernel) this.kernels.delete(sessionKey)
+        }
+        this.kernels.set(sessionKey, kernel)
+      }
+      const remaining = Math.max(0, entry.deadline - Date.now())
+      await kernel.waitReady({
+        timeout: remaining,
+        ...(entry.input.signal ? { signal: entry.input.signal } : {}),
+      })
+      const out = await kernel.evalCell(entry.input, entry.deadline)
+      this.settleEntry(entry, out)
+    } catch (err) {
+      if (entry.settled) return
+      const rlmErr = err instanceof RlmError ? err : new RlmError('closed', String(err))
+      this.settleEntry(entry, undefined, rlmErr)
+    }
   }
 
   dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise
-    // Synchronously terminal: new evals reject immediately, even while the
-    // child cleanup barriers still run.
+    // Terminal state synchronously: new evals reject immediately and drain
+    // workers stop starting new work.
     this.disposed = true
+    // Settle every not-yet-active queued entry at once; an active entry is
+    // settled by its kernel.dispose() through the existing child cleanup barrier.
+    for (const entry of [...this.queues.values()].flat()) {
+      if (!entry.active) {
+        this.settleEntry(entry, undefined, new RlmError('cancel', 'runtime disposed while queued'))
+      }
+    }
+    this.queues.clear()
     const kernels = [...this.kernels.values()]
-    this.disposePromise = Promise.all(kernels.map((kernel) => kernel.dispose())).then(() => {
+    const drainWait = Promise.all([...this.drains.values()])
+    this.disposePromise = Promise.all([
+      ...kernels.map((kernel) => kernel.dispose()),
+      drainWait,
+    ]).then(() => {
       this.kernels.clear()
     })
     return this.disposePromise
