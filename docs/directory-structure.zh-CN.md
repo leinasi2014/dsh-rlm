@@ -23,11 +23,17 @@ dsh-rlm/
 │  └─ rlm_kernel.py        # persistent globals、top-level await、rlm_query
 ├─ tests/
 │  ├─ rlm-loop.test.ts     # Python/query/跨 cell 闭环
-│  └─ profile-smoke.test.ts# 真实 DSH Profile 组合
+│  ├─ profile-smoke.test.ts# 真实 DSH Profile 组合
+│  └─ development-memory-gate.test.ts # 仓库证据门禁
 ├─ docs/
+│  └─ development-memory/
+│     └─ records/<年份>/   # append-only Issue/workstream 智能体轨迹
+├─ scripts/                # 小型仓库治理检查
+├─ .githooks/              # 本地快速门禁；CI 为权威
 └─ ref/
 ```
 
-在单个文件接近项目行数限制、出现第二个独立 Consumer，或第二个真实内核实现
+这些治理文件不改变 V1 runtime 边界。在 runtime 单个文件接近项目行数限制、
+出现第二个独立 Consumer，或第二个真实内核实现
 开始编码之前，不继续拆文件。届时按
 [后续扩展架构](future-extensions.zh-CN.md) 的触发条件做最小拆分。

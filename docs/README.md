@@ -10,6 +10,7 @@
 6. [Directory structure](directory-structure.md): the minimal TypeScript/Python source boundary.
 7. [Reference analysis](reference-analysis.md): what was adopted from and rejected from the two pinned references.
 8. [GitHub Issue repair playbook](issue-repair-playbook.md): reasoning-effort tiers, repair workflow, evidence, review, Git, and closure rules.
-9. [Interactive architecture diagram](dsh-rlm-architecture.html): the English-first core-loop visualization generated from `dsh-rlm-architecture.archify.json`.
+9. [Development memory](development-memory/README.md): append-only per-agent implementation, repair, test, and review evidence.
+10. [Interactive architecture diagram](dsh-rlm-architecture.html): the English-first core-loop visualization generated from `dsh-rlm-architecture.archify.json`.
 
 Each authoritative English document has a `.zh-CN.md` Chinese counterpart.

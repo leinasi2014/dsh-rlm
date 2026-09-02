@@ -25,11 +25,17 @@ dsh-rlm/
 │  └─ rlm_kernel.py         # globals, top-level await, rlm_query
 ├─ tests/
 │  ├─ rlm-loop.test.ts      # Python/query/cross-cell loop
-│  └─ profile-smoke.test.ts # real DSH Profile composition
+│  ├─ profile-smoke.test.ts # real DSH Profile composition
+│  └─ development-memory-gate.test.ts # repository evidence gate
 ├─ docs/
+│  └─ development-memory/
+│     └─ records/<year>/    # append-only Issue/workstream agent trails
+├─ scripts/                 # small repository governance checks
+├─ .githooks/               # local fast gate; CI is authoritative
 └─ ref/
 ```
 
-Do not split further until a file reaches the project size limit, a second
+The governance files do not change the V1 runtime boundary. Do not split runtime
+code further until a file reaches the project size limit, a second
 independent consumer appears, or a second real kernel implementation starts.
 At that point, follow the triggers in [Future extensions](future-extensions.md).

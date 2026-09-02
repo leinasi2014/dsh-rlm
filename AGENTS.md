@@ -83,6 +83,23 @@ a real clean DSH Profile.
 - A model report is not completion. Completion needs committed code plus local
   checks and the clean Profile smoke required by the milestone.
 
+## Development Memory Gate
+
+- Follow [Development Memory](docs/development-memory/README.md). Its English
+  version is authoritative; the Chinese translation is
+  [docs/development-memory/README.zh-CN.md](docs/development-memory/README.zh-CN.md).
+- Every agent that materially implements, repairs, designs tests, reviews, or
+  performs live verification appends its own record to the Issue/workstream
+  JSONL. The implementing agent owns later correction records for its work.
+- Record at Candidate or handoff granularity, not per prompt, edit, command, or
+  commit. Use durable symbol/test/heading pointers and exact evidence results.
+- A coordinator may serially append another agent's returned record, but must
+  preserve that agent's identity and may not claim its contribution.
+- Existing record lines are immutable. Correct mistakes by appending a record
+  with `correctsRecordId`; never edit, delete, or reorder history.
+- Before commit, `pnpm check:memory:staged` must pass. Do not bypass the hook or
+  weaken the CI range gate to make a Candidate green.
+
 ## Git Rules
 
 - Commit small working slices. Do not batch future-feature scaffolding into M1.

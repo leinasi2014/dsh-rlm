@@ -93,9 +93,11 @@ ambient environment variables when this plugin is enabled. See [SECURITY.md](SEC
 
 ```bash
 pnpm install --frozen-lockfile
+git config --local core.hooksPath .githooks
+pnpm check:memory
 pnpm typecheck
 pnpm build
-node --test tests/rlm-loop.test.ts tests/profile-smoke.test.ts
+pnpm test
 ```
 
 The two real Profile tests are intentionally gated because they install a fresh
@@ -163,6 +165,7 @@ revision
 - [Reference analysis](docs/reference-analysis.md)
 - [Independent review reconciliation](docs/review-findings.md)
 - [GitHub Issue repair playbook](docs/issue-repair-playbook.md)
+- [Development memory and agent evidence](docs/development-memory/README.md)
 - [Future extensions and their triggers](docs/future-extensions.md)
 - [Contributing](CONTRIBUTING.md)
 - [Security](SECURITY.md)

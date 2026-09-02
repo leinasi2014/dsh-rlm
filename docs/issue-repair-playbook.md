@@ -82,6 +82,7 @@ reviewer: "<non-author identity>"
 owned_paths: []
 forbidden_scope: []
 acceptance_tests: []
+memory_stream: "docs/development-memory/records/<year>/issue-<number>.jsonl"
 first_material_event: "<failing reproduction or exact blocker>"
 ```
 
@@ -158,6 +159,9 @@ exceptional-`repr()` cases for kernel work, sentinel secrets for environment
 isolation, and schema/prompt lifecycle checks for plugin configuration.
 
 Report each check as `PASS`, `FAIL`, `FLAKY`, `NOT_RUN`, or `NOT_CONFIGURED`.
+Each materially participating agent appends its own record to the Issue's
+development-memory stream. The record names its files and semantic pointers,
+steps, evidence, and limitations; the coordinator does not impersonate authors.
 
 ### 6.5 Freeze and review
 
@@ -165,7 +169,8 @@ Freeze one candidate packet:
 
 ```text
 Issue, base SHA, candidate SHA, changed paths,
-focused checks, full checks, documentation impact, known limitations
+focused checks, full checks, development-memory record IDs,
+documentation impact, known limitations
 ```
 
 The independent reviewer is read-only and checks the exact candidate for root
@@ -195,6 +200,9 @@ architecture or security boundary changed.
 ## Security / lifecycle impact
 ## Remaining limitations
 ```
+
+The PR also lists every participating development-memory `recordId`. Existing
+JSONL lines are append-only evidence and must never be rewritten during review.
 
 ## 8. Concurrency and integration
 
@@ -233,6 +241,8 @@ Close an Issue only when:
 - no owned Python process, Subagent, worktree, or dirty state remains;
 - public/security/architecture documentation is updated or explicitly
   `not-needed`.
+- every material contributor's development-memory record is present and its ID
+  is linked from the Candidate/PR evidence.
 
 Post this final Issue comment:
 

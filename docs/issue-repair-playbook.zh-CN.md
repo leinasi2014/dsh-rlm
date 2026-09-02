@@ -70,6 +70,7 @@ reviewer: "非作者"
 owned_paths: []
 forbidden_scope: []
 acceptance_tests: []
+memory_stream: "docs/development-memory/records/<年份>/issue-<编号>.jsonl"
 first_material_event: "失败复现或精确 blocker"
 ```
 
@@ -131,11 +132,14 @@ UTF-8；query 检查 timeout/cancel/迟到结果；kernel 检查保留名称与�
 `repr()`；环境隔离检查 sentinel secret；配置检查 schema 和 prompt 生命周期。
 
 结果统一记录为 `PASS | FAIL | FLAKY | NOT_RUN | NOT_CONFIGURED`。
+每个实质参与的智能体都要在该 Issue 的 development-memory 流中追加本人记录，写明
+相关文件和语义指针、步骤、证据与限制；协调者不得冒充作者。
 
 ### 6.5 冻结和审查
 
 Candidate packet 包含 Issue、base SHA、Candidate SHA、变更文件、定向/完整测试、
-文档影响和已知限制。Reviewer 只读审查精确 Candidate，不得边审边修。
+development-memory record IDs、文档影响和已知限制。Reviewer 只读审查精确
+Candidate，不得边审边修。
 
 阻塞问题形成 successor Candidate。架构和安全边界未改变时只做 delta review；
 改变时重新完整审查。
@@ -148,6 +152,8 @@ Candidate packet 包含 Issue、base SHA、Candidate SHA、变更文件、定向
 - 保留无关改动；未经用户明确授权不得重写已发布历史。
 - 原则上一个 Issue 一个 PR，正文包含 `Closes #N`，并说明问题、根因、ref 决策、
   实现、验收映射、测试、安全/生命周期影响和剩余限制。
+- PR 还必须列出所有实质参与者的 development-memory `recordId`；review 期间不得
+  重写既有 JSONL 行。
 
 ## 8. 并发和集成
 
@@ -171,6 +177,7 @@ PR 串行集成。证据和审查通过后的下一步必须是按预期 `main` 
 - 目标 CI 和所需干净 Profile 验证通过；
 - 没有遗留 Python、Subagent、worktree 或 dirty state；
 - 公开/安全/架构文档已更新或明确 `not-needed`。
+- 每个实质贡献者的 development-memory 记录均存在，且 ID 已链接到 Candidate/PR 证据。
 
 最终 Issue 评论：
 

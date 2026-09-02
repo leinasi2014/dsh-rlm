@@ -89,9 +89,11 @@ workspace 启用本插件。
 
 ```bash
 pnpm install --frozen-lockfile
+git config --local core.hooksPath .githooks
+pnpm check:memory
 pnpm typecheck
 pnpm build
-node --test tests/rlm-loop.test.ts tests/profile-smoke.test.ts
+pnpm test
 ```
 
 两个真实 Profile 测试会安装新 Profile 并调用真实模型，因此默认设门。当前测试
@@ -148,6 +150,7 @@ revision
 - [项目状态](docs/project-status.zh-CN.md)
 - [审查结论](docs/review-findings.zh-CN.md)
 - [GitHub Issue 修复规范](docs/issue-repair-playbook.zh-CN.md)
+- [开发记忆总档案](docs/development-memory/README.zh-CN.md)
 - [里程碑](docs/milestones.zh-CN.md)
 - [目录与语言边界](docs/directory-structure.zh-CN.md)
 - [参考项目取舍](docs/reference-analysis.zh-CN.md)

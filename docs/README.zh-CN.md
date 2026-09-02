@@ -11,5 +11,6 @@
 6. [目录结构与语言](directory-structure.zh-CN.md)：最小 TypeScript/Python 布局。
 7. [参考项目取舍](reference-analysis.zh-CN.md)：两个固定参考源的采用与拒绝项。
 8. [GitHub Issue 修复规范](issue-repair-playbook.zh-CN.md)：思考强度、修复流程、证据、审查、Git 和关单规则。
-9. [交互式架构图](dsh-rlm-architecture.html)：核心闭环可视化；图源是
+9. [开发记忆总档案](development-memory/README.zh-CN.md)：每个智能体的开发、修复、测试和审查证据。
+10. [交互式架构图](dsh-rlm-architecture.html)：核心闭环可视化；图源是
    `dsh-rlm-architecture.archify.json`。

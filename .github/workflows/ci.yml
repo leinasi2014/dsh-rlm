@@ -16,6 +16,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: pnpm/action-setup@v4
         with:
           version: 9.15.9
@@ -27,6 +29,14 @@ jobs:
         with:
           python-version: '3.11'
       - run: pnpm install --frozen-lockfile
+      - name: Check development memory
+        shell: pwsh
+        env:
+          MEMORY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          MEMORY_HEAD: ${{ github.sha }}
+        run: |
+          pnpm check:memory
+          node scripts/check-development-memory.mjs --range "$env:MEMORY_BASE..$env:MEMORY_HEAD"
       - run: pnpm typecheck
       - run: pnpm build
-      - run: node --test tests/rlm-loop.test.ts tests/profile-smoke.test.ts
+      - run: pnpm test
