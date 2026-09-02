@@ -243,9 +243,8 @@ function recordDiff(args) {
   return git([...args, '--', RECORDS_ROOT])
 }
 
-function gitFile(ref, file, root = ROOT) {
-  const revision = ref === ':' ? `:${file}` : `${ref}:${file}`
-  const result = spawnSync('git', ['show', revision], {
+function silentGit(args, root = ROOT) {
+  const result = spawnSync('git', args, {
     cwd: root,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -253,11 +252,31 @@ function gitFile(ref, file, root = ROOT) {
   return result.status === 0 ? result.stdout : null
 }
 
+function gitFile(ref, file, root = ROOT) {
+  const revision = ref === ':' ? `:${file}` : `${ref}:${file}`
+  return silentGit(['show', revision], root)
+}
+
+function gitFileMode(ref, file, root = ROOT) {
+  const output = ref === ':'
+    ? silentGit(['ls-files', '-s', '--', file], root)
+    : silentGit(['ls-tree', ref, '--', file], root)
+  return /^(\d{6})\s/.exec(output ?? '')?.[1] ?? null
+}
+
 function appendOnlyRecordErrors(paths, beforeRef, afterRef, label, root = ROOT) {
   const errors = []
   const records = new Set(paths.filter((file) =>
     file.startsWith(`${RECORDS_ROOT}/`) && file.endsWith('.jsonl')))
   for (const file of records) {
+    const beforeMode = gitFileMode(beforeRef, file, root)
+    const afterMode = gitFileMode(afterRef, file, root)
+    if (afterMode !== null && afterMode !== '100644') {
+      errors.push(`${label}: ${file} must remain a non-executable regular file mode 100644`)
+    }
+    if (beforeMode !== null && afterMode !== null && beforeMode !== afterMode) {
+      errors.push(`${label}: ${file} file mode is immutable (${beforeMode} -> ${afterMode})`)
+    }
     if (!isAppendOnlyRecordText(gitFile(beforeRef, file, root), gitFile(afterRef, file, root))) {
       errors.push(`${label}: ${file} must preserve its prior content as an exact prefix and append new records only at EOF`)
     }
@@ -274,7 +293,14 @@ function revisionEndpoints(range) {
 }
 
 export function rangeAppendOnlyErrors(range, label, root = ROOT) {
-  revisionEndpoints(range)
+  const [base, head] = revisionEndpoints(range)
+  const baseCommit = git(['rev-parse', base], root).trim()
+  const firstParentHistory = new Set(git(['rev-list', '--first-parent', head], root)
+    .split(/\r?\n/)
+    .filter(Boolean))
+  if (!firstParentHistory.has(baseCommit)) {
+    return [`${label}: base ${baseCommit} must be a first-parent ancestor of ${head}`]
+  }
   const commits = git(['rev-list', '--reverse', '--topo-order', range], root)
     .split(/\r?\n/)
     .filter(Boolean)
@@ -284,7 +310,7 @@ export function rangeAppendOnlyErrors(range, label, root = ROOT) {
       .trim()
       .split(/\s+/)
     const paths = changedPaths([
-      'diff', '--no-renames', '--name-only', '-z', '--diff-filter=ACMRD', parent, commit,
+      'diff', '--no-renames', '--name-only', '-z', '--diff-filter=ACMRTD', parent, commit,
     ], root)
     errors.push(...appendOnlyRecordErrors(paths, parent, commit, `${label} commit ${commit}`, root))
   }
@@ -346,13 +372,13 @@ function main() {
   const [mode = '--all', value] = process.argv.slice(2)
 
   if (mode === '--staged') {
-    const paths = changedPaths(['diff', '--cached', '--no-renames', '--name-only', '-z', '--diff-filter=ACMRD'])
+    const paths = changedPaths(['diff', '--cached', '--no-renames', '--name-only', '-z', '--diff-filter=ACMRTD'])
     const diff = recordDiff(['diff', '--cached', '--no-renames', '--unified=0'])
     const appendErrors = appendOnlyRecordErrors(paths, 'HEAD', ':', 'staged change')
     errors.push(...checkChangeSet(paths, diff, 'staged change', appendErrors))
   } else if (mode === '--range') {
     const range = value || defaultRange()
-    const paths = changedPaths(['diff', '--no-renames', range, '--name-only', '-z', '--diff-filter=ACMRD'])
+    const paths = changedPaths(['diff', '--no-renames', range, '--name-only', '-z', '--diff-filter=ACMRTD'])
     const diff = recordDiff(['diff', '--no-renames', '--unified=0', range])
     const appendErrors = rangeAppendOnlyErrors(range, `range ${range}`)
     errors.push(...checkChangeSet(paths, diff, `range ${range}`, appendErrors))

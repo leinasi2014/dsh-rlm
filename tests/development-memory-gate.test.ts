@@ -143,6 +143,32 @@ test('range gate rejects renaming a development-memory shard', (t) => {
     .some((error) => error.includes('exact prefix')))
 })
 
+test('range gate rejects changing a development-memory shard into a symlink', (t) => {
+  const { root, base, shard } = historyFixture(t)
+  const linkTarget = path.join(root, 'link-target.txt')
+  writeFileSync(linkTarget, 'outside.jsonl')
+  const blob = git(root, 'hash-object', '-w', linkTarget)
+  const relativeShard = path.relative(root, shard).replaceAll('\\', '/')
+  git(root, 'update-index', '--cacheinfo', `120000,${blob},${relativeShard}`)
+  git(root, 'commit', '-m', 'change shard to symlink')
+
+  assert.ok(rangeAppendOnlyErrors(`${base}..HEAD`, 'fixture range', root)
+    .some((error) => error.includes('regular file mode')))
+})
+
+test('range gate rejects a base that is only a merge second parent', (t) => {
+  const { root, base } = historyFixture(t)
+  const secondParent = git(root, 'rev-parse', 'HEAD')
+  git(root, 'checkout', '-b', 'integration', base)
+  writeFileSync(path.join(root, 'integration.txt'), 'first parent\n')
+  git(root, 'add', '.')
+  git(root, 'commit', '-m', 'integration first parent')
+  git(root, 'merge', '--no-ff', secondParent, '-m', 'merge shard as second parent')
+
+  assert.ok(rangeAppendOnlyErrors(`${secondParent}..HEAD`, 'fixture range', root)
+    .some((error) => error.includes('first-parent ancestor')))
+})
+
 test('still rejects changing an unterminated final record', () => {
   const diffs = [
     '-old record\n\\ No newline at end of file\n+changed record\n+new record',
