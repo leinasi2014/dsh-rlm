@@ -2,9 +2,9 @@
 
 > English | [简体中文](project-status.zh-CN.md)
 
-This document records the implementation boundary at the first public release.
-GitHub Issues, [Milestones](milestones.md), and executable tests jointly define
-subsequent progress.
+This document records the accepted implementation boundary and the next ordered
+milestones. GitHub Issues, [Milestones](milestones.md), and executable tests
+jointly define live progress.
 
 ## Goal
 
@@ -23,12 +23,12 @@ holds Session-local globals, and asks the host for one-shot child calls.
 
 ## Publication baseline
 
-- Audited implementation: `e1ce33e0d984a340e949768975e2397d8b62bd0b`
-- Audit date: 2026-09-02
+- Accepted M1/M2 base: `260484d7d92e43fcb99c54ab987436d494501845`
+- Status date: 2026-09-03
 - Pinned references: `ref/rlm` and `ref/prime-agent`, used as design evidence,
   not literal compatibility targets
-- Current stage: the M1 main loop passed a real clean-Profile smoke; the M2
-  reliability baseline remains open
+- Current stage: M1 and M2 passed their local, review, CI, remote-main, and real
+  clean-Profile gates; M3 architecture/contract integration is in progress
 
 ## Delivered
 
@@ -65,24 +65,29 @@ availability in the child.
 Live tests are gated by `RLM_LIVE_SMOKE=1` so ordinary test runs cannot make
 accidental model calls.
 
-## Open work
+## Accepted M2 reliability
 
-The M2 gaps are grouped into seven public work items:
+The public M2 repair Issues are closed. The accepted base includes Session FIFO
+serialization, bounded protocol frames and errors, query/child quiescence,
+scaffold/result isolation, validated configuration and system prompt, and a
+safe-name Python environment allowlist. The complete base has 138 tests (136
+passing plus two deliberately live-gated smokes) and passed the DSV4-FVE clean
+Profile path.
 
-1. [Kernel lifecycle](https://github.com/leinasi2014/dsh-rlm/issues/1): protocol-fault orphans, ready deadline, and terminal dispose.
-2. [Session serialization](https://github.com/leinasi2014/dsh-rlm/issues/2): queue concurrent cells instead of returning `busy`.
-3. [Bounded protocol](https://github.com/leinasi2014/dsh-rlm/issues/3): byte limits for stderr, incomplete frames, queries, and errors.
-4. [Query/child lifecycle](https://github.com/leinasi2014/dsh-rlm/issues/4): cancel and await children on timeout, failure, and unload; reject empty child text; preserve query taxonomy.
-5. [Scaffold and result isolation](https://github.com/leinasi2014/dsh-rlm/issues/5): contain `repr()`, protect the result slot, and restore `rlm_query`.
-6. [Configuration and system prompt](https://github.com/leinasi2014/dsh-rlm/issues/6): expose V1 settings and register concise usage guidance.
-7. [Python environment isolation](https://github.com/leinasi2014/dsh-rlm/issues/7): do not inherit host variables that may carry Provider credentials.
+## Ordered open work
 
-The accurate status is: **the M1 core loop is delivered; M1 closeout and M2
-reliability remain open**.
+1. [M3 Managed Context](m3-managed-context.md): bounded, atomic, protected
+   absolute-file loading without copying contents through model-visible input.
+2. [M4 Recursive Child RLM](m4-recursive-child-rlm.md): official depth-bounded
+   child Sessions with isolated kernels and whole-branch quiescence.
+
+The [development contract](m3-m4-development-contract.md) requires docs-first
+integration, WIP=1, TDD, independent review, CI, remote-main read-back, and a
+real DSH/Profile acceptance for each milestone. Dogfood findings are reproduced,
+aggregated, and filed separately rather than silently widening M3/M4.
 
 ## Conditional future work
 
-Snapshot/restore, Storage Domain, run records, continuable spawn, recursive RLM,
-batch queries, a second kernel, cross-host recovery, cost accounting, UI,
-Workflow, Jobs, and swarm have not started and are not M1 defects. They enter a
-milestone only after a real trigger exists.
+Snapshot/restore, Storage Domain, run records, continuable spawn, batch queries,
+a second kernel, cross-host recovery, cost accounting, UI, Workflow, Jobs, and
+swarm remain conditional and have not started.

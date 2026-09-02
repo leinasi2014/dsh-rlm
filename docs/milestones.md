@@ -50,7 +50,50 @@ processes or cross-Session state.
 6. Queries beyond the per-cell limit are rejected.
 7. No plugin-owned Python process survives plugin unload.
 
-## Conditional milestones
+## M3: Managed Context
+
+**Outcome:** `rlm_eval(code, contextPath?)` atomically loads one bounded,
+absolute UTF-8 file into protected Session-local `context` without copying its
+contents through the model-visible tool input.
+
+**Exit criteria:**
+
+1. Omitting `contextPath` is backward compatible with M1/M2.
+2. The same cell sees the loaded context and later cells reuse it.
+3. Other Sessions cannot see it, and cell code cannot permanently replace the
+   protected `context` or `context_meta` values.
+4. Invalid path, target type, size, UTF-8, and read-race failures are typed and
+   atomic: the prior live kernel/context remains intact.
+5. Protocol version mismatch fails explicitly; file bytes never appear in a
+   host-side frame, model-visible tool input, or tool result.
+6. Unit/integration tests, independent review, CI, remote-main read-back, and a
+   clean DSV4-FVE Profile smoke pass.
+
+See [M3 architecture](m3-managed-context.md).
+
+## M4: Recursive Child RLM
+
+**Outcome:** `rlm_query` can start an official, depth-bounded child DSH Session
+that owns its own `rlm_eval` kernel below the cap, while the leaf at the cap
+retains one-shot tool denial.
+
+**Exit criteria:**
+
+1. `maxDepth=1` preserves the delivered M1/M2 behavior.
+2. Depth-2 and depth-3 paths complete through official DSH Subagent/Session
+   APIs and return visible text to the parent Python cell.
+3. The official depth cap prevents deeper children and provider capability
+   absence fails before partial recursive work begins.
+4. Parent, child, sibling, and descendant Python namespaces are isolated while
+   official Session metadata/logs preserve lineage.
+5. Timeout, cancellation, protocol failure, and plugin unload quiesce the whole
+   owned descendant branch without affecting unrelated Sessions.
+6. Unit/integration tests, independent review, CI, remote-main read-back, and
+   clean DSV4-FVE depth-2/depth-3 Profile smokes pass.
+
+See [M4 architecture](m4-recursive-child-rlm.md).
+
+## Conditional milestones after M4
 
 These milestones have no predetermined order. Start one only when the matching
 trigger in [Future extensions](future-extensions.md) is real.
@@ -58,8 +101,6 @@ trigger in [Future extensions](future-extensions.md) is real.
 | Milestone | Completion outcome |
 |---|---|
 | F1 Snapshot recovery | Restore supported variables after kernel loss and report skipped values |
-| F2 Recursive child RLM | A child Session iterates within a depth limit and returns text |
-| F3 Managed context sources | Load large text from stable file/attachment handles without model copying |
 | F4 Batched query | Bounded, ordered, cancellable concurrent queries |
 | F5 Second kernel | A second implementation passes the same end-to-end loop |
 | F6 External consumer | Jobs, UI, or swarm reuse the runtime without creating a second authority loop |

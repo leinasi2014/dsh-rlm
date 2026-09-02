@@ -1,4 +1,4 @@
-# dsh-rlm Core Architecture
+# dsh-rlm Core and M3/M4 Architecture
 
 > English | [简体中文](architecture.zh-CN.md)
 
@@ -23,9 +23,11 @@ DSH Agent Loop
   -> the Agent calls rlm_eval again or gives the final answer
 ```
 
-V1 does not include a public Service, Storage Domain, run ID, checkpoint,
-restore, `rlm_spawn`, recursive child RLM, Provider framework, background jobs,
-UI, Workflow, or Team.
+The delivered V1 baseline does not include a public Service, Storage Domain,
+run ID, checkpoint, restore, `rlm_spawn`, Provider framework, background jobs,
+UI, Workflow, or Team. Managed context and recursive child RLM have now been
+promoted into the ordered M3 and M4 contracts below; they are not part of the
+already-delivered V1 behavior.
 
 ## 2. DSH boundary
 
@@ -300,7 +302,35 @@ surface. An unknown Provider, Python startup failure, or Provider that cannot
 deny the RLM tool must fail explicitly rather than silently switching
 implementation.
 
-## 9. First acceptance scenario
+## 9. Ordered M3 and M4 target
+
+M3 and M4 extend the same single-tool path without changing the DSH authority
+boundary:
+
+```text
+M3: rlm_eval(code, contextPath?)
+      -> kernel atomically loads protected context from an absolute UTF-8 file
+
+M4: kernel -> rlm_query(prompt)
+      -> depth-bounded official child DSH Session
+      -> child owns its own rlm_eval kernel when below maxDepth
+      -> leaf denies rlm_eval at maxDepth
+```
+
+- [M3 Managed Context architecture](m3-managed-context.md) freezes loading,
+  atomicity, limits, errors, and Session isolation.
+- [M4 Recursive Child RLM architecture](m4-recursive-child-rlm.md) freezes
+  official depth authority, per-Session kernels, and descendant quiescence.
+- [M3/M4 development contract](m3-m4-development-contract.md) freezes the
+  docs-first, M3-before-M4, TDD, review, Git, dogfood, and live gates.
+- The [interactive target diagram](dsh-rlm-architecture.html) is generated from
+  the tracked [Archify source](dsh-rlm-architecture.archify.json).
+
+Storage, snapshots, continuable spawn, batch queries, and a second runtime
+remain out of scope. M3 must merge and pass its clean-Profile acceptance before
+M4 production work starts.
+
+## 10. First acceptance scenario
 
 In a real DSH Profile:
 

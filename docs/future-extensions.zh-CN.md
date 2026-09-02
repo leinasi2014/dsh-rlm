@@ -5,6 +5,10 @@
 本文件不是 V1 待办清单。只有 [核心架构](architecture.zh-CN.md) 的真实 Profile
 闭环通过后，且下表触发条件已经出现，才添加对应能力。
 
+托管上下文与递归子 RLM 已经获得被接受的需求证据，不再是条件项；它们成为
+有序的 [M3 与 M4](milestones.zh-CN.md) 契约。下表从 M4 之后仍需证据触发的
+能力开始。
+
 ## 不变边界
 
 无论增加什么功能，都保持：
@@ -22,9 +26,7 @@
 |---|---|---|---|
 | 手动 reset | 用户需要主动清空变量或释放内核 | 给 `rlm_eval` 增加 `reset` 操作，或增加一个 `rlm_reset` 工具 | 只清理当前 Session，其他 Session 不受影响 |
 | Snapshot/restore | 一个被接受的用例要求在超时、崩溃或宿主重启后保留变量 | Python 序列化支持的 globals；临时文件原子替换；失败时明确丢失 | kill 后重启能恢复支持的变量，并报告跳过项 |
-| 递归子 RLM | one-shot query 无法完成一个已复现的复杂子问题 | 允许子 Session 拥有自己的内核和 `rlm_eval`；按血缘限制深度 | `max_depth > 1` 的子 RLM 能独立迭代并向父 cell 返回文本 |
 | Continuable spawn | 一个任务必须在父 cell 结束后继续工作 | 使用官方 continuable Subagent 和 inbox；不把答案塞进 handle | 父 cell 结束后子 Session 继续，并由官方 Session 路径交付结果 |
-| 受管上下文来源 | 官方提供通用文本附件或工作区句柄，或本地路径不满足真实用例 | 在现有 runtime 前增加一个来源解析器，不建立 Context Domain | 大文本由稳定句柄进入 Python，不经过模型复制全文 |
 | 跨宿主持久 Session | 用户要求插件重启后继续同一 RLM 会话 | 只持久化恢复所需元数据和 snapshot 引用 | 重启后同一 Session 能恢复；版本不匹配明确失败 |
 | Batched query | 顺序 query 的实测延迟成为瓶颈 | 一个有并发上限的 `rlm_query_batched` | 批量结果保持输入顺序，取消能终止全部子调用 |
 | 第二个内核实现 | container 或 remote kernel 已开始实现 | 从现有 runtime 抽取最小 `KernelDriver` 接口 | 本地与第二实现通过同一闭环场景 |
