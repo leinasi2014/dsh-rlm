@@ -122,7 +122,17 @@ When dispatching through the local DSH control surface:
 
 ## 6. Repair loop
 
-### 6.1 Reproduce first
+Issue repair uses an architecture-contract-first TDD loop:
+
+```text
+CONTRACT -> RED -> GREEN -> REFACTOR -> FULL GATE -> CANDIDATE
+```
+
+Freeze the observable behavior, state/ownership boundary, failure semantics,
+limits, compatibility, and non-goals before RED. RED and GREEN may be separate
+agent turns, but they belong to one Issue and one candidate lineage.
+
+### 6.1 RED: reproduce first
 
 Before editing production code, obtain at least one of:
 
@@ -132,8 +142,15 @@ Before editing production code, obtain at least one of:
 - a typed error or authoritative terminal-state mismatch;
 - a candidate-bound real DSH observation.
 
+The regression must fail on the accepted base or current predecessor candidate
+for the intended reason. A test that is already green, fails for setup noise, or
+exercises only a mock when the defect crosses a real boundary is not RED.
+
 No reproduction means no implementation. Preserve a failed real attempt as
-evidence; never patch that running attempt into a passing state.
+evidence; never patch that running attempt into a passing state. When automation
+is not yet possible, preserve a deterministic command, process/state probe, or
+candidate-bound live observation and add the nearest useful automated regression
+as soon as the contract becomes executable.
 
 ### 6.2 Reference-first decision
 
@@ -150,7 +167,7 @@ Use authoritative upstream sources only when local and pinned references leave a
 material uncertainty. Do not copy a reference daemon, Storage model, old frame
 names, or second authority merely because it solves a similar symptom.
 
-### 6.3 Implement the smallest correction
+### 6.3 GREEN: implement the smallest correction
 
 - Change only the Issue's owned surface and acceptance behavior.
 - Prefer direct code and small private helpers over frameworks or registries.
@@ -160,7 +177,20 @@ names, or second authority merely because it solves a similar symptom.
 - Never commit `lib/`, `node_modules/`, Profiles, Session logs, credentials,
   coverage, logs, or `ref/*/source/`.
 
-### 6.4 Author proof
+Run the RED test first after the production edit. GREEN proves only the frozen
+behavior exercised by that test; it does not authorize adjacent redesign.
+
+### 6.4 REFACTOR without changing the contract
+
+- Refactor only after focused GREEN evidence exists.
+- Keep the focused regression and nearby representative checks green after each
+  structural change.
+- Do not introduce a framework, public abstraction, or future-feature scaffold
+  merely to make the repair look cleaner.
+- If refactoring changes observable behavior or reveals another defect, stop and
+  create a successor RED instead of folding it into the current proof.
+
+### 6.5 FULL GATE: author proof
 
 Every candidate runs:
 
@@ -181,7 +211,7 @@ Each materially participating agent appends its own record to the Issue's
 development-memory stream. The record names its files and semantic pointers,
 steps, evidence, and limitations; the coordinator does not impersonate authors.
 
-### 6.5 Freeze and review
+### 6.6 Freeze and review
 
 Freeze one candidate packet:
 
@@ -196,6 +226,10 @@ cause, current-architecture alignment, failure/cleanup behavior, security and
 Session isolation, reference use, regression quality, and claim ceiling.
 Blocking findings create a successor candidate. Use delta review unless the
 architecture or security boundary changed.
+
+A blocking semantic finding first becomes a new failing regression or equivalent
+repeatable observation. The author then performs a successor GREEN correction;
+the reviewer does not patch the candidate and preserve reviewer independence.
 
 ## 7. Git and PR rules
 
