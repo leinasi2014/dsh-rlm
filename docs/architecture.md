@@ -162,6 +162,31 @@ other Session kernels and globals remain intact.
   when that cell is still the current pending request.
 - Cancellation reuses the existing Kernel kill/evict path.
 
+### Bounded protocol contract (Issue #3)
+
+- Total frame budget `MAX_FRAME_BYTES = 256 * 1024` is enforced on the exact
+  serialized JSONL line **including its single terminating LF** (a CR on the
+  wire, when present, counts as part of the line). Python protocol stdout is
+  forced to LF-only (`newline="\n"`); the host counts the **untrimmed** raw
+  line and rejects any line over the budget before parsing it.
+- Content budgets are `64 * 1024` UTF-8 bytes for `prompt`, `query result`,
+  `query error message/detail`, `stdout`, `result`, and `stderr`. If a payload
+  fits the content budget but JSON escaping inflates the serialized frame
+  beyond `MAX_FRAME_BYTES`, it is re-fit against the real serialized wire
+  bytes and marked `truncated`.
+- Every truncation/cut is UTF-8 code-point safe: no split characters, no
+  U+FFFD, and a lone surrogate keeps its original U+D800 code-unit semantics.
+- Oversized frames, unterminated no-newline buffers over the budget, frames
+  that cannot make shrinking progress, and protocol faults terminate and
+  evict the kernel (namespace lost); a recoverable typed error or a bounded
+  truncated frame keeps the kernel alive.
+- Query errors carry `phase='query'` and `kind='query_error'`;
+  `frame.truncated` propagates to the public `RlmError.truncated`; `detail` is
+  surfaced as stable text (strings verbatim, arrays/objects as JSON), and the
+  tool-facing failure keeps `kind + message + Detail + [truncated]` within the
+  64 KiB budget. `PROTOCOL_VERSION` stays `1`; no protocol message, Service,
+  or framework was added.
+
 ## 8. Minimal configuration
 
 V1 needs:

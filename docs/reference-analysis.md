@@ -26,6 +26,16 @@ checkouts are read-only evidence and are not published.
 Reference RLM defaults to `max_depth = 1`, so V1 `rlm_query` is a one-shot leaf
 call. Recursive child RLM is not a prerequisite.
 
+## Bounded protocol versus references
+
+Prime Agent ships a similar REPL/JSONL/text-truncation shape, but it does not
+enforce a strict total JSONL frame budget or this Issue's per-channel content
+bounds (query prompt/result, error detail, stderr, untrimmed raw-line counting,
+LF-only wire). `alexzhang13/rlm` is a same-process local REPL and has no
+TS↔Python wire at all. The mechanism is reused from the references, but the
+strictly bounded protocol is dsh-rlm-specific hardening, and this project does
+not claim that either reference's test suite covers these boundaries.
+
 ## Rejected for V1
 
 - Prime Agent's daemon, TUI, installer, and complete repair machinery;

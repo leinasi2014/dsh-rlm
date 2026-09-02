@@ -153,6 +153,27 @@ V1 不承诺故障后恢复变量。恢复能力只有在真实使用需要时�
   `removeEventListener`，避免迟到的 abort 误杀已空闲的 kernel。
 - 取消复用 `Kernel` 的 kill/evict 路径，不新建抽象。
 
+#### 有界协议契约（Issue #3）
+
+- 总帧预算 `MAX_FRAME_BYTES = 256 * 1024` 按**实际序列化后的 JSONL 行**计，
+  包含唯一的行尾 LF（wire 上若存在 CR，也算作该行字节）。Python 协议 stdout
+  强制 LF-only（`newline="\n"`）；Host 按**未 trim 的原始行**计数，超预算的
+  行在解析前即拒绝。
+- 内容预算均为 `64 * 1024` UTF-8 字节：`prompt`、`query result`、
+  `query error message/detail`、`stdout`、`result` 与 `stderr`。若内容未超
+  内容预算、但 JSON 转义使序列化帧超过 `MAX_FRAME_BYTES`，则按真实序列化
+  wire 字节再次拟合，并标记 `truncated`。
+- 所有截断/切割均 UTF-8 / code point 安全：不切半个字符、不产生 U+FFFD，
+  孤立 surrogate 保留原始 U+D800 code-unit 语义。
+- 超长帧、超预算的无换行 buffer、无法继续缩减的帧以及协议错误会终止并
+  evict 内核（namespace 丢失）；可恢复的 typed error 或有界的截断帧则保持
+  内核存活。
+- query 错误携带 `phase='query'`、`kind='query_error'`；`frame.truncated`
+  传播到公开 `RlmError.truncated`；`detail` 以稳定文本呈现（字符串原样、
+  数组/对象保留 JSON 结构）；面向模型的工具错误保持
+  `kind + message + Detail + [truncated]` 且总字节 ≤ 64 KiB。
+  `PROTOCOL_VERSION` 保持 `1`；未新增协议消息、Service 或框架。
+
 ## 8. 最小配置
 
 V1 只需要：
