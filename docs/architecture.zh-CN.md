@@ -81,7 +81,18 @@ context = open(path, encoding="utf-8").read()
 5. 通过一条小型 JSON-lines 协议与 TypeScript 宿主通信。
 
 同一 Session 的后续 `rlm_eval` 复用该进程。插件不把凭据、Provider 对象、
-DSH Agent 或 Session 转录复制进 Python。
+DSH Agent 或 Session 转录复制进 Python。子进程只接收固定安全名环境白名单，
+而不是宿主 `process.env`：Windows 保留 `PATH`、`SystemRoot`、`WINDIR`、
+`COMSPEC`、`PATHEXT`、`SYSTEMDRIVE`、`USERPROFILE`、`TEMP`、`TMP`（大小写
+不敏感匹配，按规范名输出）；POSIX 保留 `PATH`、`HOME`、`TMPDIR`、`TEMP`、
+`TMP`、`LANG` 和精确的标准 `LC_*` 类目名；两个平台都保留公共 Python 启动项
+`PYTHONIOENCODING`、`PYTHONUTF8`、`PYTHONUNBUFFERED`、`PYTHONPATH`。不提供
+环境变量透传；自定义 `python` 命令同样使用该白名单，因此必须能通过白名单内
+`PATH` 或绝对路径解析。代理变量、`VIRTUAL_ENV`/`CONDA_*`、`PYTHONHOME`、
+`LD_LIBRARY_PATH`、`DSH_*` 与凭据类变量一律不转发。最初的环境继承缺口已在
+[Issue #7](https://github.com/leinasi2014/dsh-rlm/issues/7) 审计并修复。这属于
+凭据卫生，不是文件系统/进程/网络 sandbox：受信任的 Python 仍可读取宿主用户
+可读文件、使用网络、启动进程，也可能读取磁盘上的凭据文件。
 
 ## 5. `rlm_query` 往返
 

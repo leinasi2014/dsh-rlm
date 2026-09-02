@@ -126,6 +126,52 @@ function truncateUtf8(s: string, limit: number): string {
   return out
 }
 
+// ---- Issue #7: fixed safe-name allowlist for the Python kernel env ----
+
+const KERNEL_ENV_WIN32 = [
+  'PATH', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'SYSTEMDRIVE', 'USERPROFILE', 'TEMP', 'TMP',
+] as const
+
+const KERNEL_ENV_POSIX = [
+  'PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG',
+  'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES', 'LC_COLLATE', 'LC_MONETARY', 'LC_NUMERIC', 'LC_TIME',
+  'LC_PAPER', 'LC_NAME', 'LC_ADDRESS', 'LC_TELEPHONE', 'LC_MEASUREMENT', 'LC_IDENTIFICATION',
+] as const
+
+const KERNEL_ENV_PYTHON = [
+  'PYTHONIOENCODING', 'PYTHONUTF8', 'PYTHONUNBUFFERED', 'PYTHONPATH',
+] as const
+
+/**
+ * Build the fixed safe environment for a Python kernel child (Issue #7). Only
+ * allowlisted names may cross; the child never inherits the host environment.
+ * Windows names are matched case-insensitively and emitted in the allowlist's
+ * canonical casing; POSIX names are matched exactly and no `LC_*` wildcard is
+ * applied (so a planted `LC_SECRET` cannot pass). Values absent in the host
+ * are never synthesised, and no environment value is logged.
+ */
+function collectKernelEnv(source: NodeJS.ProcessEnv, platform: NodeJS.Platform): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  if (platform === 'win32') {
+    const canonical = new Map<string, string>()
+    for (const name of [...KERNEL_ENV_WIN32, ...KERNEL_ENV_PYTHON]) {
+      canonical.set(name.toUpperCase(), name)
+    }
+    for (const [name, value] of Object.entries(source)) {
+      if (value === undefined) continue
+      const match = canonical.get(name.toUpperCase())
+      if (match !== undefined) env[match] = value
+    }
+  } else {
+    for (const name of [...KERNEL_ENV_POSIX, ...KERNEL_ENV_PYTHON]) {
+      const value = source[name]
+      if (value !== undefined) env[name] = value
+    }
+  }
+  return env
+}
+
+
 /**
  * Resolve the canonical Windows tree-kill tool. A bare `taskkill` name would
  * go through PATH, so a stripped PATH breaks cleanup and a planted CWD
@@ -298,6 +344,7 @@ class Kernel {
     const opts: SpawnOptions = {
       stdio: ['pipe', 'pipe', 'pipe'],
       windowsHide: true,
+      env: collectKernelEnv(process.env, process.platform),
     }
     if (process.platform !== 'win32') opts.detached = true
     let child: ChildProcess

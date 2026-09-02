@@ -76,9 +76,19 @@ The current Python kernel is **trusted local execution, not a sandbox**.
 `rlm_eval` can read and modify files and start processes with the DSH host user's
 permissions. Do not enable it for untrusted users, prompts, or workspaces.
 
-The public audit also confirmed that the child Python process currently inherits
-the host environment. Until that issue is fixed, do not start DSH with secrets in
-ambient environment variables when this plugin is enabled. See [SECURITY.md](SECURITY.md).
+The child Python process receives only a fixed safe-name allowlist instead of
+the full host environment. On Windows: `PATH`, `SystemRoot`, `WINDIR`,
+`COMSPEC`, `PATHEXT`, `SYSTEMDRIVE`, `USERPROFILE`, `TEMP`, and `TMP`. On
+POSIX: `PATH`, `HOME`, `TMPDIR`, `TEMP`, `TMP`, `LANG`, and the exact standard
+`LC_*` category names. Both platforms also keep the public Python startup items
+`PYTHONIOENCODING`, `PYTHONUTF8`, `PYTHONUNBUFFERED`, and `PYTHONPATH`. No
+arbitrary environment passthrough is supported, and a custom `python` command
+uses the same filtered environment. Proxy variables, `VIRTUAL_ENV`/`CONDA_*`,
+`PYTHONHOME`, `LD_LIBRARY_PATH`, `DSH_*`, and credential-looking variables are
+never forwarded. This is credential hygiene, not a sandbox: trusted Python can
+still read host-user-readable files, access the network, start processes, and
+read on-disk credential files. See [SECURITY.md](SECURITY.md) and
+[Issue #7](https://github.com/leinasi2014/dsh-rlm/issues/7).
 
 ## Requirements
 

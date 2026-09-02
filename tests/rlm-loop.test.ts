@@ -3099,3 +3099,89 @@ test('M2 Issue#2: a queued eval whose budget expires before dequeue is rejected 
     await runtime.dispose()
   }
 })
+
+// ---- M2 Issue #7: Python environment isolation (RED contract tests) ----
+
+/**
+ * Run `fn` with the given host environment keys set to fixed fake strings,
+ * then restore every key to its previous value (or delete it) in `finally`.
+ * Only booleans cross back from Python; values are never logged.
+ */
+function withHostEnvMap<T>(values: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  const previous = new Map<string, string | undefined>()
+  for (const [name, value] of Object.entries(values)) {
+    previous.set(name, process.env[name])
+    process.env[name] = value
+  }
+  return fn().finally(() => {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+  })
+}
+
+test('M2 Issue#7: synthetic credential/proxy sentinels are visible in Host but absent from Python', async () => {
+  const sentinels: Record<string, string> = {
+    DSH_RLM_TEST_SECRET_7: 'not-a-real-secret',
+    DEEPSEEK_API_KEY: 'not-a-real-secret',
+    HTTPS_PROXY: 'not-a-real-secret',
+  }
+  await withHostEnvMap(sentinels, async () => {
+    const runtime = rt()
+    try {
+      const names = Object.keys(sentinels)
+      const out = await runtime.eval('issue7-sentinels', {
+        code: 'import os\n[' + names.map((n) => JSON.stringify(n) + ' in os.environ').join(', ') + ']',
+      })
+      // Host must see the fake sentinels; Python must not inherit them.
+      for (const name of names) {
+        assert.ok(process.env[name] !== undefined, 'host must see the fake sentinel ' + name)
+      }
+      assert.equal(out.result, '[' + names.map(() => 'False').join(', ') + ']')
+    } finally {
+      runtime.dispose()
+    }
+  })
+})
+
+test('M2 Issue#7: unknown locale-looking LC_RLM_SECRET_7 is absent while safe startup variables remain usable', async () => {
+  const standard = [
+    'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_COLLATE', 'LC_MESSAGES', 'LC_MONETARY', 'LC_NUMERIC', 'LC_TIME',
+  ]
+  await withHostEnvMap({ LC_RLM_SECRET_7: 'not-a-real-secret' }, async () => {
+    const runtime = rt()
+    try {
+      const hostStandard = standard.filter((n) => process.env[n] !== undefined)
+      const out = await runtime.eval('issue7-locale', {
+        code: [
+          'import os, sys, tempfile',
+          "unknown_absent = 'LC_RLM_SECRET_7' not in os.environ",
+          'path_ok = bool(os.environ.get("PATH"))',
+          'temp_ok = bool(tempfile.gettempdir())',
+          'encoding_ok = bool(sys.getfilesystemencoding())',
+          'host_standard = ' + JSON.stringify(hostStandard),
+          'standard_ok = all(n in os.environ for n in host_standard)',
+          '[unknown_absent, path_ok, temp_ok, encoding_ok, standard_ok]',
+        ].join('\n'),
+      })
+      assert.equal(out.result, '[True, True, True, True, True]')
+    } finally {
+      runtime.dispose()
+    }
+  })
+})
+
+test('M2 Issue#7: explicit custom python command obeys the same filtered env', async () => {
+  await withHostEnvMap({ DSH_RLM_TEST_SECRET_7: 'not-a-real-secret' }, async () => {
+    const runtime = createRlmRuntime(undefined, { python: pythonCmd })
+    try {
+      const out = await runtime.eval('issue7-custom', {
+        code: "import os\n['DSH_RLM_TEST_SECRET_7' in os.environ, 1 + 1]",
+      })
+      assert.equal(out.result, '[False, 2]')
+    } finally {
+      runtime.dispose()
+    }
+  })
+})

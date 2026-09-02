@@ -74,8 +74,16 @@ GitHub Issues 是实时工作权威。
 DSH 宿主用户权限读取/修改文件并启动进程。不要为不可信用户、prompt 或
 workspace 启用本插件。
 
-公开审查还确认 Python 子进程当前继承宿主环境。该问题修复前，启用插件时不要
-通过 ambient environment variables 向 DSH 注入秘密。参见 [SECURITY.md](SECURITY.md)。
+Python 子进程只接收固定的安全名白名单，而不是完整宿主环境。Windows 保留
+`PATH`、`SystemRoot`、`WINDIR`、`COMSPEC`、`PATHEXT`、`SYSTEMDRIVE`、
+`USERPROFILE`、`TEMP`、`TMP`；POSIX 保留 `PATH`、`HOME`、`TMPDIR`、`TEMP`、
+`TMP`、`LANG` 和精确的标准 `LC_*` 类目名。两个平台都额外保留公共 Python
+启动项 `PYTHONIOENCODING`、`PYTHONUTF8`、`PYTHONUNBUFFERED`、`PYTHONPATH`。
+不支持任意环境变量透传；自定义 `python` 命令也使用同一过滤环境。代理变量、
+`VIRTUAL_ENV`/`CONDA_*`、`PYTHONHOME`、`LD_LIBRARY_PATH`、`DSH_*` 与凭据类
+变量一律不转发。这是凭据卫生，不是 sandbox：受信任的 Python 仍可读取宿主
+用户可读文件、访问网络、启动进程，也可能读取磁盘上的凭据文件。参见
+[SECURITY.md](SECURITY.md) 与 [Issue #7](https://github.com/leinasi2014/dsh-rlm/issues/7)。
 
 ## 环境要求
 
