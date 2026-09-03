@@ -84,7 +84,7 @@ class Kernel {
 async function ready(k: Kernel): Promise<void> {
   const frame = await k.next()
   assert.equal(frame.type, 'ready')
-  assert.equal(frame.version, 2)
+  assert.equal(frame.version, 3)
 }
 
 test('M1A: persistent globals and top-level await across cells', async () => {
@@ -1565,7 +1565,7 @@ test('M2 Issue#1 successor: startup and cell share one total deadline', async ()
       `import time
 time.sleep(0.5)
 import sys, json
-sys.stdout.write(json.dumps({"type": "ready", "version": 2}) + "\\n")
+sys.stdout.write(json.dumps({"type": "ready", "version": 3}) + "\\n")
 sys.stdout.flush()`,
       async (pidFile) => {
         const start = Date.now()
