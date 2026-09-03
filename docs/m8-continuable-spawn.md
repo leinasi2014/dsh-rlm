@@ -5,9 +5,9 @@
 ## Outcome
 
 M8 adds the smallest Python-facing path for work that must outlive its initiating
-RLM cell. `rlm_spawn(prompt)` returns an opaque durable child Session id after
+RLM cell. `rlm_spawn(prompt)` returns an opaque, non-snapshottable child handle after
 the official DSH continuable manager accepts the initial inbox message.
-`rlm_followup(child_id, prompt)` accepts a later message into that same child’s
+`rlm_followup(handle, prompt)` accepts a later message into that same child’s
 official FIFO inbox. Neither helper returns a child answer.
 
 The child’s selected report and eventual settlement reach the direct parent only
@@ -23,15 +23,19 @@ upstream checkout remains the freshness authority. M8 reuses the existing
 depth policy, and official Session lineage.
 
 `rlm_spawn(prompt)` and `rlm_followup(child_id, prompt)` are private kernel
-helpers, not DSH tools. Inputs are exact strings; `child_id` is a validated
-opaque id returned by a previous successful spawn in the same Session. Invalid
-input fails before child admission. A handle carries no result, runnable object,
+helpers, not DSH tools. Prompts are exact strings. `rlm_spawn` returns a private
+Python capability object whose child id is unreadable to user code and whose type
+is deliberately unsupported by M5 snapshots. `rlm_followup` accepts only that
+same live-kernel capability. Invalid, copied, restored, or cross-Session values
+fail before child admission. A handle carries no result, runnable object,
 credential, parent Agent, or cross-Session authority.
 
 ## State and failure semantics
 
-1. Spawn succeeds only after DSH durably accepts the initial inbox message; it
-   returns the child id and records it Session-locally as an owned handle.
+1. Spawn succeeds only after DSH accepts the initial inbox message. That
+   acceptance does not promise the message has reached the Session log yet; the
+   durable child and log observation are verified asynchronously through DSH.
+   It returns the private capability only in the live parent kernel.
 2. The parent cell may then end. The continuable child keeps its official durable
    identity and its inbox owns later message order, including cold resume.
 3. A follow-up succeeds only when the official manager admits it; cancellation
@@ -43,8 +47,9 @@ credential, parent Agent, or cross-Session authority.
 5. M6 reset drops only Python state and handles for that parent Session. It does
    not secretly destroy an accepted official child. Plugin unload uses official
    continuable-descendant draining; a failed drain is surfaced, never hidden.
-6. M5 snapshots never serialize live handles, child ids, inbox state, or child
-   bookkeeping. Kernel recovery cannot manufacture authority over a child.
+6. M5 rejects the capability type as unsupported, so no live handle, child id,
+   inbox state, or child bookkeeping is serialized. Kernel recovery cannot
+   manufacture authority over a child.
 
 ## Limits and non-goals
 
@@ -59,9 +64,10 @@ depth/tool filtering applies to continuable creation; exact-depth leaves deny
 
 1. **RED:** accepted M7 has no continuable Python helper and a clean Profile
    cannot create an official continuable child from `rlm_eval`.
-2. **GREEN:** a Python cell creates one child, receives only its opaque id, then
-   finishes; official logs prove the child Session and initial inbox entry exist.
-3. **GREEN:** a later cell sends one follow-up to that id; official child inbox
+2. **GREEN:** a Python cell creates one child, receives only its opaque capability,
+   then finishes; after DSH's asynchronous log publication, official logs prove
+   the child Session and initial inbox entry exist.
+3. **GREEN:** a later cell sends one follow-up through that capability; official child inbox
    ordering and parent/child lineage are observable without a plugin queue.
 4. **Lifecycle:** malformed/cross-Session handles dispatch nothing; cancellation,
    reset, recovery, unload, and child report/settlement preserve the stated

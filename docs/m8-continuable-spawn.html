@@ -5032,7 +5032,7 @@
         <path data-edge-from="kernel" data-edge-to="bridge" data-edge-label="opaque spawn request" data-edge-key="1" data-edge-id="spawn" data-composition-points="485,316;560,316" d="M 485 316 L 560 316" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="bridge" data-edge-to="manager" data-edge-label="startContinuable" data-edge-key="2" data-edge-id="start" data-composition-points="765,316;840,316" d="M 765 316 L 840 316" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
         <path data-edge-from="manager" data-edge-to="child" data-edge-label="initial inbox message" data-edge-key="3" data-edge-id="activate" data-composition-points="1065,316;1090,316" d="M 1065 316 L 1090 316" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="kernel" data-edge-to="manager" data-edge-label="followup(child id, content)" data-edge-key="4" data-edge-id="followup" data-composition-points="387.5,352;387.5,376;952.5,376;952.5,352" d="M 387.5 352 L 387.5 368 Q 387.5 376 395.5 376 L 944.5 376 Q 952.5 376 952.5 368 L 952.5 352" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="kernel" data-edge-to="manager" data-edge-label="followup(capability, content)" data-edge-key="4" data-edge-id="followup" data-composition-points="387.5,352;387.5,376;952.5,376;952.5,352" d="M 387.5 352 L 387.5 368 Q 387.5 376 395.5 376 L 944.5 376 Q 952.5 376 952.5 368 L 952.5 352" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
         <path data-edge-from="child" data-edge-to="inbox" data-edge-label="reportFrom / settlement" data-edge-key="5" data-edge-id="report" data-composition-points="1195,352;1195,376;1089,376;1089,546;1065,546" d="M 1195 352 L 1195 368 Q 1195 376 1187 376 L 1097 376 Q 1089 376 1089 384 L 1089 538 Q 1089 546 1081 546 L 1065 546" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
         <path data-edge-from="inbox" data-edge-to="parent" data-edge-label="next official turn" data-edge-key="6" data-edge-id="parent-read" data-composition-points="840,546;130,546;130,352" d="M 840 546 L 138 546 Q 130 546 130 538 L 130 352" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
 
@@ -5049,15 +5049,15 @@
         <text data-detail="context" x="130" y="330" class="t-muted" font-size="9" text-anchor="middle">official Session and Agent loop</text>
         </g>
 
-        <g id="node-kernel" data-node-id="kernel" data-node-label="Session Python Kernel" tabindex="0" role="button" aria-label="Focus Session Python Kernel, rlm_spawn / rlm_followup only, dsh-rlm scope: Python helpers reuse the existing host bridge" aria-pressed="false" data-node-kind="backend" data-node-sublabel="rlm_spawn / rlm_followup only" data-node-context="dsh-rlm scope: Python helpers reuse the existing host bridge">
-          <title>Session Python Kernel · rlm_spawn / rlm_followup only · dsh-rlm scope: Python helpers reuse the existing host bridge</title>
+        <g id="node-kernel" data-node-id="kernel" data-node-label="Session Python Kernel" tabindex="0" role="button" aria-label="Focus Session Python Kernel, non-snapshottable spawn capability, dsh-rlm scope: Python helpers reuse the existing host bridge" aria-pressed="false" data-node-kind="backend" data-node-sublabel="non-snapshottable spawn capability" data-node-context="dsh-rlm scope: Python helpers reuse the existing host bridge">
+          <title>Session Python Kernel · non-snapshottable spawn capability · dsh-rlm scope: Python helpers reuse the existing host bridge</title>
           <rect x="290" y="280" width="195" height="72" rx="6" class="c-mask"/>
           <rect x="290" y="280" width="195" height="72" rx="6" class="c-backend" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="backend" class="semantic-sigil s-backend" transform="translate(296 286) scale(0.6875)">
             <path d="M6 3 3 8l3 5M10 3l3 5-3 5"/>
           </g>
           <text data-node-label="" data-detail-anchor="" x="387.5" y="314" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Session Python Kernel</text>
-        <text data-detail="context" x="387.5" y="330" class="t-muted" font-size="9" text-anchor="middle">rlm_spawn / rlm_followup only</text>
+        <text data-detail="context" x="387.5" y="330" class="t-muted" font-size="9" text-anchor="middle">non-snapshottable spawn capability</text>
         </g>
 
         <g id="node-bridge" data-node-id="bridge" data-node-label="Existing RLM Host Bridge" tabindex="0" role="button" aria-label="Focus Existing RLM Host Bridge, one rlm_eval tool; no second loop, dsh-rlm scope: Python helpers reuse the existing host bridge" aria-pressed="false" data-node-kind="backend" data-node-sublabel="one rlm_eval tool; no second loop" data-node-context="dsh-rlm scope: Python helpers reuse the existing host bridge">
@@ -5126,9 +5126,9 @@
           <rect x="1022.1" y="356" width="110.8" height="14" rx="3" class="c-mask"/>
           <text x="1077.5" y="366" class="t-muted" font-size="8" text-anchor="middle">initial inbox message</text>
         </g>
-        <g data-detail="context" data-edge-from="kernel" data-edge-to="manager" data-edge-label="followup(child id, content)" data-edge-key="4" data-edge-id="followup">
-          <rect x="600.2" y="356" width="139.6" height="14" rx="3" class="c-mask"/>
-          <text x="670" y="366" class="t-messagebus" font-size="8" text-anchor="middle">followup(child id, content)</text>
+        <g data-detail="context" data-edge-from="kernel" data-edge-to="manager" data-edge-label="followup(capability, content)" data-edge-key="4" data-edge-id="followup">
+          <rect x="595.4" y="356" width="149.2" height="14" rx="3" class="c-mask"/>
+          <text x="670" y="366" class="t-messagebus" font-size="8" text-anchor="middle">followup(capability, content)</text>
         </g>
         <g data-detail="context" data-edge-from="child" data-edge-to="inbox" data-edge-label="reportFrom / settlement" data-edge-key="5" data-edge-id="report">
           <rect x="1081.8" y="356" width="120.39999999999999" height="14" rx="3" class="c-mask"/>
@@ -5367,7 +5367,7 @@
         </div>
         <ul>
           <li>&bull; A child outlives the initiating Python cell</li>
-          <li>&bull; The handle is an opaque child id, never a result</li>
+          <li>&bull; The handle is a non-snapshottable capability, never a result</li>
         </ul>
       </div>
 

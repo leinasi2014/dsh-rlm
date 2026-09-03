@@ -11,7 +11,7 @@ memory, review, Git, CI, and clean-Profile gates.
 1. Prove installed DSH types and fresh official source agree on the required
    continuable/inbox operations; freeze and independently review this contract.
 2. Add a smallest kernel/Profile RED proving the absent helper on accepted M7.
-3. Add protocol/runtime REDs for opaque same-Session handles, no-dispatch
+3. Add protocol/runtime REDs for non-snapshottable opaque same-Session capabilities, no-dispatch
    invalid/cross-Session input, post-cell continuation, follow-up FIFO, official
    inbox report/settlement, M4 depth, M5/M6 boundaries, and unload draining.
 4. Implement only the necessary private helpers and existing host bridge frames.
@@ -25,7 +25,8 @@ memory, review, Git, CI, and clean-Profile gates.
 - RED must fail because M7 lacks the M8 helper, not because a mock hides DSH.
 - Tests must observe real Python JSON-lines behavior and official DSH child /
   parent Session records; a fake manager supplements but never replaces them.
-- The Profile test must prove the child survives the originating cell, receives
+- The Profile test must wait for official asynchronous Session-log publication,
+  then prove the child survives the originating cell, receives
   a later follow-up, and reports through the parent inbox without an answer
   handle or cross-Session privilege.
 - Every contributor records its own Issue #39 evidence in development memory;
