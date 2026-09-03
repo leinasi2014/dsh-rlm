@@ -238,8 +238,9 @@ they are serialized by a minimal per-Session FIFO queue:
   `frame.truncated` propagates to the public `RlmError.truncated`; `detail` is
   surfaced as stable text (strings verbatim, arrays/objects as JSON), and the
   tool-facing failure keeps `kind + message + Detail + [truncated]` within the
-  64 KiB budget. `PROTOCOL_VERSION` stays `1`; no protocol message, Service,
-  or framework was added.
+  64 KiB budget. M3 raises `PROTOCOL_VERSION` to `2` so an old kernel cannot
+  silently ignore managed-context descriptors; no public Service or framework
+  was added.
 
 ### Query/child lifecycle (Issue #4)
 
@@ -295,6 +296,8 @@ V1 is configured through one `Config` schema (`ConfigSchema` in
 - `maxStdout` (default `65536`): integer `1024..262144` UTF-8 bytes of cell stdout;
 - `maxResult` (default `65536`): integer `1024..262144` UTF-8 bytes of the cell result;
 - `maxQueries` (default `16`): integer `1..4096` `rlm_query` calls per cell.
+- `maxContextBytes` (default `67108864`): integer `1048576..1073741824` source
+  bytes for one kernel-managed UTF-8 file context.
 
 The validated config object is passed directly to `createRlmRuntime`; the
 plugin adds no environment passthrough and no registry or Provider/framework

@@ -156,13 +156,17 @@ test('M1E: fresh isolated DSH Profile runs the real RLM loop', { timeout: 15 * 6
 
     // 3. Local UTF-8 Chinese fixture, referenced by absolute path.
     const fixture = path.join(home, 'fixture.txt')
-    fs.writeFileSync(fixture, '这是中文夹具内容。深度求索强化学习闭环。\n第二行：模型通过 rlm_eval 读取本文件到上下文。\n', 'utf8')
+    const fixtureSentinel = 'M3_CONTEXT_LOADER_SENTINEL_4b9d8e'
+    const fixtureText = '这是中文夹具内容。深度求索强化学习闭环。\n' + fixtureSentinel + '。\n第二行：模型通过 rlm_eval 读取本文件到上下文。\n'
+    fs.writeFileSync(fixture, fixtureText, 'utf8')
 
     const task = [
       'You are running an RLM acceptance test. Use the rlm_eval tool to complete EXACTLY these two steps.',
       '',
-      'Step 1: call rlm_eval ONCE with this exact Python source (do not change it):',
-      '    content = open(r\'' + fixture + '\', encoding=\'utf-8\').read()',
+      'Step 1: call rlm_eval ONCE with contextPath set exactly to this absolute file path:',
+      '    ' + fixture,
+      'Use this exact Python source (do not change it):',
+      '    content = context',
       '    q = await rlm_query(\'In one short English sentence, answer: what is 2 plus 2? Reply with only that sentence.\')',
       '    answer = content + \' || \' + q',
       '    answer',
@@ -170,7 +174,7 @@ test('M1E: fresh isolated DSH Profile runs the real RLM loop', { timeout: 15 * 6
       'The rlm_query call spawns a one-shot subagent whose final text is returned; the Python cell must continue after it.',
       '',
       'Step 2: call rlm_eval a SECOND time with this exact Python source:',
-      '    len(content) + len(q)',
+      '    len(context) + len(q)',
       '',
       'After both steps succeed, your final reply must be a single line beginning with RLM_ACCEPT_OK followed by the step-2 integer result.',
     ].join('\n')
@@ -204,6 +208,18 @@ test('M1E: fresh isolated DSH Profile runs the real RLM loop', { timeout: 15 * 6
     }
     assert.ok(main, 'no depth-0 main agent session was persisted')
     assert.ok(mainCalls >= 2, 'expected at least two rlm_eval tool calls in the main session, got ' + mainCalls)
+    const rlmArguments = toolCallArguments(main, 'rlm_eval')
+    const managedCall = rlmArguments.find((args) => (
+      args !== null
+      && typeof args === 'object'
+      && !Array.isArray(args)
+      && (args as { contextPath?: unknown }).contextPath === fixture
+    ))
+    assert.ok(managedCall, 'no persisted rlm_eval call carried the exact contextPath')
+    assert.ok(
+      rlmArguments.every((args) => !JSON.stringify(args).includes(fixtureSentinel)),
+      'managed loader copied the unique fixture sentinel into model-visible rlm_eval arguments',
+    )
 
     // Point 2 & 3: the step-1 result carries the Chinese fixture INTO context and,
     // after await rlm_query, the subagent's sentence after the ' || ' separator
@@ -340,6 +356,38 @@ function countToolCalls(logText: string, toolName: string): number {
   return count
 }
 
+/** Parsed model-visible arguments from official persisted tool/call events. */
+function toolCallArguments(logText: string, toolName: string): unknown[] {
+  const out: unknown[] = []
+  for (const raw of logText.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (line === '') continue
+    let row: unknown
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (
+      row === null
+      || typeof row !== 'object'
+      || Array.isArray(row)
+      || (row as { type?: unknown }).type !== 'tool/call'
+    ) continue
+    const data = (row as { data?: unknown }).data
+    if (data === null || typeof data !== 'object' || Array.isArray(data)) continue
+    if ((data as { name?: unknown }).name !== toolName) continue
+    const rawArgs = (data as { arguments?: unknown }).arguments
+    if (typeof rawArgs !== 'string') continue
+    try {
+      out.push(JSON.parse(rawArgs))
+    } catch {
+      // A malformed persisted argument is not trusted evidence.
+    }
+  }
+  return out
+}
+
 test('M2 Issue#18: isolated smoke deterministically pins agent-default-model to DSV4-FVE', () => {
   const unrelated = 'agent-presets:\n  defaultPreset: dsh\nproviders:\n  deepseek:\n    models:\n      - DeepSeek-V4-Flash-Vision-Exp\n'
   const lfInput = unrelated + 'agent-default-model:\n  provider: qwen38-207\n  model: qwen38-flash-next\n  reasoningEffort: max\n'
@@ -396,4 +444,6 @@ test('M2 Issue#18: isolated smoke deterministically pins agent-default-model to 
   assert.equal(countToolCalls(officialCall, 'rlm_eval'), 1, 'official nested data.name record must count as one')
   assert.equal(countToolCalls(wrongTopLevel, 'rlm_eval'), 0, 'top-level name without data.name must not count')
   assert.equal(countToolCalls(officialCall + '{"type":"tool/call","data":{\n', 'rlm_eval'), 1, 'torn non-JSON line must be ignored')
+  assert.deepEqual(toolCallArguments(officialCall, 'rlm_eval'), [{}])
+  assert.deepEqual(toolCallArguments(mentionJsonl, 'rlm_eval'), [])
 })

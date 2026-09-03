@@ -84,7 +84,7 @@ class Kernel {
 async function ready(k: Kernel): Promise<void> {
   const frame = await k.next()
   assert.equal(frame.type, 'ready')
-  assert.equal(frame.version, 1)
+  assert.equal(frame.version, 2)
 }
 
 test('M1A: persistent globals and top-level await across cells', async () => {
@@ -916,9 +916,10 @@ test('M1C: rlm_eval is registered only when the plugin is enabled', () => {
     // Minimal input: only code, and it is required. defineTool normalizes
     // `parameters` to JSON Schema ({ type, properties, required }).
     assert.equal(enabled.registered[0].parameters.type, 'object')
-    assert.deepEqual(Object.keys(enabled.registered[0].parameters.properties), ['code'])
+    assert.deepEqual(Object.keys(enabled.registered[0].parameters.properties), ['code', 'contextPath'])
     assert.equal(enabled.registered[0].parameters.properties.code.type, 'string')
     assert.ok(enabled.registered[0].parameters.required.includes('code'))
+    assert.ok(!enabled.registered[0].parameters.required.includes('contextPath'))
     // The runtime teardown effect is mounted.
     assert.equal(typeof enabled.teardown, 'function')
     assert.equal(enabled.label, 'rlm runtime teardown')
@@ -1463,7 +1464,7 @@ test('M2 Issue#1 successor: startup and cell share one total deadline', async ()
       `import time
 time.sleep(0.5)
 import sys, json
-sys.stdout.write(json.dumps({"type": "ready", "version": 1}) + "\\n")
+sys.stdout.write(json.dumps({"type": "ready", "version": 2}) + "\\n")
 sys.stdout.flush()`,
       async (pidFile) => {
         const start = Date.now()
@@ -1908,7 +1909,7 @@ test('M2 Issue#3: host counts the untrimmed raw line, so a whitespace-padded rea
         // content plus CRLF, so onData sees the newline in a later data event
         // and reaches the trim-then-count path. The host must count the
         // untrimmed raw line and reject before ever accepting ready.
-        'payload = json.dumps({"type": "ready", "version": 1, "python": "x"}).encode("utf-8")',
+        'payload = json.dumps({"type": "ready", "version": 2, "python": "x"}).encode("utf-8")',
         'content = payload + b" " * (262143 - len(payload))',
         'sys.stdout.buffer.write(content[:250000])',
         'sys.stdout.buffer.flush()',
@@ -3221,7 +3222,7 @@ test('M2 Issue#7: explicit custom python command obeys the same filtered env', a
 
 // ---- M2 Issue #6: runtime config schema, propagation, and system prompt lifecycle ----
 
-test('M2 Issue#6: Config schema defaults and range-validates the five runtime settings', async () => {
+test('M2 Issue#6 / M3 Issue#24: Config schema defaults and range-validates runtime settings', async () => {
   const rt = (await import('../src/runtime.ts')) as { ConfigSchema?: any }
   assert.equal(typeof rt.ConfigSchema, 'function', 'Issue #6 ConfigSchema must be exported from runtime.ts')
   const S: any = rt.ConfigSchema
@@ -3233,6 +3234,7 @@ test('M2 Issue#6: Config schema defaults and range-validates the five runtime se
   assert.equal(parsed.maxStdout, 65536)
   assert.equal(parsed.maxResult, 65536)
   assert.equal(parsed.maxQueries, 16)
+  assert.equal(parsed.maxContextBytes, 67108864)
   assert.throws(() => S({ python: '' }))
   assert.throws(() => S({ timeout: 999 }))
   assert.throws(() => S({ timeout: 3600001 }))
@@ -3244,6 +3246,9 @@ test('M2 Issue#6: Config schema defaults and range-validates the five runtime se
   assert.throws(() => S({ maxQueries: 0 }))
   assert.throws(() => S({ maxQueries: 4097 }))
   assert.equal(S({ maxQueries: 4096 }).maxQueries, 4096)
+  assert.throws(() => S({ maxContextBytes: 1048575 }))
+  assert.throws(() => S({ maxContextBytes: 1073741825 }))
+  assert.equal(S({ maxContextBytes: 1073741824 }).maxContextBytes, 1073741824)
 })
 
 test('M2 Issue#6: parsed runtime settings propagate end to end (maxQueries limit observable)', async () => {
@@ -3301,4 +3306,211 @@ test('M2 Issue#6: teardown removes the prompt section with the tool and releases
   assert.equal(m.registered.length, 0)
   assert.equal(m.sections.length, 0)
   assert.ok(released != null && typeof (released as any).then === 'function', 'teardown must return the runtime dispose barrier')
+})
+
+// ---- M3 Issue #24: kernel-owned managed file context ----
+
+test('M3 Issue#24: a contextPath loads once into one session kernel and persists there', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-context-'))
+  const contextPath = path.join(dir, 'context.txt')
+  const contents = 'managed context\n'
+  writeFileSync(contextPath, contents, 'utf8')
+  const runtime = rt({ maxContextBytes: 1024 * 1024 })
+  try {
+    const first = await runtime.eval('m3-managed', {
+      code: 'context',
+      contextPath,
+    })
+    assert.equal(first.result, contents)
+
+    const later = await runtime.eval('m3-managed', { code: 'context_meta["bytes"]' })
+    assert.equal(later.result, String(Buffer.byteLength(contents, 'utf8')))
+
+    await assert.rejects(
+      runtime.eval('m3-other-session', { code: 'context' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+  } finally {
+    await runtime.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('M3 Issue#24: invalid sources are typed and atomic, and cell mutation cannot poison managed context', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-atomic-'))
+  const contextPath = path.join(dir, 'context.txt')
+  const nonUtf8Path = path.join(dir, 'not-utf8.bin')
+  writeFileSync(contextPath, 'trusted context', 'utf8')
+  writeFileSync(nonUtf8Path, Buffer.from([0xff, 0xfe]))
+  const runtime = rt({ maxContextBytes: 1024 * 1024 })
+  try {
+    await runtime.eval('m3-atomic', { code: 'context', contextPath })
+    await runtime.eval('m3-atomic', { code: 'context = "poison"\ncontext_meta["bytes"] = 0' })
+    const restored = await runtime.eval('m3-atomic', { code: 'context + ":" + str(context_meta["bytes"])' })
+    assert.equal(restored.result, 'trusted context:15')
+
+    for (const rejectedPath of ['relative.txt', nonUtf8Path, dir]) {
+      await assert.rejects(
+        runtime.eval('m3-atomic', { code: 'context', contextPath: rejectedPath }),
+        (err: unknown) => err instanceof RlmError && err.kind === 'context' && err.phase === 'context',
+      )
+      const preserved = await runtime.eval('m3-atomic', { code: 'context' })
+      assert.equal(preserved.result, 'trusted context')
+    }
+  } finally {
+    await runtime.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('M3 Issue#24: tool forwards contextPath and reports source-limit rejection without replacing prior context', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-tool-'))
+  const contextPath = path.join(dir, 'context.txt')
+  const tooLargePath = path.join(dir, 'too-large.txt')
+  writeFileSync(contextPath, 'safe', 'utf8')
+  writeFileSync(tooLargePath, 'oversized', 'utf8')
+  const m = makeMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true, maxContextBytes: 4 })
+  try {
+    const tool = m.registered[0]
+    const first = await tool.execute({ code: 'context', contextPath }, makeExec('m3-tool'))
+    assert.equal(first.result, 'safe')
+    await assert.rejects(
+      tool.execute({ code: 'context', contextPath: tooLargePath }, makeExec('m3-tool')),
+      (err: unknown) => err instanceof Error && /rlm_eval failed \(context\)/.test(err.message),
+    )
+    const preserved = await tool.execute({ code: 'context' }, makeExec('m3-tool'))
+    assert.equal(preserved.result, 'safe')
+  } finally {
+    m.teardown?.()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('M3 Issue#24: a FIFO is rejected before opening and preserves the live kernel', async (t) => {
+  if (process.platform === 'win32') {
+    t.skip('Windows has no portable filesystem FIFO for this black-box regression')
+    return
+  }
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-fifo-'))
+  const contextPath = path.join(dir, 'context.txt')
+  const fifoPath = path.join(dir, 'source.fifo')
+  writeFileSync(contextPath, 'stable', 'utf8')
+  const fifo = spawnSync(pythonCmd, ['-c', 'import os, sys; os.mkfifo(sys.argv[1])', fifoPath], { encoding: 'utf8' })
+  assert.equal(fifo.status, 0, 'could not create FIFO: ' + fifo.stderr)
+  const runtime = rt({ timeout: 500 })
+  try {
+    const before = await runtime.eval('m3-fifo', { code: 'import os\nos.getpid()', contextPath })
+    await assert.rejects(
+      runtime.eval('m3-fifo', { code: 'context', contextPath: fifoPath }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'context',
+    )
+    const after = await runtime.eval('m3-fifo', { code: 'import os\nstr(os.getpid()) + ":" + context' })
+    assert.equal(after.result, String(before.result) + ':stable')
+  } finally {
+    await runtime.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('M3 Issue#24: an in-read source mutation is rejected before atomic publication', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-race-'))
+  const contextPath = path.join(dir, 'context.txt')
+  writeFileSync(contextPath, 'before', 'utf8')
+  const script = [
+    'import importlib.util, os, sys',
+    'spec = importlib.util.spec_from_file_location("rlm_kernel_under_test", sys.argv[1])',
+    'module = importlib.util.module_from_spec(spec)',
+    'assert spec.loader is not None',
+    'spec.loader.exec_module(module)',
+    'path = sys.argv[2]',
+    'original_fstat = os.fstat',
+    'calls = 0',
+    'def raced_fstat(fd):',
+    '    global calls',
+    '    calls += 1',
+    '    if calls == 2:',
+    '        with open(path, "ab") as source: source.write(b"!")',
+    '    return original_fstat(fd)',
+    'os.fstat = raced_fstat',
+    'try:',
+    '    module.RlmKernel._read_context(path, 1024)',
+    'except module.RlmContextError:',
+    '    raise SystemExit(0)',
+    'raise SystemExit(1)',
+  ].join('\n')
+  try {
+    const result = spawnSync(pythonCmd, ['-c', script, kernelPath, contextPath], { encoding: 'utf8' })
+    assert.equal(result.status, 0, 'read-race must be a typed context failure; stderr: ' + result.stderr)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('M3 Issue#24: a short descriptor read is rejected instead of publishing partial context', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-short-read-'))
+  const contextPath = path.join(dir, 'context.txt')
+  writeFileSync(contextPath, 'complete source', 'utf8')
+  const script = [
+    'import importlib.util, os, sys',
+    'spec = importlib.util.spec_from_file_location("rlm_kernel_under_test", sys.argv[1])',
+    'module = importlib.util.module_from_spec(spec)',
+    'assert spec.loader is not None',
+    'spec.loader.exec_module(module)',
+    'path = sys.argv[2]',
+    'original_read = os.read',
+    'calls = 0',
+    'def short_read(fd, size):',
+    '    global calls',
+    '    calls += 1',
+    '    if calls == 1: return original_read(fd, 1)',
+    '    return b""',
+    'os.read = short_read',
+    'try:',
+    '    module.RlmKernel._read_context(path, 1024)',
+    'except module.RlmContextError:',
+    '    raise SystemExit(0)',
+    'raise SystemExit(1)',
+  ].join('\n')
+  try {
+    const result = spawnSync(pythonCmd, ['-c', script, kernelPath, contextPath], { encoding: 'utf8' })
+    assert.equal(result.status, 0, 'short read must be a typed context failure; stderr: ' + result.stderr)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('M3 Issue#24: a post-read pathname identity change is rejected before publication', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-path-race-'))
+  const contextPath = path.join(dir, 'context.txt')
+  const replacementPath = path.join(dir, 'replacement.txt')
+  writeFileSync(contextPath, 'original', 'utf8')
+  writeFileSync(replacementPath, 'replacement', 'utf8')
+  const script = [
+    'import importlib.util, os, sys',
+    'spec = importlib.util.spec_from_file_location("rlm_kernel_under_test", sys.argv[1])',
+    'module = importlib.util.module_from_spec(spec)',
+    'assert spec.loader is not None',
+    'spec.loader.exec_module(module)',
+    'path, replacement = sys.argv[2], sys.argv[3]',
+    'original_lstat = os.lstat',
+    'calls = 0',
+    'def replaced_lstat(target):',
+    '    global calls',
+    '    calls += 1',
+    '    if calls == 2: return original_lstat(replacement)',
+    '    return original_lstat(target)',
+    'os.lstat = replaced_lstat',
+    'try:',
+    '    module.RlmKernel._read_context(path, 1024)',
+    'except module.RlmContextError:',
+    '    raise SystemExit(0)',
+    'raise SystemExit(1)',
+  ].join('\n')
+  try {
+    const result = spawnSync(pythonCmd, ['-c', script, kernelPath, contextPath, replacementPath], { encoding: 'utf8' })
+    assert.equal(result.status, 0, 'path replacement must be a typed context failure; stderr: ' + result.stderr)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

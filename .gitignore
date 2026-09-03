@@ -2,6 +2,8 @@ node_modules/
 lib/
 coverage/
 *.log
+__pycache__/
+*.pyc
 .DS_Store
 docs/*.visual-check.json
 

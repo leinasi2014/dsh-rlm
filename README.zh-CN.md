@@ -51,11 +51,13 @@ Loop，也不会接收 DSH Provider 或 Session 对象。
 - 每 cell query 次数限制；
 - timeout/cancel 后驱逐 kernel 并重建干净 namespace；
 - 插件 teardown 释放所拥有的 Python kernel；
+- M3 托管上下文：可选 `contextPath` 由 kernel 读取为一个有界、严格 UTF-8 的
+  常规文件，并原子发布为受保护的 `context`；
 - 离线测试和设门的真实干净 Profile 冒烟测试。
 
 ## 下一里程碑与未实现
 
-M3、M4 已排期但尚未实现：
+M3 已在当前开发分支实现，等待干净 Profile 验收；M4 仍处于计划阶段：
 
 - [M3 托管上下文](docs/m3-managed-context.zh-CN.md)；
 - [M4 递归子 RLM](docs/m4-recursive-child-rlm.zh-CN.md)。
@@ -149,9 +151,10 @@ pnpm dsh plugin --profile <profile> add -w /absolute/path/to/dsh-rlm
         maxStdout: 65536
         maxResult: 65536
         maxQueries: 16
+        maxContextBytes: 67108864
 ```
 
-以上即 schema 默认值；`provider` 默认为 `spawn`。五个运行时设置均为可选，
+以上即 schema 默认值；`provider` 默认为 `spawn`。六个运行时设置均为可选，
 由唯一 `Config` schema 校验：
 
 | 设置 | 默认 | 合法范围/单位 |
@@ -161,13 +164,15 @@ pnpm dsh plugin --profile <profile> add -w /absolute/path/to/dsh-rlm
 | `maxStdout` | `65536` | 整数 `1024..262144` UTF-8 字节（cell stdout） |
 | `maxResult` | `65536` | 整数 `1024..262144` UTF-8 字节（cell 结果） |
 | `maxQueries` | `16` | 整数 `1..4096`（每 cell 的 `rlm_query` 次数） |
+| `maxContextBytes` | `67108864` | 整数 `1048576..1073741824`（一个托管 UTF-8 上下文文件的字节数） |
 
 本仓库尚未发布 npm registry 包；这里是真实本地包安装。
 
 ## 示例
 
+调用 Agent 可以带一个绝对 `contextPath`，并运行如下 cell：
+
 ```python
-context = open(path, encoding="utf-8").read()
 draft = await rlm_query("Summarize the key evidence in this context:\n" + context)
 draft
 ```

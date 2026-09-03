@@ -43,6 +43,10 @@ execution and may still read files directly when managed loading is unnecessary.
 - Loading is atomic. Validation and decoding complete before either protected
   global changes. A managed-context error leaves the live kernel and its prior
   managed context intact.
+- The kernel rejects a non-regular source before opening it, opens with
+  nonblocking/no-follow safeguards where available, and compares the opened
+  descriptor identity before and after the read. A replacement or mutation race
+  is a typed failure, never a partial publication or stale metadata record.
 - Invalid path shape, missing/non-file targets, size overflow, invalid UTF-8,
   and read races are typed `context` errors. Cancel, hard timeout, protocol
   fault, or process failure retain the existing fatal namespace-loss rules.
