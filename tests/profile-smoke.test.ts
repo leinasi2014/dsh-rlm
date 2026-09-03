@@ -584,6 +584,99 @@ test('M7 Issue#36 RED: a fresh installed Profile returns ordered rlm_query_batch
   }
 })
 
+test('M8 Issue#39: a fresh installed Profile keeps an opaque handle across cells and admits an official child inbox follow-up', { timeout: 15 * 60_000 }, async (t) => {
+  if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the M8 continuable-spawn acceptance'); return }
+  const ambientHome = process.env.DSH_HOME
+  if (!ambientHome || !fs.existsSync(path.join(ambientHome, 'settings.yaml'))) {
+    t.skip('DSH_HOME with settings.yaml is required; it supplies the configured vLLM provider and credential refs')
+    return
+  }
+  assert.ok(fs.existsSync(BIN), 'DSH harness bin.ts not found at ' + REPO_ROOT)
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m8-spawn-'))
+  const profileDir = path.join(home, 'profiles', PROFILE)
+  fs.mkdirSync(path.join(home, 'profiles'), { recursive: true })
+  const ambientSettingsPath = path.join(ambientHome, 'settings.yaml')
+  const ambientSettingsBytes = fs.readFileSync(ambientSettingsPath)
+  const ambientCredsPath = path.join(ambientHome, '.credentials.yaml')
+  const ambientCredsBytes = fs.existsSync(ambientCredsPath) ? fs.readFileSync(ambientCredsPath) : null
+  fs.writeFileSync(path.join(home, 'settings.yaml'), replaceAgentDefaultModel(ambientSettingsBytes.toString('utf8'), LIVE_PROVIDER, LIVE_MODEL))
+  if (ambientCredsBytes !== null) fs.writeFileSync(path.join(home, '.credentials.yaml'), ambientCredsBytes)
+  const env = { DSH_HOME: home }
+  const childPrompt = 'Reply exactly M8_CONTINUABLE_CHILD_4b2d9a. Do not call tools.'
+  const followupPrompt = 'Reply exactly M8_CONTINUABLE_FOLLOWUP_9ca27e. Do not call tools.'
+  const spawnCode = `h = await rlm_spawn(${JSON.stringify(childPrompt)})\n"M8_SPAWNED"`
+  // Keep the parent Agent live long enough for the official continuation
+  // manager to route its settlement notice. DSH deliberately does not retain
+  // a notice once the direct parent Agent has already left its live registry.
+  const followupCode = `await rlm_followup(h, ${JSON.stringify(followupPrompt)})\nawait __import__("asyncio").sleep(30)\n"M8_FOLLOWED"`
+  const task = [
+    'You are validating M8 continuable spawn. Call rlm_eval exactly twice, in the stated order, with the exact Python sources below and no other rlm_eval call.',
+    '',
+    'First call:',
+    spawnCode,
+    '',
+    'Second call after the first succeeds:',
+    followupCode,
+    '',
+    'Do not use any other tool. Only if both correlated rlm_eval results succeed, reply exactly M8_CONTINUABLE_PROFILE_OK.',
+  ].join('\n')
+  try {
+    const add = runDsh(['plugin', '--profile', PROFILE, 'add', '-w', PKG_ROOT], env, REPO_ROOT, 180_000)
+    assert.equal(add.status, 0, 'dsh plugin add failed: ' + add.stderr)
+    assert.ok(fs.existsSync(path.join(profileDir, 'node_modules', 'dsh-rlm')), 'dsh-rlm not installed into the profile')
+    const manifestPath = path.join(profileDir, 'package.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    manifest.dsh = { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'] } }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+    fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), [
+      '- insert:',
+      '    - id: rlm',
+      '      name: dsh-rlm',
+      '      config:',
+      '        enabled: true',
+      '        provider: spawn',
+      '        timeout: 60000',
+      '',
+    ].join('\n'))
+
+    const run = runDsh(['--profile', PROFILE, task], env, REPO_ROOT, 12 * 60_000)
+    const outTail = run.stdout.slice(-1200)
+    assert.equal(run.status, 0, 'headless M8 journey failed before its correlated tool result: ' + outTail + ' ' + run.stderr.slice(-1200))
+    let logs = new Map<string, string>()
+    for (let attempt = 0; attempt < 25; attempt++) {
+      logs = await readSessionLogs(home)
+      const childReceivedFollowup = [...logs.values()].some((text) =>
+        JSON.parse(text.split('\n')[0]).delegationDepth === 1 && text.includes(followupPrompt))
+      const parentObservedSettlement = [...logs.values()].some((text) =>
+        JSON.parse(text.split('\n')[0]).delegationDepth === 0 && text.includes('subagent-settled'))
+      if (childReceivedFollowup && parentObservedSettlement) break
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+    const mainEntry = [...logs.entries()].find(([, text]) => JSON.parse(text.split('\n')[0]).delegationDepth === 0)
+    const main = mainEntry?.[1]
+    assert.ok(main, 'no persisted depth-0 Session log')
+    assert.equal(countToolCalls(main, 'rlm_eval'), 2, 'M8 acceptance must use exactly two ordered ordinary rlm_eval calls')
+    assert.deepEqual(toolCallArguments(main, 'rlm_eval'), [{ code: spawnCode }, { code: followupCode }], 'official Session log did not record the exact spawn/follow-up cells')
+    const outcomes = toolOutcomes(main, 'rlm_eval')
+    assert.equal(outcomes.length, 2, 'each exact rlm_eval call must have one correlated official result')
+    assert.deepEqual(outcomes.map((outcome) => outcome.result?.isError), [false, false], 'spawn and follow-up must both be admitted: ' + JSON.stringify(outcomes))
+    assert.match(outcomes[0].result?.text ?? '', /M8_SPAWNED/, 'spawn cell did not receive its non-answer acknowledgement')
+    assert.match(outcomes[1].result?.text ?? '', /M8_FOLLOWED/, 'follow-up cell did not continue after inbox admission')
+    assert.match(main, /subagent-settled/, 'official parent Session log did not record the continuable child settlement notice')
+    const children = [...logs.values()].filter((text) => JSON.parse(text.split('\n')[0]).delegationDepth === 1)
+    assert.ok(children.length >= 1, 'spawn must persist an official depth-1 child Session')
+    assert.ok(children.some((text) => text.includes(childPrompt) && text.includes(followupPrompt)), 'official child Session log did not publish both ordered inbox prompts')
+    assert.match(outTail, /M8_CONTINUABLE_PROFILE_OK/, 'headless agent did not observe both successful correlated results')
+  } finally {
+    try {
+      assert.ok(ambientSettingsBytes.equals(fs.readFileSync(ambientSettingsPath)), 'ambient settings.yaml was modified by the M8 RED smoke')
+      if (ambientCredsBytes !== null) assert.ok(ambientCredsBytes.equals(fs.readFileSync(ambientCredsPath)), 'ambient .credentials.yaml was modified by the M8 RED smoke')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  }
+})
+
 test('M1E: runtime dispose releases the Python kernel process', { timeout: 30_000 }, async (t) => {
   if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the live kernel-dispose smoke'); return }
   const { createRlmRuntime } = await import('../src/runtime.ts')

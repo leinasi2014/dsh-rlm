@@ -10,15 +10,24 @@ the official DSH continuable manager accepts the initial inbox message.
 `rlm_followup(handle, prompt)` accepts a later message into that same child’s
 official FIFO inbox. Neither helper returns a child answer.
 
-The child’s selected report and eventual settlement reach the direct parent only
-through the official DSH parent inbox and Session log. The parent Agent loop,
-not Python, decides when that inbox message becomes a turn.
+While its direct parent Agent remains live, the child’s selected report and
+eventual settlement reach that parent only through the official DSH inbox and
+Session log. A parent already removed from DSH's live registry cannot receive a
+late notice; the durable child Session is then the record. The parent Agent
+loop, not Python, decides when an accepted inbox message becomes a turn.
 
 ## Authority and API
 
-The executable authority is the installed `@deepseek-ai/dsh-subagent` types:
-`ctx.subagents.startContinuable`, `followup`, and `reportFrom`. The official
-upstream checkout remains the freshness authority. M8 reuses the existing
+The executable authority is the exact loaded DSH Profile runtime, checked
+against the installed `@deepseek-ai/dsh-subagent` types and the official fresh
+upstream checkout. `startContinuable` remains the public creation operation.
+For a host-protocol FIFO follow-up, current upstream intentionally exposes the
+official `queueHostSubagentPrompt` adapter from its `internal` entry rather than
+the older public `ctx.subagents.followup` method. The plugin uses that exact
+process-stable host adapter; it creates no queue and does not impersonate an
+Agent sender. The adapter is checked before child admission as well as before
+follow-up: a host which exposes only the older `0.1.1-rc.2` public declarations
+is explicitly unsupported for M8 and receives no continuable child. M8 reuses the existing
 `rlm_eval` tool, Session-keyed Python kernel, host child-work lifecycle, M4
 depth policy, and official Session lineage.
 
@@ -42,8 +51,8 @@ credential, parent Agent, or cross-Session authority.
    before admission leaves no ghost message. The manager, not the plugin,
    serializes child turns.
 4. A child report/settlement is never injected into an old or later Python cell.
-   It is attributed and delivered by `reportFrom`/official settlement handling to
-   the direct parent’s inbox.
+   Official settlement handling attributes and delivers it to a still-live
+   direct parent inbox; it does not recreate an already disposed parent.
 5. M6 reset drops only Python state and handles for that parent Session. It does
    not secretly destroy an accepted official child. Plugin unload uses official
    continuable-descendant draining; a failed drain is surfaced, never hidden.

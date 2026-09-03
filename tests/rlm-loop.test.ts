@@ -126,6 +126,76 @@ test('M1A: rlm_query request/response resumes the cell', async () => {
   }
 })
 
+test('M8 Issue#39 RED: a live opaque handle routes only a later follow-up', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'h = await rlm_spawn("first child turn")\nrepr(h)' })
+    const spawn = await k.next()
+    assert.equal(spawn.type, 'spawn')
+    assert.equal(spawn.prompt, 'first child turn')
+    assert.equal(typeof spawn.capability, 'string')
+    assert.ok(String(spawn.capability).length >= 32)
+    assert.equal(spawn.child_id, undefined)
+    k.send({ type: 'spawn_result', id: k.id(spawn) })
+    const created = await k.next()
+    assert.equal(created.type, 'result')
+    assert.equal(created.result, '<rlm child handle>')
+    k.send({ type: 'eval', id: 2, code: 'await rlm_followup(h, "second child turn")\n"parent continued"' })
+    const followup = await k.next()
+    assert.equal(followup.type, 'followup')
+    assert.equal(followup.capability, spawn.capability)
+    assert.equal(followup.child_id, undefined)
+    assert.equal(followup.prompt, 'second child turn')
+    k.send({ type: 'followup_result', id: k.id(followup) })
+    const completed = await k.next()
+    assert.equal(completed.type, 'result')
+    assert.equal(completed.result, 'parent continued')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M8 Issue#39 successor RED: a cross-kind live response is a fatal protocol violation', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'await rlm_query("must remain text")' })
+    const request = await k.next()
+    assert.equal(request.type, 'query')
+    k.send({ type: 'spawn_result', id: k.id(request), child_id: 'forged-child-id' })
+    const exit = await Promise.race([
+      k.exit,
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('cross-kind response did not terminate kernel')), 2_000)),
+    ])
+    assert.notEqual(exit, 0)
+  } finally {
+    await k.close()
+  }
+})
+
+test('M8 Issue#39 successor RED: Python introspection cannot read a raw child id', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    const rawChildId = 'raw-child-id-must-not-leak'
+    k.send({ type: 'eval', id: 1, code: 'h = await rlm_spawn("conceal id")\nrepr(h)' })
+    const spawn = await k.next()
+    assert.equal(spawn.type, 'spawn')
+    // Current candidate accepts this legacy raw-id reply; the successor must
+    // ignore it and retain only a local opaque capability token.
+    k.send({ type: 'spawn_result', id: k.id(spawn), child_id: rawChildId })
+    const created = await k.next()
+    assert.equal(created.type, 'result')
+    k.send({ type: 'eval', id: 2, code: 'rlm_spawn.__self__._child_handles[h]' })
+    const inspected = await k.next()
+    assert.equal(inspected.type, 'result')
+    assert.notEqual(inspected.result, rawChildId)
+  } finally {
+    await k.close()
+  }
+})
+
 test('M7 Issue#36 RED: a batch admits four queries and returns ordered text', async () => {
   const k = new Kernel()
   try {
@@ -1055,6 +1125,9 @@ interface MockCtx {
   ctx: any
   registered: any[]
   starts: { provider: string; request: any }[]
+  continuableStarts: any[]
+  followups: any[]
+  drained: any[]
   run: any
   teardown: (() => void) | undefined
   label: string | undefined
@@ -1068,6 +1141,9 @@ function makeMockCtx(options: {
 } = {}): MockCtx {
   const registered: any[] = []
   const starts: { provider: string; request: any }[] = []
+  const continuableStarts: any[] = []
+  const followups: any[] = []
+  const drained: any[] = []
   const sections: any[] = []
   const run: any = {
     disposed: false,
@@ -1076,7 +1152,7 @@ function makeMockCtx(options: {
   }
   // Build the mutable mock first; ctx.effect writes straight onto it (not a
   // closure local, which the returned object would capture as stale undefined).
-  const m: MockCtx = { ctx: undefined as any, registered, starts, run, teardown: undefined, label: undefined, sections }
+  const m: MockCtx = { ctx: undefined as any, registered, starts, continuableStarts, followups, drained, run, teardown: undefined, label: undefined, sections }
   m.ctx = {
     tools: {
       register(def: any) {
@@ -1086,7 +1162,10 @@ function makeMockCtx(options: {
     },
     subagents: {
       getProvider() {
-        return { capabilities: options.providerCapabilities ?? { depthLimit: true, toolFilter: true } }
+        return {
+          capabilities: options.providerCapabilities ?? { depthLimit: true, toolFilter: true },
+          prepareContinuable: async () => ({ seed: undefined }),
+        }
       },
       async start(provider: string, request: any) {
         if (options.enforceDepthLimit) {
@@ -1097,6 +1176,18 @@ function makeMockCtx(options: {
         }
         starts.push({ provider, request })
         return run
+      },
+      async startContinuable(spec: any) {
+        continuableStarts.push(spec)
+        return { childId: 'm8-continuable-child', messageId: 'm8-initial-message' }
+      },
+      [Symbol.for('dsh.subagent.deliverPrompt')](parent: any, childId: string, content: any[], source: any, signal: AbortSignal, delivery: string) {
+        assert.equal(delivery, 'queue', 'M8 uses the official FIFO host-prompt adapter')
+        followups.push({ parent, childId, content, options: { source, signal } })
+        return Promise.resolve('m8-followup-message')
+      },
+      async drainContinuableDescendants(parents: any[]) {
+        drained.push(parents)
       },
     },
     // Issue #6: real Context augmentation from @deepseek-ai/dsh-system-prompt
@@ -1195,6 +1286,85 @@ test('M1D: the one-shot child request filters out rlm_eval and uses the calling 
     assert.equal(m.run.disposed, true)
   } finally {
     m.teardown?.()
+  }
+})
+
+test('M8 Issue#39: the existing tool routes an opaque handle through official continuable inbox calls', async () => {
+  const m = makeMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn' })
+  const tool = m.registered[0]
+  const exec = { agent: makeAgent('m8-parent'), signal: new AbortController().signal }
+  try {
+    const spawned = await tool.execute({ code: 'h = await rlm_spawn("initial")\nrepr(h)' }, exec)
+    assert.equal(spawned.result, '<rlm child handle>')
+    assert.equal(m.continuableStarts.length, 1)
+    assert.equal(m.continuableStarts[0].provider, 'spawn')
+    assert.equal(m.continuableStarts[0].request.parent, exec.agent)
+    assert.deepEqual(m.continuableStarts[0].request.prompt, [{ type: 'text', text: 'initial' }])
+    assert.deepEqual(m.continuableStarts[0].request.toolFilter, { deny: ['rlm_eval'] })
+
+    const followed = await tool.execute({ code: 'await rlm_followup(h, "later")\n"parent continued"' }, exec)
+    assert.equal(followed.result, 'parent continued')
+    assert.equal(m.followups.length, 1)
+    assert.equal(m.followups[0].parent, exec.agent)
+    assert.equal(m.followups[0].childId, 'm8-continuable-child')
+    assert.deepEqual(m.followups[0].content, [{ type: 'text', text: 'later' }])
+    assert.deepEqual(m.followups[0].options.source, {
+      kind: 'coordinator', form: 'relay', senderSessionId: 'm8-parent',
+    })
+  } finally {
+    await m.teardown?.()
+  }
+  assert.deepEqual(m.drained, [[exec.agent]])
+})
+
+test('M8 Issue#39 successor RED: an adapter-less host rejects spawn before child admission', async () => {
+  const m = makeMockCtx()
+  delete m.ctx.subagents[Symbol.for('dsh.subagent.deliverPrompt')]
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn' })
+  const tool = m.registered[0]
+  try {
+    await assert.rejects(
+      tool.execute({ code: 'await rlm_spawn("must not admit")' }, makeExec('m8-adapterless')),
+      (err: unknown) => err instanceof Error
+        && (err as Error & { kind?: string; phase?: string }).kind === 'query'
+        && (err as Error & { kind?: string; phase?: string }).phase === 'query'
+        && /official continuable inbox adapter/i.test(err.message),
+    )
+    assert.equal(m.continuableStarts.length, 0)
+  } finally {
+    await m.teardown?.()
+  }
+})
+
+test('M8 Issue#39: foreign handles dispatch nothing and M5 never checkpoints a live capability', async () => {
+  const runtime = rt({ snapshotRecovery: true, timeout: 5_000 })
+  let spawned = 0
+  let followed = 0
+  try {
+    const created = await runtime.eval('m8-snapshot', {
+      code: 'h = await rlm_spawn("snapshot child")\n"created"',
+      onSpawn: async () => {
+        spawned += 1
+        return 'm8-snapshot-child'
+      },
+    })
+    assert.equal(created.result, 'created')
+    assert.equal(spawned, 1)
+    assert.ok(created.recovery?.skipped?.some((entry) => /h: unsupported _RlmChildHandle/.test(entry)))
+    await assert.rejects(
+      runtime.eval('m8-snapshot', {
+        code: 'await rlm_followup(object(), "must not send")',
+        onFollowup: async () => { followed += 1 },
+      }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'query' && /live child handle/.test(err.message),
+    )
+    assert.equal(followed, 0)
+    await assert.rejects(runtime.eval('m8-snapshot', { code: 'import os\nos._exit(1)' }))
+    const restored = await runtime.eval('m8-snapshot', { code: '"h" in globals()' })
+    assert.equal(restored.result, 'False')
+  } finally {
+    await runtime.dispose()
   }
 })
 

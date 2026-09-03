@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { delegationDepthOf, type SubagentRun, type SubagentResult } from '@deepseek-ai/dsh-subagent'
+import { SessionId } from '@deepseek-ai/dsh-session'
 
 const KERNEL_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -31,6 +32,30 @@ const MAX_QUERY_RESULT_BYTES = 64 * 1024
 const STDERR_TRUNCATED_MARKER = ' [stderr truncated]'
 const MAX_QUERY_ERROR_BYTES = 64 * 1024
 const QUERY_ERROR_TRUNCATED_MARKER = ' [query error truncated]'
+/**
+ * Official DSH host-prompt adapter key. In current DSH this is exported from
+ * `@deepseek-ai/dsh-subagent/internal`; spelling the process-stable key here
+ * keeps this external plugin compatible with the exact loaded host even when
+ * its published type package is one release behind the checked source.
+ */
+const DELIVER_SUBAGENT_PROMPT = Symbol.for('dsh.subagent.deliverPrompt')
+
+interface HostPromptDeliverer {
+  [DELIVER_SUBAGENT_PROMPT](parent: Agent, childId: unknown, content: unknown[], source: unknown, signal: AbortSignal, delivery: 'queue' | 'steer'): Promise<unknown>
+}
+
+/**
+ * Gate M8 admission on the loaded host's official continuable-inbox adapter.
+ * Checking before `startContinuable` prevents an unsupported host from leaving
+ * Python with a capability for a child it can never follow up.
+ */
+function requireHostPromptAdapter(ctx: Context): HostPromptDeliverer[typeof DELIVER_SUBAGENT_PROMPT] {
+  const deliver = (ctx.subagents as unknown as Partial<HostPromptDeliverer>)[DELIVER_SUBAGENT_PROMPT]
+  if (typeof deliver !== 'function') {
+    throw new RlmError('query', 'DSH host does not expose the official continuable inbox adapter', { phase: 'query' })
+  }
+  return deliver
+}
 
 /**
  * Cap one query-error text field to a total of at most `limit` UTF-8 bytes
@@ -260,6 +285,10 @@ export interface RlmCodeEvalInput extends RlmEvalCommon {
    * and disposes the active one-shot child before the cell settles.
    */
   onQuery?: (prompt: string, signal: AbortSignal) => Promise<string>
+  /** Admit one official continuable child and return its host-private id. */
+  onSpawn?: (prompt: string, signal: AbortSignal) => Promise<string>
+  /** Admit one official FIFO follow-up for a host-private child id. */
+  onFollowup?: (childId: string, prompt: string, signal: AbortSignal) => Promise<void>
   reset?: never
 }
 
@@ -270,6 +299,8 @@ export interface RlmResetInput extends RlmEvalCommon {
   contextPath?: never
   timeout?: never
   onQuery?: never
+  onSpawn?: never
+  onFollowup?: never
 }
 
 export type RlmEvalInput = RlmCodeEvalInput | RlmResetInput
@@ -324,6 +355,8 @@ interface PendingEval {
   maxQueries: number
   timeout: number
   onQuery: ((prompt: string, signal: AbortSignal) => Promise<string>) | undefined
+  onSpawn: ((prompt: string, signal: AbortSignal) => Promise<string>) | undefined
+  onFollowup: ((childId: string, prompt: string, signal: AbortSignal) => Promise<void>) | undefined
   queries: number
   timer: ReturnType<typeof setTimeout> | undefined
   signal: AbortSignal | undefined
@@ -388,6 +421,8 @@ class Kernel {
   private restoreSnapshot: boolean
   private readonly maxSnapshotBytes: number
   private retainCheckpoint = true
+  /** Kernel capability token -> official child id. Never sent back to Python. */
+  private continuableChildren = new Map<string, string>()
   onExit: ((k: Kernel) => void) | null = null
 
   constructor(key: string, config: RlmRuntimeConfig, snapshot?: { path: string; restore: boolean; maxBytes: number }) {
@@ -516,6 +551,12 @@ class Kernel {
       case 'query':
         this.onQuery(frame)
         return
+      case 'spawn':
+        this.onSpawn(frame)
+        return
+      case 'followup':
+        this.onFollowup(frame)
+        return
       case 'result':
         this.onResult(frame)
         return
@@ -586,54 +627,110 @@ class Kernel {
       })
       .catch((err) => {
         if (this.exited || this.disposed || this.pending !== p) return
-        try {
-          // A rejection is untrusted: message/detail/detailed getters and
-          // toString may throw, so every read goes through non-throwing
-          // helpers. The cell must always get a typed query error rather than
-          // an unhandled rejection with a hanging cell.
-          const source = err instanceof Error ? err : undefined
-          const rawMessage = safeErrorText(err)
-          const detailRaw = safeReadField(source, 'detail') ?? safeReadField(source, 'detailed')
-          const rawDetail = safeDetailText(detailRaw)
-          const m = capQueryErrorText(rawMessage, MAX_QUERY_ERROR_BYTES)
-          const d = capQueryErrorText(rawDetail, MAX_QUERY_ERROR_BYTES)
-          let response: Frame = {
-            type: 'error',
-            id: qid,
-            phase: 'query',
-            kind: 'query_error',
-            message: m.text,
-          }
-          if (d.text.length > 0) response.detail = d.text
-          // Fit the real serialized wire budget for message then detail, so a
-          // control-character error payload (budget-fine raw, sixfold when
-          // serialized) is truncated here instead of protocol-killing the kernel.
-          let truncated = m.truncated || d.truncated
-          const fitMessage = this.fitFrameTextField(response, 'message', true)
-          if (fitMessage.truncated) {
-            response = { ...response, message: fitMessage.text }
-            truncated = true
-          }
-          if (d.text.length > 0) {
-            const fitDetail = this.fitFrameTextField(response, 'detail', true)
-            if (fitDetail.truncated) {
-              response = { ...response, detail: fitDetail.text }
-              truncated = true
-            }
-          }
-          if (truncated) response.truncated = true
-          this.write(response)
-        } catch {
-          // Absolute last resort: never leave the cell hanging on a query.
-          this.write({
-            type: 'error',
-            id: qid,
-            phase: 'query',
-            kind: 'query_error',
-            message: 'query handler failed',
-          })
-        }
+        this.writeOperationError(qid, err)
       })
+  }
+
+  /** Return one bounded typed bridge failure to the active Python request. */
+  private writeOperationError(id: number, err: unknown): void {
+    try {
+      const source = err instanceof Error ? err : undefined
+      const rawMessage = safeErrorText(err)
+      const detailRaw = safeReadField(source, 'detail') ?? safeReadField(source, 'detailed')
+      const rawDetail = safeDetailText(detailRaw)
+      const m = capQueryErrorText(rawMessage, MAX_QUERY_ERROR_BYTES)
+      const d = capQueryErrorText(rawDetail, MAX_QUERY_ERROR_BYTES)
+      let response: Frame = { type: 'error', id, phase: 'query', kind: 'query_error', message: m.text }
+      if (d.text.length > 0) response.detail = d.text
+      let truncated = m.truncated || d.truncated
+      const fitMessage = this.fitFrameTextField(response, 'message', true)
+      if (fitMessage.truncated) {
+        response = { ...response, message: fitMessage.text }
+        truncated = true
+      }
+      if (d.text.length > 0) {
+        const fitDetail = this.fitFrameTextField(response, 'detail', true)
+        if (fitDetail.truncated) {
+          response = { ...response, detail: fitDetail.text }
+          truncated = true
+        }
+      }
+      if (truncated) response.truncated = true
+      this.write(response)
+    } catch {
+      this.write({ type: 'error', id, phase: 'query', kind: 'query_error', message: 'query handler failed' })
+    }
+  }
+
+  private onSpawn(frame: Frame): void {
+    const p = this.pending
+    const id = frame.id
+    const capability = frame.capability
+    if (!p || typeof id !== 'number' || typeof capability !== 'string' || capability.length === 0 || byteLength(capability) > MAX_QUERY_ERROR_BYTES) {
+      this.handleExit(new RlmError('protocol', 'spawn frame without an active numeric request id and bounded capability'))
+      return
+    }
+    if (this.continuableChildren.has(capability)) {
+      this.writeOperationError(id, new Error('duplicate continuable child capability'))
+      return
+    }
+    const onSpawn = p.onSpawn
+    if (!onSpawn) {
+      this.write({ type: 'error', id, phase: 'query', kind: 'query_unhandled', message: 'rlm_spawn called but no spawn handler is configured' })
+      return
+    }
+    const work: Promise<string | undefined> = Promise.resolve().then(() => {
+      if (this.exited || this.disposed || this.pending !== p) return undefined
+      return onSpawn(String(frame.prompt ?? ''), this.childSignal(p))
+    })
+    p.childWorks.push(work)
+    void work.then((childId) => {
+      if (childId === undefined || this.exited || this.disposed || this.pending !== p) return
+      if (childId.length === 0 || byteLength(childId) > MAX_QUERY_ERROR_BYTES) {
+        this.writeOperationError(id, new Error('continuable child id is invalid'))
+        return
+      }
+      // The durable official id stays exclusively in this host-local map.
+      // Python sees only its opaque object and can send its capability token
+      // back on a later follow-up frame.
+      this.continuableChildren.set(capability, childId)
+      this.write({ type: 'spawn_result', id })
+    }).catch((err) => {
+      if (this.exited || this.disposed || this.pending !== p) return
+      this.writeOperationError(id, err)
+    })
+  }
+
+  private onFollowup(frame: Frame): void {
+    const p = this.pending
+    const id = frame.id
+    const capability = frame.capability
+    if (!p || typeof id !== 'number' || typeof capability !== 'string' || capability.length === 0 || byteLength(capability) > MAX_QUERY_ERROR_BYTES) {
+      this.handleExit(new RlmError('protocol', 'followup frame without an active numeric request id and bounded capability'))
+      return
+    }
+    const onFollowup = p.onFollowup
+    if (!onFollowup) {
+      this.write({ type: 'error', id, phase: 'query', kind: 'query_unhandled', message: 'rlm_followup called but no follow-up handler is configured' })
+      return
+    }
+    const childId = this.continuableChildren.get(capability)
+    if (!childId) {
+      this.writeOperationError(id, new Error('unknown or expired continuable child capability'))
+      return
+    }
+    const work: Promise<void> = Promise.resolve().then(() => {
+      if (this.exited || this.disposed || this.pending !== p) return undefined
+      return onFollowup(childId, String(frame.prompt ?? ''), this.childSignal(p))
+    })
+    p.childWorks.push(work)
+    void work.then(() => {
+      if (this.exited || this.disposed || this.pending !== p) return
+      this.write({ type: 'followup_result', id })
+    }).catch((err) => {
+      if (this.exited || this.disposed || this.pending !== p) return
+      this.writeOperationError(id, err)
+    })
   }
 
   /**
@@ -783,6 +880,7 @@ class Kernel {
     const err = new RlmError('cancel', message)
     this.retainCheckpoint = false
     this.exited = true
+    this.continuableChildren.clear()
     this.settling = true
     this.kill()
     if (!this.cellFinish) this.cellFinish = this.finishCell(p, undefined, err)
@@ -791,6 +889,7 @@ class Kernel {
   private handleExit(err: RlmError): void {
     if (this.exited) return
     this.exited = true
+    this.continuableChildren.clear()
     this.settling = true
     if (!this.readyDone) {
       this.readyDone = true
@@ -922,6 +1021,8 @@ class Kernel {
       maxQueries: this.config.maxQueries,
       timeout,
       onQuery: input.onQuery,
+      onSpawn: input.onSpawn,
+      onFollowup: input.onFollowup,
       queries: 0,
       timer: undefined,
       signal: input.signal,
@@ -1084,6 +1185,7 @@ class Kernel {
     this.disposed = true
     this.retainCheckpoint = false
     this.exited = true
+    this.continuableChildren.clear()
     this.settling = true
     // A dispose during the ready handshake must settle the waiting eval; the
     // startup waiters share the ready promise, so rejecting it unblocks them.
@@ -1170,8 +1272,8 @@ class RlmRuntimeImpl implements RlmRuntime {
       throw new RlmError('closed', 'runtime is disposed')
     }
     if (isManualReset(input)) {
-      if (input.code !== undefined || input.contextPath !== undefined || input.timeout !== undefined || input.onQuery !== undefined) {
-        throw new RlmError('eval', 'reset input must not include code, contextPath, timeout, or onQuery')
+      if (input.code !== undefined || input.contextPath !== undefined || input.timeout !== undefined || input.onQuery !== undefined || input.onSpawn !== undefined || input.onFollowup !== undefined) {
+        throw new RlmError('eval', 'reset input must not include code, contextPath, timeout, onQuery, onSpawn, or onFollowup')
       }
     } else if (typeof input.code !== 'string' || input.reset !== undefined) {
       throw new RlmError('eval', 'code input must contain code and must not include reset')
@@ -1493,6 +1595,58 @@ async function runQuery(
   }
 }
 
+/** Admit a continuable child through DSH; its durable id never reaches user Python. */
+async function runSpawn(
+  ctx: Context,
+  provider: string,
+  parent: Agent,
+  prompt: string,
+  signal: AbortSignal,
+  maxDepth: number,
+): Promise<string> {
+  requireHostPromptAdapter(ctx)
+  const selected = ctx.subagents.getProvider(provider)
+  if (selected === undefined) {
+    throw new RlmError('query', `rlm_spawn provider "${provider}" is not registered`, { phase: 'query' })
+  }
+  if (!selected.capabilities.depthLimit || !selected.capabilities.toolFilter || !selected.prepareContinuable) {
+    throw new RlmError('query', `rlm_spawn provider "${provider}" must support continuable depthLimit and toolFilter`, { phase: 'query' })
+  }
+  const childDepth = delegationDepthOf(parent) + 1
+  const started = await ctx.subagents.startContinuable({
+    provider,
+    label: 'rlm continuable child',
+    request: {
+      prompt: [{ type: 'text', text: prompt }],
+      parent,
+      maxDepth,
+      ...(childDepth === maxDepth ? { toolFilter: { deny: [TOOL_NAME] } } : {}),
+    },
+    signal,
+  })
+  return String(started.childId)
+}
+
+/** Admit one later message through the official child inbox; no plugin queue exists. */
+async function runFollowup(
+  ctx: Context,
+  parent: Agent,
+  childId: string,
+  prompt: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const deliver = requireHostPromptAdapter(ctx)
+  await deliver.call(
+    ctx.subagents,
+    parent,
+    SessionId(childId),
+    [{ type: 'text', text: prompt }],
+    { kind: 'coordinator', form: 'relay', senderSessionId: parent.id },
+    signal,
+    'queue',
+  )
+}
+
 interface RlmEvalValue {
   stdout: string
   result?: string
@@ -1524,6 +1678,7 @@ export function registerRlmPlugin(
   const provider = config.provider ?? 'spawn'
   const maxDepth = config.maxDepth ?? DEFAULT_MAX_DEPTH
   const runtime = createRlmRuntime(ctx, config)
+  const continuableParents = new Set<Agent>()
 
   const disposeSection = ctx.systemPrompt.section({
     name: 'tool:' + TOOL_NAME,
@@ -1534,6 +1689,8 @@ export function registerRlmPlugin(
       + 'Cells may also read files by absolute paths. Top-level await is supported, and '
       + 'await rlm_query(prompt) delegates the prompt to a depth-bounded DSH subagent and returns its text. '
       + 'For independent prompts, await rlm_query_batched(prompts) starts at most four child queries and returns text in input order. '
+      + 'For work that outlives a cell, await rlm_spawn(prompt) returns an opaque live-kernel handle and '
+      + 'await rlm_followup(handle, prompt) admits a later official child-inbox turn; child reports and settlement arrive only through DSH. '
       + 'A later rlm_eval call reuses the same variables and can iterate on earlier results. '
       + 'Call rlm_eval with reset: true and no other input to discard this Session\'s RLM state before a fresh later cell.',
   })
@@ -1597,6 +1754,13 @@ export function registerRlmPlugin(
             signal: exec.signal,
             onQuery: async (prompt: string, cellSignal: AbortSignal) =>
               runQuery(ctx, provider, parent, prompt, cellSignal, maxDepth),
+            onSpawn: async (prompt: string, cellSignal: AbortSignal) => {
+              const childId = await runSpawn(ctx, provider, parent, prompt, cellSignal, maxDepth)
+              continuableParents.add(parent)
+              return childId
+            },
+            onFollowup: async (childId: string, prompt: string, cellSignal: AbortSignal) =>
+              runFollowup(ctx, parent, childId, prompt, cellSignal),
           }
           if (args.contextPath !== undefined) input.contextPath = args.contextPath
         }
@@ -1634,6 +1798,14 @@ export function registerRlmPlugin(
   ctx.effect(() => () => {
     disposeTool()
     disposeSection()
-    return runtime.dispose()
+    return (async () => {
+      try {
+        if (continuableParents.size > 0) {
+          await ctx.subagents.drainContinuableDescendants([...continuableParents])
+        }
+      } finally {
+        await runtime.dispose()
+      }
+    })()
   }, 'rlm runtime teardown')
 }
