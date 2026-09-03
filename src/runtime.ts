@@ -236,7 +236,16 @@ export const ConfigSchema: z<RlmPluginConfig> = z.object({
   maxDepth: z.natural().min(1).max(8).default(DEFAULT_MAX_DEPTH).description('Absolute DSH delegation-depth cap for recursive rlm_query children.'),
 })
 
-export interface RlmEvalInput {
+interface RlmEvalCommon {
+  /**
+   * Caller-owned cancellation. A pre-aborted signal never starts a kernel or
+   * queues work. Once a reset becomes active it owns its cleanup barrier, so a
+   * later abort cannot interrupt the deliberate deletion.
+   */
+  signal?: AbortSignal
+}
+
+export interface RlmCodeEvalInput extends RlmEvalCommon {
   /** Python source; top-level await is supported. */
   code: string
   /** Optional absolute UTF-8 regular file loaded by the session kernel. */
@@ -251,12 +260,22 @@ export interface RlmEvalInput {
    * and disposes the active one-shot child before the cell settles.
    */
   onQuery?: (prompt: string, signal: AbortSignal) => Promise<string>
-  /**
-   * Caller-owned cancellation. When it aborts, the owning session's kernel is
-   * evicted and its process tree killed; the cell is rejected with
-   * `RlmError kind='cancel'`. A pre-aborted signal never starts a kernel.
-   */
-  signal?: AbortSignal
+  reset?: never
+}
+
+/** One explicit Session-local reset on the existing model-facing tool path. */
+export interface RlmResetInput extends RlmEvalCommon {
+  reset: true
+  code?: never
+  contextPath?: never
+  timeout?: never
+  onQuery?: never
+}
+
+export type RlmEvalInput = RlmCodeEvalInput | RlmResetInput
+
+function isManualReset(input: RlmEvalInput): input is RlmResetInput {
+  return input.reset === true
 }
 
 export interface RlmEvalOutput {
@@ -845,7 +864,7 @@ class Kernel {
     })
   }
 
-  async evalCell(input: RlmEvalInput, deadline?: number): Promise<RlmEvalOutput> {
+  async evalCell(input: RlmCodeEvalInput, deadline?: number): Promise<RlmEvalOutput> {
     await this.ready
     if (this.exited || this.disposed) {
       throw new RlmError('closed', 'kernel is not running')
@@ -1150,9 +1169,18 @@ class RlmRuntimeImpl implements RlmRuntime {
     if (this.disposed) {
       throw new RlmError('closed', 'runtime is disposed')
     }
+    if (isManualReset(input)) {
+      if (input.code !== undefined || input.contextPath !== undefined || input.timeout !== undefined || input.onQuery !== undefined) {
+        throw new RlmError('eval', 'reset input must not include code, contextPath, timeout, or onQuery')
+      }
+    } else if (typeof input.code !== 'string' || input.reset !== undefined) {
+      throw new RlmError('eval', 'code input must contain code and must not include reset')
+    }
     // One effective timeout is the total budget for the whole eval: it is frozen
     // at submission so startup, queue wait, and cell execution share one deadline.
-    const budget = input.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT
+    const budget = isManualReset(input)
+      ? (this.config.timeout ?? DEFAULT_TIMEOUT)
+      : (input.timeout ?? this.config.timeout ?? DEFAULT_TIMEOUT)
     const entry = this.enqueue(sessionKey, input, Date.now() + budget)
     void this.ensureDrain(sessionKey)
     return entry.promise
@@ -1313,6 +1341,20 @@ class RlmRuntimeImpl implements RlmRuntime {
       }
       if (entry.deadline - Date.now() <= 0) {
         this.settleEntry(entry, undefined, new RlmError('timeout', 'cell timed out before it could start'))
+        return
+      }
+      if (isManualReset(entry.input)) {
+        // Reset deliberately ignores an abort that arrives after dequeue. It
+        // owns this FIFO position until the existing kernel cleanup barrier and
+        // M5 checkpoint deletion have completed, so a later eval cannot overtake
+        // deletion or revive pre-reset state.
+        const kernel = this.kernels.get(sessionKey)
+        if (kernel) {
+          await kernel.dispose()
+          if (this.kernels.get(sessionKey) === kernel) this.kernels.delete(sessionKey)
+        }
+        this.dropCheckpoint(sessionKey)
+        this.settleEntry(entry, { stdout: '', result: 'RLM state reset', truncated: false })
         return
       }
       // Dequeue-time kernel capture: a fatal eviction (by identity) removes the
@@ -1491,7 +1533,8 @@ export function registerRlmPlugin(
       + 'Pass contextPath to load one absolute UTF-8 regular file into persistent context; invalid sources leave the prior context intact. '
       + 'Cells may also read files by absolute paths. Top-level await is supported, and '
       + 'await rlm_query(prompt) delegates the prompt to a depth-bounded DSH subagent and returns its text. '
-      + 'A later rlm_eval call reuses the same variables and can iterate on earlier results.',
+      + 'A later rlm_eval call reuses the same variables and can iterate on earlier results. '
+      + 'Call rlm_eval with reset: true and no other input to discard this Session\'s RLM state before a fresh later cell.',
   })
 
   const disposeTool = ctx.tools.register(defineTool({
@@ -1500,16 +1543,20 @@ export function registerRlmPlugin(
       'Run one Python cell in the current session\'s persistent kernel and return its '
       + 'stdout and last-expression result. The cell may call `await rlm_query(prompt)`, '
       + 'which answers by delegating the prompt to a depth-bounded DSH Subagent and returns only '
-      + 'its final text. An exact-depth leaf has no rlm_eval tool; lower-depth children may recurse.',
+      + 'its final text. Pass `{ reset: true }` with no code or contextPath to discard only the current Session\'s RLM state. '
+      + 'An exact-depth leaf has no rlm_eval tool; lower-depth children may recurse.',
     parameters: {
       code: {
         type: 'string',
-        required: true,
         description: 'Python source to run; top-level await and persistent globals are supported.',
       },
       contextPath: {
         type: 'string',
         description: 'Optional absolute UTF-8 regular file loaded atomically as persistent `context` for this session kernel.',
+      },
+      reset: {
+        type: 'boolean',
+        description: 'Set exactly true with no code or contextPath to discard this Session\'s Python globals, managed context, and private checkpoint.',
       },
     },
     output: {
@@ -1525,7 +1572,7 @@ export function registerRlmPlugin(
       },
       render: (_args: unknown, value: RlmEvalValue) => [{ type: 'text', text: renderValue(value) }],
     },
-    async execute(args: { code: string; contextPath?: string }, exec): Promise<RlmEvalValue> {
+    async execute(args: { code?: string; contextPath?: string; reset?: boolean }, exec): Promise<RlmEvalValue> {
       const parent = exec.agent
       if (!parent) {
         throw new Error('rlm_eval requires a calling agent (exec.agent was undefined)')
@@ -1534,13 +1581,24 @@ export function registerRlmPlugin(
       const sessionKey = String(parent.id)
       let output: Awaited<ReturnType<typeof runtime.eval>>
       try {
-        const input: RlmEvalInput = {
-          code: args.code,
-          signal: exec.signal,
-          onQuery: async (prompt: string, cellSignal: AbortSignal) =>
-            runQuery(ctx, provider, parent, prompt, cellSignal, maxDepth),
+        let input: RlmEvalInput
+        if (args.reset === true) {
+          if (args.code !== undefined || args.contextPath !== undefined) {
+            throw new RlmError('eval', 'reset input must not include code or contextPath')
+          }
+          input = { reset: true, signal: exec.signal }
+        } else {
+          if (args.reset !== undefined || typeof args.code !== 'string') {
+            throw new RlmError('eval', 'rlm_eval requires either code or reset: true')
+          }
+          input = {
+            code: args.code,
+            signal: exec.signal,
+            onQuery: async (prompt: string, cellSignal: AbortSignal) =>
+              runQuery(ctx, provider, parent, prompt, cellSignal, maxDepth),
+          }
+          if (args.contextPath !== undefined) input.contextPath = args.contextPath
         }
-        if (args.contextPath !== undefined) input.contextPath = args.contextPath
         output = await runtime.eval(sessionKey, input)
       } catch (error) {
         // Surface the typed runtime error as a normal tool failure so the model

@@ -430,6 +430,82 @@ test('M5 Issue#31 RED: a timed-out kernel restores supported Session globals in 
   }
 })
 
+test('M6 Issue#33 RED: reset creates a new Session-local RLM kernel in a fresh installed Profile', { timeout: 15 * 60_000 }, async (t) => {
+  if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the M6 manual-reset acceptance'); return }
+  const ambientHome = process.env.DSH_HOME
+  if (!ambientHome || !fs.existsSync(path.join(ambientHome, 'settings.yaml'))) {
+    t.skip('DSH_HOME with settings.yaml is required; it supplies the configured vLLM provider and credential refs')
+    return
+  }
+  assert.ok(fs.existsSync(BIN), 'DSH harness bin.ts not found at ' + REPO_ROOT)
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m6-reset-'))
+  const profileDir = path.join(home, 'profiles', PROFILE)
+  fs.mkdirSync(path.join(home, 'profiles'), { recursive: true })
+  const ambientSettingsPath = path.join(ambientHome, 'settings.yaml')
+  const ambientSettingsBytes = fs.readFileSync(ambientSettingsPath)
+  const ambientCredsPath = path.join(ambientHome, '.credentials.yaml')
+  const ambientCredsBytes = fs.existsSync(ambientCredsPath) ? fs.readFileSync(ambientCredsPath) : null
+  fs.writeFileSync(path.join(home, 'settings.yaml'), replaceAgentDefaultModel(ambientSettingsBytes.toString('utf8'), LIVE_PROVIDER, LIVE_MODEL))
+  if (ambientCredsBytes !== null) fs.writeFileSync(path.join(home, '.credentials.yaml'), ambientCredsBytes)
+  const env = { DSH_HOME: home }
+  const marker = 'M6_RESET_MARKER_f26f69'
+  const task = [
+    'You are validating M6 RLM manual reset. Use rlm_eval exactly three times in this order.',
+    `1. Run exactly: m6_marker = ${JSON.stringify(marker)}`,
+    '2. Call rlm_eval with exactly this JSON input and no other property: {"reset":true}.',
+    '3. Run exactly: m6_marker. The call must report that m6_marker is not defined because reset made a new empty kernel.',
+    'If all three steps occur and the third call reports m6_marker is not defined, reply with exactly M6_RESET_OBSERVED. Otherwise reply with exactly M6_RESET_UNSUPPORTED.',
+  ].join('\n')
+  try {
+    const add = runDsh(['plugin', '--profile', PROFILE, 'add', '-w', PKG_ROOT], env, REPO_ROOT, 180_000)
+    assert.equal(add.status, 0, 'dsh plugin add failed: ' + add.stderr)
+    assert.ok(fs.existsSync(path.join(profileDir, 'node_modules', 'dsh-rlm')), 'dsh-rlm not installed into the profile')
+    const manifestPath = path.join(profileDir, 'package.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    manifest.dsh = { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'] } }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+    fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), [
+      '- insert:',
+      '    - id: rlm',
+      '      name: dsh-rlm',
+      '      config:',
+      '        enabled: true',
+      '        provider: spawn',
+      '        timeout: 1000',
+      '        snapshotRecovery: true',
+      '',
+    ].join('\n'))
+    const run = runDsh(['--profile', PROFILE, task], env, REPO_ROOT, 8 * 60_000)
+    const outTail = run.stdout.slice(-1200)
+    assert.equal(run.status, 0, 'headless M6 reset journey failed: ' + outTail + ' ' + run.stderr.slice(-1200))
+    assert.match(outTail, /M6_RESET_OBSERVED/)
+    assert.doesNotMatch(outTail, /M6_RESET_UNSUPPORTED/)
+    const logs = await readSessionLogs(home)
+    const main = [...logs.values()].find((text) => JSON.parse(text.split('\n')[0]).delegationDepth === 0)
+    assert.ok(main, 'no persisted depth-0 Session log')
+    assert.equal(countToolCalls(main, 'rlm_eval'), 3, 'expected exactly the ordered set, reset, and post-reset read calls')
+    assert.deepEqual(toolCallArguments(main, 'rlm_eval'), [
+      { code: `m6_marker = ${JSON.stringify(marker)}` },
+      { reset: true },
+      { code: 'm6_marker' },
+    ], 'official Session log did not record the exact set -> reset -> read tool journey')
+    const outcomes = toolOutcomes(main, 'rlm_eval')
+    assert.equal(outcomes.length, 3, 'each ordered rlm_eval call must have one official tool/result event')
+    assert.equal(outcomes[0].result?.isError, false, 'the pre-reset assignment must succeed')
+    assert.equal(outcomes[1].result?.isError, false, 'the reset call must succeed')
+    assert.equal(outcomes[1].result?.text, 'RLM state reset', 'the reset acknowledgement must not expose discarded state')
+    assert.equal(outcomes[2].result?.isError, true, 'the post-reset read must be the failing tool result')
+    assert.match(outcomes[2].result?.text ?? '', /rlm_eval failed \(eval\):[\s\S]*(?:m6_marker.*not defined|NameError)/i, 'the post-reset read must report a typed undefined-marker error')
+  } finally {
+    try {
+      assert.ok(ambientSettingsBytes.equals(fs.readFileSync(ambientSettingsPath)), 'ambient settings.yaml was modified by the M6 reset smoke')
+      if (ambientCredsBytes !== null) assert.ok(ambientCredsBytes.equals(fs.readFileSync(ambientCredsPath)), 'ambient .credentials.yaml was modified by the M6 reset smoke')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  }
+})
+
 test('M1E: runtime dispose releases the Python kernel process', { timeout: 30_000 }, async (t) => {
   if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the live kernel-dispose smoke'); return }
   const { createRlmRuntime } = await import('../src/runtime.ts')
@@ -562,6 +638,49 @@ function toolCallArguments(logText: string, toolName: string): unknown[] {
     }
   }
   return out
+}
+
+/** One ordered official tool/call and its result, correlated by durable callId. */
+function toolOutcomes(logText: string, toolName: string): { args: unknown; result?: { isError: boolean; text: string } }[] {
+  const ordered: { callId: string; args: unknown; result?: { isError: boolean; text: string } }[] = []
+  const byCallId = new Map<string, { isError: boolean; text: string }>()
+  for (const raw of logText.split(/\r?\n/)) {
+    const line = raw.trim()
+    if (line === '') continue
+    let row: unknown
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (row === null || typeof row !== 'object' || Array.isArray(row)) continue
+    const event = row as { type?: unknown; data?: unknown }
+    if (event.type === 'tool/call' && event.data !== null && typeof event.data === 'object' && !Array.isArray(event.data)) {
+      const data = event.data as { name?: unknown; callId?: unknown; arguments?: unknown }
+      if (data.name !== toolName || typeof data.callId !== 'string' || typeof data.arguments !== 'string') continue
+      try {
+        ordered.push({ callId: data.callId, args: JSON.parse(data.arguments) })
+      } catch {
+        // A malformed persisted argument is not evidence for an accepted call.
+      }
+      continue
+    }
+    if (event.type !== 'tool/result' || event.data === null || typeof event.data !== 'object' || Array.isArray(event.data)) continue
+    const message = (event.data as { message?: unknown }).message
+    if (message === null || typeof message !== 'object' || Array.isArray(message)) continue
+    const content = (message as { content?: unknown }).content
+    if (!Array.isArray(content) || content.length !== 1) continue
+    const block = content[0]
+    if (block === null || typeof block !== 'object' || Array.isArray(block)) continue
+    const toolResult = block as { type?: unknown; toolCallId?: unknown; isError?: unknown; content?: unknown }
+    if (toolResult.type !== 'tool-result' || typeof toolResult.toolCallId !== 'string' || !Array.isArray(toolResult.content)) continue
+    const text = toolResult.content
+      .filter((item): item is { type: 'text'; text: string } => item !== null && typeof item === 'object' && !Array.isArray(item) && (item as { type?: unknown }).type === 'text' && typeof (item as { text?: unknown }).text === 'string')
+      .map((item) => item.text)
+      .join('')
+    byCallId.set(toolResult.toolCallId, { isError: toolResult.isError === true, text })
+  }
+  return ordered.map(({ callId, args }) => ({ args, ...(byCallId.has(callId) ? { result: byCallId.get(callId)! } : {}) }))
 }
 
 test('M2 Issue#18: isolated smoke deterministically pins agent-default-model to DSV4-FVE', () => {
