@@ -1533,6 +1533,7 @@ export function registerRlmPlugin(
       + 'Pass contextPath to load one absolute UTF-8 regular file into persistent context; invalid sources leave the prior context intact. '
       + 'Cells may also read files by absolute paths. Top-level await is supported, and '
       + 'await rlm_query(prompt) delegates the prompt to a depth-bounded DSH subagent and returns its text. '
+      + 'For independent prompts, await rlm_query_batched(prompts) starts at most four child queries and returns text in input order. '
       + 'A later rlm_eval call reuses the same variables and can iterate on earlier results. '
       + 'Call rlm_eval with reset: true and no other input to discard this Session\'s RLM state before a fresh later cell.',
   })

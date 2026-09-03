@@ -45,6 +45,7 @@ MAX_SAFE_INTEGER = 2**53 - 1
 MAX_QUERY_TEXT = 64 * 1024
 MAX_FRAME_BYTES = 256 * 1024
 MAX_ERROR_TEXT = 64 * 1024
+BATCH_CONCURRENCY = 4
 CELL_FILENAME = "<rlm-cell>"
 
 
@@ -175,6 +176,7 @@ class RlmKernel:
             "__builtins__": builtins,
             "asyncio": asyncio,
             "rlm_query": self._rlm_query,
+            "rlm_query_batched": self._rlm_query_batched,
         }
         self.loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
         self.queue: "asyncio.Queue[Optional[dict[str, Any]]]" = asyncio.Queue()
@@ -481,17 +483,82 @@ class RlmKernel:
         finally:
             self.pending.pop(qid, None)
 
+    @staticmethod
+    async def _drain_batch_tasks(tasks: "list[asyncio.Task[str]]") -> None:
+        """Let already-emitted queries consume their replies before re-raising.
+
+        A caller may cancel the task awaiting rlm_query_batched while the cell
+        remains live.  Cancelling its worker would retire the Python pending id
+        before the host reply, which is a protocol fault.  Shielding keeps the
+        workers owned by the cell until they all settle; repeated caller
+        cancellation still cannot orphan them.
+        """
+        if not tasks:
+            return
+        completion = asyncio.gather(*tasks, return_exceptions=True)
+        while True:
+            try:
+                await asyncio.shield(completion)
+                return
+            except asyncio.CancelledError:
+                continue
+
+    async def _rlm_query_batched(self, prompts: Any) -> "list[str]":
+        """Run a fixed-bounded ordered batch through the existing query bridge."""
+        if type(prompts) not in (list, tuple) or any(type(prompt) is not str for prompt in prompts):
+            raise RlmQueryError("rlm_query_batched expects a list or tuple of strings")
+        if not prompts:
+            return []
+
+        results: list[Optional[str]] = [None] * len(prompts)
+        failures: dict[int, RlmQueryError] = {}
+        active: dict[asyncio.Task[str], int] = {}
+        started: list[asyncio.Task[str]] = []
+        next_index = 0
+
+        def admit() -> None:
+            nonlocal next_index
+            while len(active) < BATCH_CONCURRENCY and next_index < len(prompts):
+                task = asyncio.create_task(self._rlm_query(prompts[next_index]))
+                active[task] = next_index
+                started.append(task)
+                next_index += 1
+
+        try:
+            admit()
+            while active:
+                done, _pending = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+                for task in sorted(done, key=lambda item: active[item]):
+                    index = active.pop(task)
+                    try:
+                        results[index] = task.result()
+                    except RlmQueryError as exc:
+                        failures[index] = exc
+                    except asyncio.CancelledError:
+                        failures[index] = RlmQueryError("rlm_query_batched query was cancelled")
+                    except BaseException as exc:
+                        failures[index] = RlmQueryError("rlm_query_batched query failed: " + str(exc))
+                if not failures:
+                    admit()
+            if failures:
+                raise failures[min(failures)]
+            return [result for result in results if result is not None]
+        except asyncio.CancelledError:
+            await self._drain_batch_tasks(started)
+            raise
+
     # ---- cell execution ----
 
     def _restore_scaffold(self) -> None:
-        """Re-bind the official rlm_query bridge at every cell boundary.
+        """Re-bind the official RLM query helpers at every cell boundary.
 
         User code may legitimately shadow or delete any global (the namespace
         is deliberately not frozen), so the scaffold this kernel speaks is
-        always self._rlm_query: it is re-injected before a cell and again in
-        the outer finally that covers every success/error exit.
+        always self._rlm_query and self._rlm_query_batched: they are re-injected
+        before a cell and again in the outer finally covering every exit.
         """
         self.namespace["rlm_query"] = self._rlm_query
+        self.namespace["rlm_query_batched"] = self._rlm_query_batched
 
     def _restore_context(self) -> None:
         """Publish the kernel-owned context with a fresh metadata dictionary."""
@@ -639,7 +706,7 @@ class RlmKernel:
         """Atomically replace a private checkpoint after a successful cell."""
         skipped: list[str] = []
         variables: dict[str, Any] = {}
-        reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "context", "context_meta"}
+        reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "rlm_query_batched", "context", "context_meta"}
         for name in sorted(name for name in self.namespace if type(name) is str and name not in reserved):
             try:
                 ok, detached, reason = self._snapshot_value(self.namespace[name], set())
@@ -702,7 +769,7 @@ class RlmKernel:
         if not isinstance(envelope, dict) or envelope.get("version") != 1 or not isinstance(envelope.get("variables"), dict):
             raise RlmSnapshotError("checkpoint version or variables are invalid")
         restored: dict[str, Any] = {}
-        reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "context", "context_meta"}
+        reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "rlm_query_batched", "context", "context_meta"}
         for name, value in envelope["variables"].items():
             if type(name) is not str or name in reserved:
                 raise RlmSnapshotError("checkpoint contains an invalid variable name")
@@ -738,7 +805,7 @@ class RlmKernel:
                 or canonical_context_path != restored_meta["path"]
             ):
                 raise RlmSnapshotError("checkpoint context metadata is invalid")
-        fresh = {"__name__": "__rlm__", "__builtins__": builtins, "asyncio": asyncio, "rlm_query": self._rlm_query}
+        fresh = {"__name__": "__rlm__", "__builtins__": builtins, "asyncio": asyncio, "rlm_query": self._rlm_query, "rlm_query_batched": self._rlm_query_batched}
         fresh.update(restored)
         self.namespace = fresh
         self.managed_context = restored_context

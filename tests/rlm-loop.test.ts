@@ -126,6 +126,170 @@ test('M1A: rlm_query request/response resumes the cell', async () => {
   }
 })
 
+test('M7 Issue#36 RED: a batch admits four queries and returns ordered text', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    const prompts = ['zero', 'one', 'two', 'three', 'four', 'five']
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: `await rlm_query_batched(${JSON.stringify(prompts)})`,
+    })
+    const first = await k.next()
+    assert.equal(first.type, 'query')
+    assert.equal(first.prompt, prompts[0])
+    const initial = [first, await k.next(), await k.next(), await k.next()]
+    assert.deepEqual(initial.map((frame) => frame.prompt), prompts.slice(0, 4))
+
+    for (const index of [3, 2, 1, 0]) {
+      k.send({ type: 'query_result', id: k.id(initial[index]), text: 'answer-' + index })
+    }
+    const tail = [await k.next(), await k.next()]
+    assert.deepEqual(tail.map((frame) => frame.type), ['query', 'query'])
+    assert.deepEqual(tail.map((frame) => frame.prompt), prompts.slice(4))
+    for (const [offset, frame] of tail.entries()) {
+      k.send({ type: 'query_result', id: k.id(frame), text: 'answer-' + (offset + 4) })
+    }
+    const result = await k.next()
+    assert.equal(result.type, 'result')
+    assert.equal(result.result, "['answer-0', 'answer-1', 'answer-2', 'answer-3', 'answer-4', 'answer-5']")
+  } finally {
+    await k.close()
+  }
+})
+
+test('M7 Issue#36 successor: duplicate prompts retain distinct ordered result slots', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'await rlm_query_batched(["repeat", "repeat"])' })
+    const queries = [await k.next(), await k.next()]
+    assert.deepEqual(queries.map((frame) => frame.prompt), ['repeat', 'repeat'])
+    assert.notEqual(k.id(queries[0]), k.id(queries[1]), 'equal prompt text must still create independent bridge requests')
+    k.send({ type: 'query_result', id: k.id(queries[1]), text: 'second' })
+    k.send({ type: 'query_result', id: k.id(queries[0]), text: 'first' })
+    const result = await k.next()
+    assert.equal(result.type, 'result')
+    assert.equal(result.result, "['first', 'second']")
+  } finally {
+    await k.close()
+  }
+})
+
+test('M7 Issue#36: caller cancellation drains admitted batch queries before re-raising', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: [
+        'batch = asyncio.create_task(rlm_query_batched(["left", "right"]))',
+        'await asyncio.sleep(0)',
+        'batch.cancel()',
+        'try:',
+        '    await batch',
+        'except asyncio.CancelledError:',
+        '    outcome = "cancelled after drain"',
+        'outcome',
+      ].join('\n'),
+    })
+    const queries = [await k.next(), await k.next()]
+    assert.deepEqual(queries.map((frame) => frame.type), ['query', 'query'])
+    for (const frame of queries) k.send({ type: 'query_result', id: k.id(frame), text: 'late reply' })
+    const result = await k.next()
+    assert.equal(result.type, 'result')
+    assert.equal(result.result, 'cancelled after drain')
+    k.send({ type: 'eval', id: 2, code: '6 * 7' })
+    const next = await k.next()
+    assert.equal(next.type, 'result')
+    assert.equal(next.result, '42')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M7 Issue#36 successor: asyncio.wait_for cancellation drains admitted queries before the timeout is caught', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: [
+        'batch = asyncio.create_task(rlm_query_batched(["left", "right"]))',
+        'await asyncio.sleep(0)',
+        'try:',
+        '    await asyncio.wait_for(batch, timeout=0.01)',
+        'except asyncio.TimeoutError:',
+        '    outcome = "wait_for after drain"',
+        'outcome',
+      ].join('\n'),
+    })
+    const queries = [await k.next(), await k.next()]
+    assert.deepEqual(queries.map((frame) => frame.type), ['query', 'query'])
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    for (const frame of queries) k.send({ type: 'query_result', id: k.id(frame), text: 'late reply' })
+    const result = await k.next()
+    assert.equal(result.type, 'result')
+    assert.equal(result.result, 'wait_for after drain')
+    k.send({ type: 'eval', id: 2, code: '7 * 6' })
+    const next = await k.next()
+    assert.equal(next.type, 'result')
+    assert.equal(next.result, '42')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M7 Issue#36: reverse-completion failures drain and surface the lowest input index', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'await rlm_query_batched(["0", "1", "2", "3", "not-admitted"])' })
+    const initial = [await k.next(), await k.next(), await k.next(), await k.next()]
+    assert.deepEqual(initial.map((frame) => frame.prompt), ['0', '1', '2', '3'])
+    k.send({ type: 'error', id: k.id(initial[3]), phase: 'query', kind: 'query_error', message: 'failure-3' })
+    k.send({ type: 'error', id: k.id(initial[1]), phase: 'query', kind: 'query_error', message: 'failure-1' })
+    k.send({ type: 'query_result', id: k.id(initial[2]), text: 'two' })
+    k.send({ type: 'query_result', id: k.id(initial[0]), text: 'zero' })
+    const error = await k.next()
+    assert.equal(error.type, 'error')
+    assert.equal(error.phase, 'query')
+    assert.equal(error.kind, 'query_error')
+    assert.equal(error.message, 'failure-1')
+    k.send({ type: 'eval', id: 2, code: '3 * 9' })
+    const next = await k.next()
+    assert.equal(next.type, 'result')
+    assert.equal(next.result, '27')
+  } finally {
+    await k.close()
+  }
+})
+
+test('M7 Issue#36: invalid batch input dispatches no query and the helper scaffold is restored', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'await rlm_query_batched(["ok", 7])' })
+    const invalid = await k.next()
+    assert.equal(invalid.type, 'error')
+    assert.equal(invalid.phase, 'query')
+    assert.equal(invalid.kind, 'query_error')
+    assert.match(String(invalid.message), /list or tuple of strings/)
+    k.send({ type: 'eval', id: 2, code: 'del rlm_query_batched\nraise ValueError("restore batch scaffold")' })
+    const erased = await k.next()
+    assert.equal(erased.type, 'error')
+    k.send({ type: 'eval', id: 3, code: 'await rlm_query_batched([])' })
+    const empty = await k.next()
+    assert.equal(empty.type, 'result')
+    assert.equal(empty.result, '[]')
+  } finally {
+    await k.close()
+  }
+})
+
 test('M1A: runtime error is typed and kernel continues', async () => {
   const k = new Kernel()
   try {
@@ -750,6 +914,33 @@ test('M1B: a cell cannot exceed the per-cell query limit', async () => {
     )
   } finally {
     runtime.dispose()
+  }
+})
+
+test('M7 Issue#36: a batch respects remaining maxQueries and drains admitted children', async () => {
+  const runtime = rt({ maxQueries: 2 })
+  const gates = [new Deferred<string>(), new Deferred<string>()]
+  let started = 0
+  try {
+    const pending = runtime.eval('m7-query-limit', {
+      code: 'await rlm_query_batched(["0", "1", "2", "3"])',
+      onQuery: async () => {
+        const gate = gates[started++]
+        return gate.promise
+      },
+    })
+    await until(() => started === 2)
+    gates[0].resolve('zero')
+    gates[1].resolve('one')
+    await assert.rejects(
+      pending,
+      (err: unknown) => err instanceof RlmError && err.kind === 'query' && /query limit exceeded: 2/.test(err.message),
+    )
+    assert.equal(started, 2, 'only budgeted batch items may start DSH children')
+    const next = await runtime.eval('m7-query-limit', { code: '8 * 5' })
+    assert.equal(next.result, '40')
+  } finally {
+    await runtime.dispose()
   }
 })
 
@@ -2396,6 +2587,80 @@ function makeLifecycleMockCtx(options: {
   return m
 }
 
+test('M7 Issue#36: the runtime never starts more than four batch children before a reply', async () => {
+  const m = makeLifecycleMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', timeout: 8000 })
+  try {
+    const pending = m.registered[0].execute(
+      { code: 'await rlm_query_batched(["0", "1", "2", "3", "4", "5"])' },
+      makeExec('m7-runtime-concurrency'),
+    )
+    await until(() => m.starts.length === 4)
+    assert.equal(m.starts.length, 4)
+    m.starts[3].run.result.resolve({ output: [{ type: 'text', text: 'answer-3' }], stopReason: 'completed' })
+    await until(() => m.starts.length === 5)
+    assert.equal(m.starts.length, 5)
+    m.starts[2].run.result.resolve({ output: [{ type: 'text', text: 'answer-2' }], stopReason: 'completed' })
+    await until(() => m.starts.length === 6)
+    for (const [index, start] of m.starts.entries()) {
+      if (!start.run.result.isSettled()) {
+        start.run.result.resolve({ output: [{ type: 'text', text: 'answer-' + index }], stopReason: 'completed' })
+      }
+    }
+    const out = await pending
+    assert.equal(out.result, "['answer-0', 'answer-1', 'answer-2', 'answer-3', 'answer-4', 'answer-5']")
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M7 Issue#36: a batch preserves M4 recursion policy for every admitted child', async () => {
+  const root = makeLifecycleMockCtx({ autoResult: { output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' } })
+  const leaf = makeLifecycleMockCtx({ autoResult: { output: [{ type: 'text', text: 'ok' }], stopReason: 'completed' } })
+  registerRlmPlugin(root.ctx, { enabled: true, provider: 'spawn', maxDepth: 2 })
+  registerRlmPlugin(leaf.ctx, { enabled: true, provider: 'spawn', maxDepth: 2 })
+  try {
+    await root.registered[0].execute(
+      { code: 'await rlm_query_batched(["0", "1", "2", "3"])' },
+      { agent: makeAgent('m7-m4-root', 0), signal: new AbortController().signal },
+    )
+    assert.equal(root.starts.length, 4)
+    for (const start of root.starts) assert.equal(start.request.toolFilter, undefined, 'a below-cap child remains recursion-capable')
+
+    await leaf.registered[0].execute(
+      { code: 'await rlm_query_batched(["0", "1", "2", "3"])' },
+      { agent: makeAgent('m7-m4-leaf', 1), signal: new AbortController().signal },
+    )
+    assert.equal(leaf.starts.length, 4)
+    for (const start of leaf.starts) assert.deepEqual(start.request.toolFilter, { deny: ['rlm_eval'] }, 'an exact-depth child is a leaf')
+  } finally {
+    root.teardown?.()
+    leaf.teardown?.()
+  }
+})
+
+test('M7 Issue#36: caller cancellation quiesces every admitted batch child before settlement', async () => {
+  const m = makeLifecycleMockCtx({ disposeAsync: true })
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', timeout: 8000 })
+  const controller = new AbortController()
+  try {
+    const pending = m.registered[0].execute(
+      { code: 'await rlm_query_batched(["0", "1", "2", "3", "not-started"])' },
+      { agent: makeAgent('m7-batch-cancel'), signal: controller.signal },
+    )
+    await until(() => m.starts.length === 4)
+    controller.abort('cancel batch')
+    await assert.rejects(pending, (err: unknown) => err instanceof Error && /cancel/.test(err.message))
+    for (const start of m.starts) {
+      assert.equal(start.run.signal.aborted, true, 'every admitted child signal must be aborted')
+      assert.equal(start.run.disposed, true, 'every admitted child must be disposed before the tool settles')
+    }
+    assert.equal(m.starts.length, 4, 'caller cancellation may not admit another child')
+  } finally {
+    m.teardown?.()
+  }
+})
+
 test('M2 Issue#4: a cell timeout aborts and disposes the active one-shot child before the tool settles', async () => {
   const m = makeLifecycleMockCtx()
   registerRlmPlugin(m.ctx, { enabled: true, timeout: 1500 })
@@ -2471,17 +2736,18 @@ test('M2 Issue#4: a kernel protocol fault leaves no active one-shot child behind
     const code = [
       'import asyncio, sys',
       'async def corrupt():',
+      '    await asyncio.sleep(0.1)',
       '    sys.__stdout__.write("this is not json\\n")',
       '    sys.__stdout__.flush()',
       'asyncio.create_task(corrupt())',
-      'x = await rlm_query("q")',
-      'x',
+      'await rlm_query_batched(["0", "1", "2", "3"])',
     ].join('\n')
     await assert.rejects(
       tool.execute({ code }, makeExec('sess-protocol-child')),
       (err: unknown) => err instanceof Error && /protocol/.test(err.message),
     )
     await tick(10)
+    assert.equal(m.starts.length, 4, 'the fatal must clean every admitted batch child')
     assert.ok(
       m.starts.every((s) => s.run.disposed),
       'a one-shot child survived the protocol fault (token leak)',
@@ -2499,20 +2765,21 @@ test('M2 Issue#4: kernel exit aborts and disposes the active one-shot child', as
     const code = [
       'import asyncio, os',
       'async def bye():',
-      '    await asyncio.sleep(0)',
+      '    await asyncio.sleep(0.1)',
       '    os._exit(1)',
       'asyncio.create_task(bye())',
-      'x = await rlm_query("q")',
-      'x',
+      'await rlm_query_batched(["0", "1", "2", "3"])',
     ].join('\n')
     const pending = tool.execute({ code }, makeExec('sess-exit-child'))
-    await until(() => m.starts.length === 1)
+    await until(() => m.starts.length === 4)
     await assert.rejects(
       pending,
       (err: unknown) => err instanceof Error && /(closed|protocol|kernel exited)/.test(err.message),
     )
-    assert.equal(m.starts[0].run.signal.aborted, true, 'child signal must be aborted by kernel exit')
-    assert.equal(m.starts[0].run.disposed, true, 'child must be disposed after kernel exit')
+    for (const start of m.starts) {
+      assert.equal(start.run.signal.aborted, true, 'every admitted child signal must be aborted by kernel exit')
+      assert.equal(start.run.disposed, true, 'every admitted child must be disposed after kernel exit')
+    }
   } finally {
     m.teardown?.()
   }
@@ -3446,6 +3713,9 @@ test('M2 Issue#6: enabled registers the tool:rlm_eval system prompt section; dis
     assert.match(section.text, /absolute (file )?paths?/i)
     assert.match(section.text, /top[- ]level await/i)
     assert.match(section.text, /rlm_query/i)
+    assert.match(section.text, /rlm_query_batched/i)
+    assert.match(section.text, /four|4/i)
+    assert.match(section.text, /input order|ordered/i)
     assert.match(section.text, /(subsequent|later|next) rlm_eval/i)
     assert.match(section.text, /iterat|reuse/i)
   } finally {
@@ -3693,9 +3963,9 @@ test('M5 Issue#31: an owned timeout restores JSON-safe globals and checkpointed 
     )
     writeFileSync(contextPath, 'changed source', 'utf8')
     const restored = await runtime.eval('m5-recover', {
-      code: '[m5_value, context, context_meta["bytes"], __import__("os").getpid()]',
+      code: '[m5_value, context, context_meta["bytes"], await rlm_query_batched([]), __import__("os").getpid()]',
     })
-    assert.match(restored.result ?? '', /^\[\{'items': \[1, True\], 'label': 'saved'\}, 'checkpointed context', 20, \d+\]$/)
+    assert.match(restored.result ?? '', /^\[\{'items': \[1, True\], 'label': 'saved'\}, 'checkpointed context', 20, \[\], \d+\]$/)
     assert.ok(restored.recovery?.restored, 'replacement kernel must report recovery')
     const restoredPid = Number(restored.result!.match(/(\d+)\]$/)?.[1])
     assert.ok(Number.isInteger(restoredPid) && restoredPid > 0 && restoredPid !== firstPid, 'timeout must use a fresh PID')
@@ -3772,16 +4042,17 @@ test('M6 Issue#33 RED: reset is FIFO within one Session and never resets a sibli
   try {
     await runtime.eval('m6-a', { code: 'm6_a = "discard"' })
     await runtime.eval('m6-b', { code: 'm6_b = "keep"' })
-    const gate = new Deferred<string>()
-    let running = false
+    const gates = Array.from({ length: 4 }, () => new Deferred<string>())
+    const started: string[] = []
     const first = runtime.eval('m6-a', {
-      code: 'await rlm_query("hold")\nm6_first_finished = True',
-      onQuery: async () => {
-        running = true
-        return gate.promise
+      code: 'await rlm_query_batched(["hold-0", "hold-1", "hold-2", "hold-3"])\nm6_first_finished = True',
+      onQuery: async (prompt) => {
+        started.push(prompt)
+        return gates[Number(prompt.slice(-1))].promise
       },
     })
-    await until(() => running)
+    await until(() => started.length === 4)
+    assert.deepEqual(started, ['hold-0', 'hold-1', 'hold-2', 'hold-3'])
     const reset = runtime.eval('m6-a', manualReset())
     const afterReset = runtime.eval('m6-a', { code: 'm6_a' })
     void afterReset.catch(() => {})
@@ -3790,7 +4061,7 @@ test('M6 Issue#33 RED: reset is FIFO within one Session and never resets a sibli
     await new Promise((resolve) => setTimeout(resolve, 30))
     assert.equal(resetSettled, false, 'reset must wait behind the accepted same-Session cell')
     assert.equal((await runtime.eval('m6-b', { code: 'm6_b' })).result, 'keep', 'a sibling Session must remain independent')
-    gate.resolve('released')
+    for (const [index, gate] of gates.entries()) gate.resolve('released-' + index)
     await first
     await reset
     await assert.rejects(

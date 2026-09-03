@@ -506,6 +506,84 @@ test('M6 Issue#33 RED: reset creates a new Session-local RLM kernel in a fresh i
   }
 })
 
+test('M7 Issue#36 RED: a fresh installed Profile returns ordered rlm_query_batched results through rlm_eval', { timeout: 15 * 60_000 }, async (t) => {
+  if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the M7 batched-query acceptance'); return }
+  const ambientHome = process.env.DSH_HOME
+  if (!ambientHome || !fs.existsSync(path.join(ambientHome, 'settings.yaml'))) {
+    t.skip('DSH_HOME with settings.yaml is required; it supplies the configured vLLM provider and credential refs')
+    return
+  }
+  assert.ok(fs.existsSync(BIN), 'DSH harness bin.ts not found at ' + REPO_ROOT)
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m7-batch-'))
+  const profileDir = path.join(home, 'profiles', PROFILE)
+  fs.mkdirSync(path.join(home, 'profiles'), { recursive: true })
+  const ambientSettingsPath = path.join(ambientHome, 'settings.yaml')
+  const ambientSettingsBytes = fs.readFileSync(ambientSettingsPath)
+  const ambientCredsPath = path.join(ambientHome, '.credentials.yaml')
+  const ambientCredsBytes = fs.existsSync(ambientCredsPath) ? fs.readFileSync(ambientCredsPath) : null
+  fs.writeFileSync(path.join(home, 'settings.yaml'), replaceAgentDefaultModel(ambientSettingsBytes.toString('utf8'), LIVE_PROVIDER, LIVE_MODEL))
+  if (ambientCredsBytes !== null) fs.writeFileSync(path.join(home, '.credentials.yaml'), ambientCredsBytes)
+  const env = { DSH_HOME: home }
+  const left = 'M7_BATCH_LEFT_7d642e'
+  const right = 'M7_BATCH_RIGHT_4a9c3b'
+  const code = [
+    `results = await rlm_query_batched([${JSON.stringify(`Reply exactly ${left}. Do not call tools.`)}, ${JSON.stringify(`Reply exactly ${right}. Do not call tools.`)}])`,
+    "' | '.join(results)",
+  ].join('\n')
+  const task = [
+    'You are validating M7 batched RLM queries. Call rlm_eval exactly once with the exact Python source below and no other rlm_eval call.',
+    '',
+    code,
+    '',
+    `Only if that same tool call succeeds and visibly returns ${left} before ${right}, reply with exactly M7_BATCHED_PROFILE_OK. Otherwise reply with exactly M7_BATCHED_PROFILE_UNSUPPORTED.`,
+  ].join('\n')
+  try {
+    const add = runDsh(['plugin', '--profile', PROFILE, 'add', '-w', PKG_ROOT], env, REPO_ROOT, 180_000)
+    assert.equal(add.status, 0, 'dsh plugin add failed: ' + add.stderr)
+    assert.ok(fs.existsSync(path.join(profileDir, 'node_modules', 'dsh-rlm')), 'dsh-rlm not installed into the profile')
+    const manifestPath = path.join(profileDir, 'package.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    manifest.dsh = { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'] } }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+    fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), [
+      '- insert:',
+      '    - id: rlm',
+      '      name: dsh-rlm',
+      '      config:',
+      '        enabled: true',
+      '        provider: spawn',
+      '',
+    ].join('\n'))
+
+    const run = runDsh(['--profile', PROFILE, task], env, REPO_ROOT, 12 * 60_000)
+    const outTail = run.stdout.slice(-1200)
+    assert.equal(run.status, 0, 'headless M7 batch journey failed: ' + outTail + ' ' + run.stderr.slice(-1200))
+    const logs = await readSessionLogs(home)
+    const main = [...logs.values()].find((text) => JSON.parse(text.split('\n')[0]).delegationDepth === 0)
+    assert.ok(main, 'no persisted depth-0 Session log')
+    assert.equal(countToolCalls(main, 'rlm_eval'), 1, 'M7 acceptance must use exactly one ordinary rlm_eval call')
+    assert.deepEqual(toolCallArguments(main, 'rlm_eval'), [{ code }], 'official Session log did not record the exact batched helper call')
+    const outcomes = toolOutcomes(main, 'rlm_eval')
+    assert.equal(outcomes.length, 1, 'the exact rlm_eval call must have one correlated official result')
+    assert.equal(outcomes[0].result?.isError, false, 'rlm_query_batched must be provided by the Session Python kernel; actual result: ' + (outcomes[0].result?.text ?? '<missing>'))
+    assert.match(outcomes[0].result?.text ?? '', new RegExp(`${left}[\\s\\S]*${right}`), 'the correlated rlm_eval result must preserve input order')
+    const children = [...logs.values()].filter((text) => JSON.parse(text.split('\n')[0]).delegationDepth === 1)
+    assert.equal(children.length, 2, 'the batch must persist one depth-1 DSH child Session for each admitted prompt')
+    for (const child of children) {
+      assert.equal(countToolCalls(child, 'rlm_eval'), 0, 'a batched leaf child must not receive rlm_eval')
+    }
+    assert.match(outTail, /M7_BATCHED_PROFILE_OK/, 'headless agent did not observe the successful correlated result')
+    assert.doesNotMatch(outTail, /M7_BATCHED_PROFILE_UNSUPPORTED/, 'headless agent reported that the helper is unavailable')
+  } finally {
+    try {
+      assert.ok(ambientSettingsBytes.equals(fs.readFileSync(ambientSettingsPath)), 'ambient settings.yaml was modified by the M7 batch smoke')
+      if (ambientCredsBytes !== null) assert.ok(ambientCredsBytes.equals(fs.readFileSync(ambientCredsPath)), 'ambient .credentials.yaml was modified by the M7 batch smoke')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  }
+})
+
 test('M1E: runtime dispose releases the Python kernel process', { timeout: 30_000 }, async (t) => {
   if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the live kernel-dispose smoke'); return }
   const { createRlmRuntime } = await import('../src/runtime.ts')
