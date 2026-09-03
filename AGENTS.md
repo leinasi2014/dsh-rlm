@@ -10,19 +10,19 @@ DSH Agent -> rlm_eval(code) -> Session Python kernel
   -> text returns to Python -> cell continues -> next rlm_eval can reuse globals
 ```
 
-M1/M2/M3/M4 are delivered. Extend the same loop only with M5 Session Snapshot
-Recovery: an opt-in, private per-runtime checkpoint after owned kernel loss.
-Do not add a second agent loop, public service, Storage Domain, host-restart
-persistence, UI, Workflow, Jobs, or provider framework.
+M1–M5 are delivered. Extend the same loop in strict order: M6 Manual Reset,
+then M7 Batched Query, then M8 Continuable Spawn. Do not add a second agent
+loop, public service, Storage Domain, host-restart persistence, UI, Workflow,
+Jobs, or provider framework.
 
 ## Development Rules
 
 - Treat `docs/architecture.md`, `docs/directory-structure.md`,
   `docs/milestones.md`, and `docs/future-extensions.md` as the current product
   boundary.
-- For M5, also treat `docs/m5-session-snapshot-recovery.md` and
-  `docs/m5-development-contract.md` as binding; English is authoritative and
-  each has a Chinese mirror. M3/M4 documents remain binding for their owned
+- For M6, also treat `docs/m6-manual-reset.md` and
+  `docs/m6-development-contract.md` as binding; English is authoritative and
+  each has a Chinese mirror. M3/M4/M5 documents remain binding for their owned
   boundaries.
 - Keep the V1 source layout small:
   - `src/index.ts`
@@ -89,11 +89,11 @@ persistence, UI, Workflow, Jobs, or provider framework.
    and dispose.
 6. Prove the M1 loop in tests and in a clean DSH Profile using the configured
    `DeepSeek-V4-Flash-Vision-Exp` vLLM/PTC model path.
-7. M3 and M4 are accepted on `main`; preserve their contract boundaries.
-8. Implement M5 only after its docs slice is integrated: use strict TDD to
-   recover a bounded JSON-safe checkpoint plus protected M3 context after an
-   owned timeout/crash/protocol-fatal loss; cancellation, unload, and host
-   restart remain clean-state behavior.
+7. M3–M5 are accepted on `main`; preserve their contract boundaries.
+8. Implement M6 only after its docs slice is integrated: use strict TDD to
+   reset only the current Session through the existing `rlm_eval` path, after
+   the queue-ordered kernel/child cleanup barrier and M5 checkpoint deletion.
+9. Start M7 only after M6 acceptance; start M8 only after M7 acceptance.
 
 ## Milestone Split
 
@@ -111,6 +111,9 @@ persistence, UI, Workflow, Jobs, or provider framework.
 - M3: managed absolute UTF-8 context loading with atomic Session-local state.
 - M4: depth-bounded recursive child DSH Sessions with isolated RLM kernels.
 - M5: opt-in, private runtime checkpoint recovery after eligible kernel loss.
+- M6: explicit FIFO Session-local reset through the existing `rlm_eval` tool.
+- M7: bounded ordered concurrent `rlm_query_batched`.
+- M8: official continuable child DSH Sessions with inbox delivery.
 
 ## PTC / Multi-Agent Coordination
 
@@ -138,7 +141,7 @@ persistence, UI, Workflow, Jobs, or provider framework.
   active assignment.
 - A model report is not completion. Completion needs committed code plus local
   checks and the clean Profile smoke required by the milestone.
-- During M5, dogfood the latest completed plugin through a real clean DSH
+- During M6–M8, dogfood the latest completed plugin through a real clean DSH
   Profile with the local package installed and the configured vLLM/PTC route.
   Aggregate incidental findings, reproduce and classify them, then create a
   separate GitHub Issue; do not opportunistically fold them into the active

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "M6 Manual Reset Boundary",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/leinasi2014/dsh-rlm",
+      "revision": "454dc65dfbfefadedcda3177ae4be42d6eed0c48"
+    },
+    "viewBox": [1240, 720],
+    "views": [
+      { "id": "ordered-reset", "label": "Ordered reset", "focus": ["agent", "tool", "queue", "kernel", "checkpoint"], "note": "The existing rlm_eval route enqueues reset by exactly one DSH Session key before private cleanup." },
+      { "id": "clean-next-cell", "label": "Fresh next cell", "focus": ["queue", "kernel", "checkpoint", "next"], "note": "After cleanup, a later code call owns a new clean kernel and has no M5 recovery source." },
+      { "id": "isolation", "label": "Isolation", "focus": ["queue", "sibling"], "note": "Reset affects only its exact Session queue, kernel, and checkpoint mapping." }
+    ]
+  },
+  "components": [
+    { "id": "agent", "type": "external", "label": "DSH Agent", "sublabel": "official Session history", "pos": [40, 292], "size": [150, 70], "sources": [{ "path": "src/runtime.ts", "label": "tool registration" }] },
+    { "id": "tool", "type": "frontend", "label": "rlm_eval", "sublabel": "{ reset: true }", "pos": [245, 292], "size": [150, 70], "sources": [{ "path": "src/runtime.ts", "label": "registerRlmPlugin" }] },
+    { "id": "queue", "type": "backend", "label": "Session FIFO", "sublabel": "one exact Session key", "pos": [455, 292], "size": [165, 70], "sources": [{ "path": "src/runtime.ts", "label": "RlmRuntimeImpl" }] },
+    { "id": "kernel", "type": "backend", "label": "Current Kernel", "sublabel": "dispose + child cleanup barrier", "pos": [680, 230], "size": [190, 70], "sources": [{ "path": "src/runtime.ts", "label": "Kernel.dispose" }] },
+    { "id": "checkpoint", "type": "security", "label": "Private M5 Checkpoint", "sublabel": "drop file + reservation", "pos": [680, 390], "size": [190, 70], "sources": [{ "path": "src/runtime.ts", "label": "dropCheckpoint" }] },
+    { "id": "next", "type": "backend", "label": "Later rlm_eval", "sublabel": "new PID; clean namespace", "pos": [945, 292], "size": [180, 70], "sources": [{ "path": "src/runtime.ts", "label": "runEntry" }] },
+    { "id": "sibling", "type": "external", "label": "Sibling Session", "sublabel": "separate queue, kernel, checkpoint", "pos": [455, 505], "size": [190, 70], "tag": "unaffected" }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "Current Session: only this private runtime state may change", "wraps": ["tool", "queue", "kernel", "checkpoint", "next"], "pad": 32 }
+  ],
+  "connections": [
+    { "id": "request", "from": "agent", "to": "tool", "label": "reset request", "variant": "emphasis", "labelAt": [218, 376] },
+    { "id": "enqueue", "from": "tool", "to": "queue", "label": "current Session key", "variant": "emphasis", "labelDy": -28 },
+    { "id": "dispose", "from": "queue", "to": "kernel", "label": "when queue head: await disposal", "variant": "emphasis", "fromSide": "right", "toSide": "left", "via": [[650, 327], [650, 265]], "labelAt": [650, 205] },
+    { "id": "drop", "from": "queue", "to": "checkpoint", "label": "drop private recovery state", "variant": "security", "fromSide": "right", "toSide": "left", "via": [[650, 327], [650, 425]], "labelAt": [650, 376] },
+    { "id": "fresh", "from": "queue", "to": "next", "label": "later code call starts clean", "variant": "emphasis", "labelAt": [785, 186] },
+    { "id": "isolate", "from": "queue", "to": "sibling", "label": "no cross-Session action", "variant": "dashed", "fromSide": "bottom", "toSide": "top", "labelAt": [537, 435] }
+  ],
+  "cards": [
+    { "dot": "emerald", "title": "Successful reset", "items": ["Runs after accepted same-Session work", "Acknowledges only after private cleanup"] },
+    { "dot": "violet", "title": "Next evaluation", "items": ["Lazy new Python PID", "No old globals, M3 context, or M5 recovery"] },
+    { "dot": "rose", "title": "Explicit non-goals", "items": ["No second tool, Agent loop, Storage Domain, or UI", "No all-Session or recursive-branch reset"] }
+  ]
+}
