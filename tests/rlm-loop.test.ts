@@ -126,6 +126,26 @@ test('M1A: rlm_query request/response resumes the cell', async () => {
   }
 })
 
+test('M8 Issue#39 RED: rlm_spawn is absent and the persistent kernel remains usable', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({ type: 'eval', id: 1, code: 'await rlm_spawn("continuable child")' })
+    const absent = await k.next()
+    assert.equal(absent.type, 'error')
+    assert.equal(absent.phase, 'eval')
+    assert.equal(absent.kind, 'runtime_error')
+    assert.equal(absent.name, 'NameError')
+    assert.match(String(absent.message), /rlm_spawn.*not defined/)
+    k.send({ type: 'eval', id: 2, code: '6 * 7' })
+    const next = await k.next()
+    assert.equal(next.type, 'result')
+    assert.equal(next.result, '42')
+  } finally {
+    await k.close()
+  }
+})
+
 test('M7 Issue#36 RED: a batch admits four queries and returns ordered text', async () => {
   const k = new Kernel()
   try {
