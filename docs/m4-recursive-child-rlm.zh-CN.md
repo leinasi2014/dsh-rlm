@@ -32,8 +32,10 @@ Session 权威，不创建第二套 Agent Loop，也不直接调用模型客户�
   `rlm_eval` 的 one-shot 叶子。
 
 运行时从官方 DSH Session/运行时元数据推导深度，并把上限传给
-`ctx.subagents.start`；不信任模型提供的深度，也不维护平行计数器。缺少
-`depthLimit` 能力的 Provider 必须显式失败；叶子执行还要求 `toolFilter`。
+`ctx.subagents.start`；不信任模型提供的深度，也不维护平行计数器。在首次
+分支准入前，它取得所选官方 Provider，并同时要求 `depthLimit` 与
+`toolFilter`：前者授权绝对上限，后者保证叶子结构性禁用。因此缺少能力时会
+在创建任何递归子节点前失败；每个子节点仍由 `start()` 作为权威执行点。
 
 ## 所有权与隔离
 
