@@ -116,13 +116,24 @@ Session 的 RLM kernel、managed context 和私有 M5 checkpoint。
 见 [M6 架构](m6-manual-reset.zh-CN.md) 与
 [M6 交付契约](m6-development-contract.zh-CN.md)。
 
-## M6 之后的有序里程碑
+## M7：有界有序批量查询
 
-M7 必须在 M6 接受后开始，M8 必须在 M7 接受后开始。
+**结果**：Python 代码可在既有 Session kernel 内调用
+`await rlm_query_batched(prompts)`。一次 batch 最多有四个普通 DSH child query
+active；成功文本按输入顺序返回。
 
-| 里程碑 | 完成结果 |
-|---|---|
-| M7 Batched query | 有界并发、顺序稳定、可取消的批量查询 |
-| M8 Continuable spawn | 官方 child/inbox 工作在 parent cell 结束后继续 |
-| F9 第二内核实现 | 第二实现与本地实现通过同一端到端闭环 |
-| F10 外部 Consumer | Jobs、UI 或 swarm 复用现有 runtime，不产生第二权威循环 |
+**退出条件**：
+
+1. 非法输入不启动 child；空输入返回空列表；
+2. child 即使乱序完成且 prompt 重复，返回列表仍完全按输入顺序；
+3. 观测到的每 batch active child 永不超过四；既有 `maxQueries`、字节、深度和 child tool deny 规则不变；
+4. 项目错误停止新准入，drain 已准入 child，再返回一个确定性类型化 failure，不污染下一 cell；
+5. cancel、timeout、reset、unload 静止所有已准入工作，M5 不把 helper bookkeeping 序列化为 user state；
+6. 单元/集成测试、独立审查、CI、remote-main read-back 和干净已安装插件 Profile smoke 均通过。
+
+见 [M7 架构](m7-batched-query.zh-CN.md) 与
+[M7 交付契约](m7-development-contract.zh-CN.md)。
+
+## M8：可继续 spawn
+
+仅当 M7 在 `main` 接受且 [Future extensions](future-extensions.md) 的对应 trigger 真实存在后，才开始 M8。

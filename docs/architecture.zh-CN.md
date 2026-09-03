@@ -1,4 +1,4 @@
-# dsh-rlm 核心与 M3/M4/M5/M6 架构
+# dsh-rlm 核心与 M3/M4/M5/M6/M7 架构
 
 > [English](architecture.md) | 简体中文
 
@@ -6,7 +6,8 @@
 
 `dsh-rlm` 只给 DeepSeek Harness 增加一条能力：模型通过一个
 `rlm_eval` 工具在持久 Python 命名空间中执行代码，并能从代码里
-`await rlm_query(prompt)` 调用模型。查询结果返回 Python 后，当前代码继续
+`await rlm_query(prompt)` 调用模型，也可调用有界便利 helper
+`await rlm_query_batched(prompts)`。查询结果返回 Python 后，当前代码继续
 计算；DSH Agent 也可以再次调用 `rlm_eval`，继续使用同一批变量。
 
 V1 的完成标准不是“基础设施齐全”，而是以下路径在真实 DSH Profile 中跑通：
@@ -24,7 +25,7 @@ DSH Agent Loop
 
 已交付的 V1 基线不包含公共 Service、Storage Domain、run ID、checkpoint、
 restore、`rlm_spawn`、Provider 框架、后台任务、UI、Workflow 或 Team。托管
-上下文、递归子 RLM、可选故障恢复与显式重置现由有序 M3、M4、M5、M6 契约约束，
+上下文、递归子 RLM、可选故障恢复、显式重置与有界批处理现由有序 M3、M4、M5、M6、M7 契约约束，
 但不属于已交付的 V1 行为。
 
 ## 2. DSH 边界
@@ -39,7 +40,7 @@ restore、`rlm_spawn`、Provider 框架、后台任务、UI、Workflow 或 Team�
 
 启用时插件恰好注册一个名为 `tool:rlm_eval`、order `150` 的 system-prompt
 section：说明持久 globals/variables、按绝对路径读取文件、顶层 `await`、
-`await rlm_query(prompt)`，以及后续 `rlm_eval` 复用同一批变量继续迭代。
+`await rlm_query(prompt)`、有界 `await rlm_query_batched(prompts)`，以及后续 `rlm_eval` 复用同一批变量继续迭代。
 禁用或卸载其 fiber 时，该 section 与工具和 runtime 一起移除；这里没有
 registry、public service 或 Provider framework。
 
@@ -85,7 +86,7 @@ context = open(path, encoding="utf-8").read()
 
 1. 保存一个持续存在的 `globals`；
 2. 串行执行支持顶层 `await` 的 cell；
-3. 暴露 `await rlm_query(prompt)`；
+3. 暴露 `await rlm_query(prompt)` 和 M7 有界 batch helper；
 4. 缓冲并截断 stdout、stderr 和结果；
 5. 通过一条小型 JSON-lines 协议与 TypeScript 宿主通信。
 
@@ -282,9 +283,9 @@ V1 通过一个 `Config` schema（`src/runtime.ts` 中的 `ConfigSchema`，由�
 也没有 registry 或 Provider/framework 表面。未知 Provider、Python 启动失败
 或 Provider 无法禁用 RLM 工具时，插件在首次使用时明确失败，不静默切换实现。
 
-## 9. 有序 M3、M4、M5 与 M6 目标
+## 9. 有序 M3、M4、M5、M6 与 M7 目标
 
-M3、M4、M5、M6 在不改变 DSH 权威边界的前提下扩展同一条单工具路径：
+M3、M4、M5、M6、M7 在不改变 DSH 权威边界的前提下扩展同一条单工具路径：
 
 ```text
 M3: rlm_eval(code, contextPath?)
@@ -302,6 +303,11 @@ M6: rlm_eval({ reset: true })
       -> FIFO 当前 Session cleanup
       -> 删除 kernel、M3 context 与 M5 checkpoint
       -> 后续携带 code 的 eval 从干净状态开始
+
+M7: kernel -> await rlm_query_batched(prompts)
+      -> 每个 batch 最多四条既有 query/child path active
+      -> index 结果按输入顺序返回
+      -> 项目失败停止准入并 drain 已准入 child
 ```
 
 - [M3 托管上下文架构](m3-managed-context.zh-CN.md) 冻结加载、原子性、限制、
@@ -312,15 +318,18 @@ M6: rlm_eval({ reset: true })
   checkpoint 的范围、原子性与恢复边界；
 - [M6 手动重置架构](m6-manual-reset.zh-CN.md) 冻结既有工具 reset 输入、FIFO
   所有权、cleanup barrier 与 Session 隔离；
+- [M7 有界有序批量查询架构](m7-batched-query.zh-CN.md) 冻结 Python-only helper、
+  固定准入上限、有序结果、failure 前 drain 与 lifecycle 复用；
 - [M3/M4 开发契约](m3-m4-development-contract.zh-CN.md) 冻结文档先行、
   M3→M4、TDD、审查、Git、dogfood 与活体验收门禁；
-- [M5 交互式验收架构图](m5-session-snapshot-recovery.html) 与
-  [M6 reset 边界图](m6-manual-reset.html) 由受版本管理 Archify 源生成；
+- [M5 交互式验收架构图](m5-session-snapshot-recovery.html)、
+  [M6 reset 边界图](m6-manual-reset.html) 与
+  [M7 batch 边界图](m7-batched-query.html) 均由受版本管理 Archify 源生成；
 - [交互式目标架构图](dsh-rlm-architecture.html) 由受版本管理的
   [Archify 源](dsh-rlm-architecture.archify.json) 生成。
 
-Storage、宿主重启持久化、continuable spawn、批量查询和第二 runtime 仍不在范围内，
-直至其有序契约被接受。M5 必须被接受后才开始 M6；M6 在 M7 前，M7 在 M8 前。
+Storage、宿主重启持久化、continuable spawn、provider-native batching 和第二 runtime 仍不在范围内，
+直至其有序契约被接受。M6 必须被接受后才开始 M7；M7 在 M8 前。
 
 ## 10. 首个验收场景
 

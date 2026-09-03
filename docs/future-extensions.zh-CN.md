@@ -25,7 +25,7 @@
 |---|---|---|---|
 | Continuable spawn | 一个任务必须在父 cell 结束后继续工作 | 使用官方 continuable Subagent 和 inbox；不把答案塞进 handle | 父 cell 结束后子 Session 继续，并由官方 Session 路径交付结果 |
 | 跨宿主持久 Session | 用户要求插件重启后继续同一 RLM 会话 | 只持久化恢复所需元数据和 snapshot 引用 | 重启后同一 Session 能恢复；版本不匹配明确失败 |
-| Batched query | 顺序 query 的实测延迟成为瓶颈 | 一个有并发上限的 `rlm_query_batched` | 批量结果保持输入顺序，取消能终止全部子调用 |
+| M7 Batched query | 顺序 query 的实测延迟成为瓶颈 | 一个有并发上限的 `rlm_query_batched` | 批量结果保持输入顺序，取消能终止全部子调用 |
 | 第二个内核实现 | container 或 remote kernel 已开始实现 | 从现有 runtime 抽取最小 `KernelDriver` 接口 | 本地与第二实现通过同一闭环场景 |
 | Token/费用护栏 | 实际 Provider 暴露可靠用量，且发生可复现的费用控制问题 | 在 query 准入点读取已观测用量并拒绝后续调用 | 达到限制后停止新 query，不伪造未观测 token |
 | Jobs、UI、swarm | 有点名 Consumer 和端到端场景 | 作为现有 runtime 的 Consumer，不进入 Python core | 新 Consumer 不改变 `rlm_eval` 和 Session 权威 |
@@ -44,3 +44,7 @@
 M5 已用可选、每个已加载 runtime 的 checkpoint 满足 timeout/crash 的已观测触发条件；
 M6 通过既有 `rlm_eval` 路径拥有显式清理状态的触发条件。跨主机或宿主重启持久化
 仍是单独条件扩展，未经新契约不得复用 M5 私有映射。
+
+M7 现由其[有界有序批量契约](m7-batched-query.zh-CN.md)约束。它仍只是既有 bridge
+上的私有 Python helper；provider-native batching、全局调度和 durable batch work
+仍是条件扩展。
