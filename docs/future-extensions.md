@@ -6,9 +6,9 @@ This document is not a V1 backlog. Add a capability only after the real Profile
 loop in [Core architecture](architecture.md) passes and the matching trigger
 below exists.
 
-Managed Context, Recursive Child RLM, Snapshot Recovery, and Manual Reset are
-ordered [M3–M6](milestones.md) contracts. This table starts with capabilities
-that remain conditional after M6.
+Managed Context through Batched Query are accepted ordered
+[M3–M7](milestones.md) contracts. Continuable spawn is now Issue #39's frozen
+next slice; the remaining rows are conditional after M7.
 
 ## Invariants
 

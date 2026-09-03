@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "M8 Continuable Child RLM",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [1360, 760],
+    "repository": {
+      "url": "https://github.com/leinasi2014/dsh-rlm.git",
+      "revision": "742885b5b608d4ed83a92752fe40a513464595e7"
+    }
+  },
+  "components": [
+    { "id": "parent", "type": "external", "label": "Parent DSH Agent", "sublabel": "official Session and Agent loop", "pos": [40, 280], "size": [180, 72] },
+    { "id": "kernel", "type": "backend", "label": "Session Python Kernel", "sublabel": "rlm_spawn / rlm_followup only", "pos": [290, 280], "size": [195, 72], "sources": [{ "path": "python-runtime/rlm_kernel.py", "label": "persistent kernel" }] },
+    { "id": "bridge", "type": "backend", "label": "Existing RLM Host Bridge", "sublabel": "one rlm_eval tool; no second loop", "pos": [560, 280], "size": [205, 72], "sources": [{ "path": "src/runtime.ts", "label": "plugin runtime" }] },
+    { "id": "manager", "type": "security", "label": "Official DSH Subagent Manager", "sublabel": "startContinuable · followup · reportFrom", "pos": [840, 280], "size": [225, 72], "tag": "installed rc.2 authority" },
+    { "id": "child", "type": "cloud", "label": "Continuable Child Session", "sublabel": "durable identity; official FIFO inbox", "pos": [1090, 280], "size": [210, 72] },
+    { "id": "inbox", "type": "messagebus", "label": "Parent Official Inbox", "sublabel": "child report / settlement only", "pos": [840, 510], "size": [225, 72] }
+  ],
+  "boundaries": [
+    { "kind": "region", "label": "dsh-rlm scope: Python helpers reuse the existing host bridge", "wraps": ["kernel", "bridge"] },
+    { "kind": "security-group", "label": "Official DSH ownership boundary", "wraps": ["manager", "child", "inbox"] }
+  ],
+  "connections": [
+    { "id": "eval", "from": "parent", "to": "kernel", "label": "rlm_eval cell", "variant": "emphasis" },
+    { "id": "spawn", "from": "kernel", "to": "bridge", "label": "opaque spawn request", "labelDy": 60 },
+    { "id": "start", "from": "bridge", "to": "manager", "label": "startContinuable", "variant": "security", "labelDy": 60 },
+    { "id": "activate", "from": "manager", "to": "child", "label": "initial inbox message", "labelDy": 60 },
+    { "id": "followup", "from": "kernel", "to": "manager", "label": "followup(child id, content)", "variant": "dashed", "fromSide": "bottom", "toSide": "bottom" },
+    { "id": "report", "from": "child", "to": "inbox", "label": "reportFrom / settlement", "variant": "emphasis", "fromSide": "bottom", "toSide": "right" },
+    { "id": "parent-read", "from": "inbox", "to": "parent", "label": "next official turn", "variant": "security", "fromSide": "left", "toSide": "bottom" }
+  ],
+  "cards": [
+    { "dot": "cyan", "title": "Outcome", "items": ["A child outlives the initiating Python cell", "The handle is an opaque child id, never a result"] },
+    { "dot": "emerald", "title": "Authority", "items": ["DSH owns durable identity, FIFO inbox and delivery", "The parent Session log remains model-visible history"] },
+    { "dot": "rose", "title": "Non-goals", "items": ["No custom queue, scheduler, Storage Domain or second Agent loop", "No child result injected into a later Python cell"] }
+  ]
+}

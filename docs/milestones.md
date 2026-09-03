@@ -165,3 +165,9 @@ See [M7 architecture](m7-batched-query.md) and the
 
 Start M8 only after M7 is accepted on `main` and its matching trigger in
 [Future extensions](future-extensions.md) is real.
+
+Issue #39 now freezes the thin contract: private Python spawn/follow-up helpers
+reuse the official continuable Subagent manager and its parent inbox; they do
+not return child answers or create a plugin queue. See
+[M8 architecture](m8-continuable-spawn.md) and the
+[M8 delivery contract](m8-development-contract.md).
