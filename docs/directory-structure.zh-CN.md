@@ -8,21 +8,21 @@
   限制的 Subagent/Session、处理取消和插件 dispose。
 - **Python 3.11+**：保存 globals、执行 cell，并通过宿主回调实现
   `await rlm_query()`；M3 还在内核内执行有界、严格 UTF-8 的托管文件加载，
-  避免上下文字节跨越宿主帧。
+  M5 则验证、原子写入并恢复私有 checkpoint，避免 checkpoint 字节跨越宿主帧。
 
-M3/M4 保持 V1 形态：一个 npm 包加一个 Python 脚本，不拆 Service、Provider、
+M3/M4/M5 保持 V1 形态：一个 npm 包加一个 Python 脚本，不拆 Service、Provider、
 Context Domain、递归调度器或协议包。只有真实可测试职责越过项目大小门禁时才拆。
 
-## M1-M4 目标目录
+## M1-M5 目标目录
 
 ```text
 dsh-rlm/
 ├─ package.json
 ├─ src/
 │  ├─ index.ts             # 配置、system prompt、rlm_eval 注册与 dispose
-│  └─ runtime.ts           # Session 内核、协议、托管上下文、query bridge
+│  └─ runtime.ts           # Session 内核、协议、context、query、私有 checkpoint 根
 ├─ python-runtime/
-│  └─ rlm_kernel.py        # globals、top-level await、托管加载、rlm_query
+│  └─ rlm_kernel.py        # globals、top-level await、托管加载、checkpoint、rlm_query
 ├─ tests/
 │  ├─ rlm-loop.test.ts     # Python/query/跨 cell 闭环
 │  ├─ profile-smoke.test.ts# 真实 DSH Profile 组合

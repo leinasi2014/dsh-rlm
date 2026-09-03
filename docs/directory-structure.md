@@ -9,23 +9,24 @@
   and handles plugin disposal.
 - **Python 3.11+** owns globals, executes cells, and implements
   `await rlm_query()` through a host callback. In M3 it also performs bounded,
-  strict-UTF-8 managed file loading so context bytes never cross a host frame.
+  strict-UTF-8 managed file loading; in M5 it validates, atomically writes, and
+  restores the private checkpoint without placing checkpoint bytes on a frame.
 
-M3/M4 retain the V1 shape: one npm package plus one Python script. They do not
+M3/M4/M5 retain the V1 shape: one npm package plus one Python script. They do not
 split out a Service, Provider, context domain, recursive scheduler, or protocol
 package. A source file may be split only when a real testable responsibility
 crosses the existing project size gate.
 
-## M1-M4 layout target
+## M1-M5 layout target
 
 ```text
 dsh-rlm/
 ├─ package.json
 ├─ src/
 │  ├─ index.ts              # config, system prompt, tool registration, dispose
-│  └─ runtime.ts            # Session kernels, protocol, managed context, query bridge
+│  └─ runtime.ts            # Session kernels, protocol, context, query, private checkpoint root
 ├─ python-runtime/
-│  └─ rlm_kernel.py         # globals, top-level await, managed load, rlm_query
+│  └─ rlm_kernel.py         # globals, top-level await, managed load, checkpoint, rlm_query
 ├─ tests/
 │  ├─ rlm-loop.test.ts      # Python/query/cross-cell loop
 │  ├─ profile-smoke.test.ts # real DSH Profile composition

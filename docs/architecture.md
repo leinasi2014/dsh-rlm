@@ -1,4 +1,4 @@
-# dsh-rlm Core and M3/M4 Architecture
+# dsh-rlm Core and M3/M4/M5 Architecture
 
 > English | [简体中文](architecture.zh-CN.md)
 
@@ -25,9 +25,9 @@ DSH Agent Loop
 
 The delivered V1 baseline does not include a public Service, Storage Domain,
 run ID, checkpoint, restore, `rlm_spawn`, Provider framework, background jobs,
-UI, Workflow, or Team. Managed context and recursive child RLM have now been
-promoted into the ordered M3 and M4 contracts below; they are not part of the
-already-delivered V1 behavior.
+UI, Workflow, or Team. Managed context, recursive child RLM, and opt-in fault
+recovery are governed by the ordered M3, M4, and M5 contracts below; they are
+not part of the already-delivered V1 behavior.
 
 ## 2. DSH boundary
 
@@ -62,6 +62,7 @@ interface RlmEvalResult {
   stdout: string
   result?: string
   truncated: boolean
+  recovery?: { restored: boolean; checkpointCommitted: boolean }
 }
 ```
 
@@ -171,6 +172,17 @@ and outputs must be byte-bounded. A cell emits exactly one terminal `result` or
 - Plugin unload: reject new cells and terminate all owned Python processes.
 
 V1 does not promise variable recovery after a fault.
+
+### Opt-in recovery state (M5)
+
+With `snapshotRecovery=true`, an eligible timeout, process exit, or fatal
+protocol fault retains the last private checkpoint for that runtime/Session.
+The replacement kernel restores it before the next cell. Cancellation and
+unload delete it; host restart has no recovery mapping. The checkpoint is
+bounded JSON-safe globals plus protected M3 context, stored atomically in a
+private runtime temporary root. Its values never enter a model-visible frame or
+tool result; only bounded recovery status can be returned. See the
+[M5 architecture](m5-session-snapshot-recovery.md).
 
 ### Cancellation state machine (M2)
 
@@ -298,6 +310,8 @@ V1 is configured through one `Config` schema (`ConfigSchema` in
 - `maxQueries` (default `16`): integer `1..4096` `rlm_query` calls per cell.
 - `maxContextBytes` (default `67108864`): integer `1048576..1073741824` source
   bytes for one kernel-managed UTF-8 file context.
+- `snapshotRecovery` (default `false`): enable the fixed-limit, private M5
+  fault checkpoint; it is not durable Session storage.
 
 The validated config object is passed directly to `createRlmRuntime`; the
 plugin adds no environment passthrough and no registry or Provider/framework
@@ -305,9 +319,9 @@ surface. An unknown Provider, Python startup failure, or Provider that cannot
 deny the RLM tool must fail explicitly rather than silently switching
 implementation.
 
-## 9. Ordered M3 and M4 target
+## 9. Ordered M3, M4, and M5 target
 
-M3 and M4 extend the same single-tool path without changing the DSH authority
+M3, M4, and M5 extend the same single-tool path without changing the DSH authority
 boundary:
 
 ```text
@@ -318,20 +332,27 @@ M4: kernel -> rlm_query(prompt)
       -> depth-bounded official child DSH Session
       -> child owns its own rlm_eval kernel when below maxDepth
       -> leaf denies rlm_eval at maxDepth
+
+M5: successful cell -> private atomic checkpoint
+      -> eligible kernel fault -> restore before next cell
 ```
 
 - [M3 Managed Context architecture](m3-managed-context.md) freezes loading,
   atomicity, limits, errors, and Session isolation.
 - [M4 Recursive Child RLM architecture](m4-recursive-child-rlm.md) freezes
   official depth authority, per-Session kernels, and descendant quiescence.
+- [M5 Session Snapshot Recovery architecture](m5-session-snapshot-recovery.md)
+  freezes opt-in checkpoint scope, atomicity, and recovery boundaries.
 - [M3/M4 development contract](m3-m4-development-contract.md) freezes the
   docs-first, M3-before-M4, TDD, review, Git, dogfood, and live gates.
+- The [M5 interactive acceptance diagram](m5-session-snapshot-recovery.html) is
+  generated from the tracked [Archify source](m5-session-snapshot-recovery.archify.json).
 - The [interactive target diagram](dsh-rlm-architecture.html) is generated from
   the tracked [Archify source](dsh-rlm-architecture.archify.json).
 
-Storage, snapshots, continuable spawn, batch queries, and a second runtime
-remain out of scope. M3 must merge and pass its clean-Profile acceptance before
-M4 production work starts.
+Storage, host-restart persistence, continuable spawn, batch queries, and a
+second runtime remain out of scope. M3 must merge and pass before M4 production
+work starts; M4 must be accepted before M5 production work starts.
 
 ## 10. First acceptance scenario
 

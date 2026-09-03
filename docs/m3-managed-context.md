@@ -72,7 +72,8 @@ M3 does not promise recovery across restarts.
 - automatic attachment resolution (the current official DSH attachment API is
   image-oriented and is not a stable text-source authority);
 - chunking, summarization, embeddings, retrieval, watch/reload, or mmap;
-- snapshot/restore or cross-host persistence;
+- snapshot/restore within M3 itself or cross-host persistence (M5 later adds
+  a narrowly bounded, private runtime checkpoint);
 - a new model-facing tool or public service.
 
 ## Acceptance examples

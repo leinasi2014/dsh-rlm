@@ -10,18 +10,20 @@ DSH Agent -> rlm_eval(code) -> Session Python kernel
   -> text returns to Python -> cell continues -> next rlm_eval can reuse globals
 ```
 
-M1/M2 are delivered. Extend the same loop in strict order: M3 Managed Context,
-then M4 Recursive Child RLM. Do not add a second agent loop, public service,
-storage domain, checkpoint system, UI, Workflow, Jobs, or provider framework.
+M1/M2/M3/M4 are delivered. Extend the same loop only with M5 Session Snapshot
+Recovery: an opt-in, private per-runtime checkpoint after owned kernel loss.
+Do not add a second agent loop, public service, Storage Domain, host-restart
+persistence, UI, Workflow, Jobs, or provider framework.
 
 ## Development Rules
 
 - Treat `docs/architecture.md`, `docs/directory-structure.md`,
   `docs/milestones.md`, and `docs/future-extensions.md` as the current product
   boundary.
-- For M3/M4, also treat `docs/m3-managed-context.md`,
-  `docs/m4-recursive-child-rlm.md`, and `docs/m3-m4-development-contract.md` as
-  binding; English is authoritative and each has a Chinese mirror.
+- For M5, also treat `docs/m5-session-snapshot-recovery.md` and
+  `docs/m5-development-contract.md` as binding; English is authoritative and
+  each has a Chinese mirror. M3/M4 documents remain binding for their owned
+  boundaries.
 - Keep the V1 source layout small:
   - `src/index.ts`
   - `src/runtime.ts`
@@ -87,10 +89,11 @@ storage domain, checkpoint system, UI, Workflow, Jobs, or provider framework.
    and dispose.
 6. Prove the M1 loop in tests and in a clean DSH Profile using the configured
    `DeepSeek-V4-Flash-Vision-Exp` vLLM/PTC model path.
-7. Implement M3 Managed Context only after its docs slice is integrated; close
-   it through TDD, independent review, CI, remote-main read-back, and live smoke.
-8. Implement M4 Recursive Child RLM only after M3 is accepted on `main`; reuse
-   official DSH depth/Session/Subagent authority and prove depth 2 and 3 live.
+7. M3 and M4 are accepted on `main`; preserve their contract boundaries.
+8. Implement M5 only after its docs slice is integrated: use strict TDD to
+   recover a bounded JSON-safe checkpoint plus protected M3 context after an
+   owned timeout/crash/protocol-fatal loss; cancellation, unload, and host
+   restart remain clean-state behavior.
 
 ## Milestone Split
 
@@ -107,6 +110,7 @@ storage domain, checkpoint system, UI, Workflow, Jobs, or provider framework.
 - M2: local reliability baseline after M1 passes.
 - M3: managed absolute UTF-8 context loading with atomic Session-local state.
 - M4: depth-bounded recursive child DSH Sessions with isolated RLM kernels.
+- M5: opt-in, private runtime checkpoint recovery after eligible kernel loss.
 
 ## PTC / Multi-Agent Coordination
 
@@ -134,7 +138,8 @@ storage domain, checkpoint system, UI, Workflow, Jobs, or provider framework.
   active assignment.
 - A model report is not completion. Completion needs committed code plus local
   checks and the clean Profile smoke required by the milestone.
-- During M3/M4, dogfood the latest completed plugin through the real DSH UI.
+- During M5, dogfood the latest completed plugin through a real clean DSH
+  Profile with the local package installed and the configured vLLM/PTC route.
   Aggregate incidental findings, reproduce and classify them, then create a
   separate GitHub Issue; do not opportunistically fold them into the active
   milestone unless they block its acceptance.
@@ -198,6 +203,9 @@ plugin from the local package, enables it, selects the configured
 3. `await rlm_query(...)` returns visible text and Python continues executing;
 4. a second `rlm_eval` sees variables from the first cell;
 5. the official Session log contains the tool calls and bounded results.
+6. with `snapshotRecovery=true`, a timeout/crash starts a new kernel and the
+   next same-Session `rlm_eval` restores supported state without exposing
+   checkpoint values or context text in the model-visible log.
 
 If this smoke cannot run, report the exact product blocker and keep improving the
 nearest executable slice instead of creating more design documents.

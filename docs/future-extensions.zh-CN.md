@@ -6,7 +6,7 @@
 闭环通过后，且下表触发条件已经出现，才添加对应能力。
 
 托管上下文与递归子 RLM 已经获得被接受的需求证据，不再是条件项；它们成为
-有序的 [M3 与 M4](milestones.zh-CN.md) 契约。下表从 M4 之后仍需证据触发的
+有序的 [M3、M4 与 M5](milestones.zh-CN.md) 契约。下表从 M5 之后仍需证据触发的
 能力开始。
 
 ## 不变边界
@@ -25,7 +25,6 @@
 | 能力 | 触发条件 | 最小增加 | 验收结果 |
 |---|---|---|---|
 | 手动 reset | 用户需要主动清空变量或释放内核 | 给 `rlm_eval` 增加 `reset` 操作，或增加一个 `rlm_reset` 工具 | 只清理当前 Session，其他 Session 不受影响 |
-| Snapshot/restore | 一个被接受的用例要求在超时、崩溃或宿主重启后保留变量 | Python 序列化支持的 globals；临时文件原子替换；失败时明确丢失 | kill 后重启能恢复支持的变量，并报告跳过项 |
 | Continuable spawn | 一个任务必须在父 cell 结束后继续工作 | 使用官方 continuable Subagent 和 inbox；不把答案塞进 handle | 父 cell 结束后子 Session 继续，并由官方 Session 路径交付结果 |
 | 跨宿主持久 Session | 用户要求插件重启后继续同一 RLM 会话 | 只持久化恢复所需元数据和 snapshot 引用 | 重启后同一 Session 能恢复；版本不匹配明确失败 |
 | Batched query | 顺序 query 的实测延迟成为瓶颈 | 一个有并发上限的 `rlm_query_batched` | 批量结果保持输入顺序，取消能终止全部子调用 |
@@ -43,3 +42,6 @@
 4. 什么端到端结果证明功能完成？
 
 如果没有可运行触发场景，答案就是“不添加”。
+
+M5 已用可选、每个已加载 runtime 的 checkpoint 满足 timeout/crash 的已观测触发条件。
+跨主机或宿主重启持久化仍是单独条件扩展，未经新契约不得复用 M5 私有映射。

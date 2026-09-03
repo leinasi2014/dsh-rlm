@@ -84,7 +84,7 @@ class Kernel {
 async function ready(k: Kernel): Promise<void> {
   const frame = await k.next()
   assert.equal(frame.type, 'ready')
-  assert.equal(frame.version, 2)
+  assert.equal(frame.version, 3)
 }
 
 test('M1A: persistent globals and top-level await across cells', async () => {
@@ -1565,7 +1565,7 @@ test('M2 Issue#1 successor: startup and cell share one total deadline', async ()
       `import time
 time.sleep(0.5)
 import sys, json
-sys.stdout.write(json.dumps({"type": "ready", "version": 2}) + "\\n")
+sys.stdout.write(json.dumps({"type": "ready", "version": 3}) + "\\n")
 sys.stdout.flush()`,
       async (pidFile) => {
         const start = Date.now()
@@ -3361,6 +3361,8 @@ test('M2 Issue#6 / M3 Issue#24: Config schema defaults and range-validates runti
   assert.equal(parsed.maxQueries, 16)
   assert.equal(parsed.maxDepth, 1)
   assert.equal(parsed.maxContextBytes, 67108864)
+  assert.equal(parsed.snapshotRecovery, false)
+  assert.equal(S({ snapshotRecovery: true }).snapshotRecovery, true)
   assert.throws(() => S({ python: '' }))
   assert.throws(() => S({ timeout: 999 }))
   assert.throws(() => S({ timeout: 3600001 }))
@@ -3639,6 +3641,127 @@ test('M3 Issue#24: a post-read pathname identity change is rejected before publi
   try {
     const result = spawnSync(pythonCmd, ['-c', script, kernelPath, contextPath, replacementPath], { encoding: 'utf8' })
     assert.equal(result.status, 0, 'path replacement must be a typed context failure; stderr: ' + result.stderr)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('M5 Issue#31: an owned timeout restores JSON-safe globals and checkpointed managed context in a new kernel', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m5-context-'))
+  const contextPath = path.join(dir, 'context.txt')
+  writeFileSync(contextPath, 'checkpointed context', 'utf8')
+  const runtime = rt({ snapshotRecovery: true, timeout: 5_000, maxContextBytes: 1024 * 1024 })
+  try {
+    const first = await runtime.eval('m5-recover', {
+      code: 'm5_value = {"items": [1, True], "label": "saved"}\nimport os\nos.getpid()',
+      contextPath,
+    })
+    const firstPid = Number(first.result)
+    assert.ok(first.recovery?.checkpointCommitted, 'successful cell must publish the private checkpoint')
+    await assert.rejects(
+      runtime.eval('m5-recover', { code: 'import time\ntime.sleep(1)', timeout: 100 }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'timeout',
+    )
+    writeFileSync(contextPath, 'changed source', 'utf8')
+    const restored = await runtime.eval('m5-recover', {
+      code: '[m5_value, context, context_meta["bytes"], __import__("os").getpid()]',
+    })
+    assert.match(restored.result ?? '', /^\[\{'items': \[1, True\], 'label': 'saved'\}, 'checkpointed context', 20, \d+\]$/)
+    assert.ok(restored.recovery?.restored, 'replacement kernel must report recovery')
+    const restoredPid = Number(restored.result!.match(/(\d+)\]$/)?.[1])
+    assert.ok(Number.isInteger(restoredPid) && restoredPid > 0 && restoredPid !== firstPid, 'timeout must use a fresh PID')
+    await assert.rejects(
+      runtime.eval('m5-recover', { code: 'm5_value["label"] = "after-restore"\nraise RuntimeError("keep live mutation")' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+    const later = await runtime.eval('m5-recover', { code: 'm5_value["label"]' })
+    assert.equal(later.result, 'after-restore', 'restore must be consumed once, not replayed before every cell')
+  } finally {
+    await runtime.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('M5 Issue#31: caller cancellation deletes the private checkpoint instead of restoring it', async () => {
+  const runtime = rt({ snapshotRecovery: true, timeout: 5_000 })
+  try {
+    await runtime.eval('m5-cancel', { code: 'm5_cancel_value = "must disappear"' })
+    const controller = new AbortController()
+    const running = runtime.eval('m5-cancel', { code: 'import time\ntime.sleep(5)', signal: controller.signal })
+    setTimeout(() => controller.abort('test cancellation'), 50)
+    await assert.rejects(running, (err: unknown) => err instanceof RlmError && err.kind === 'cancel')
+    await assert.rejects(
+      runtime.eval('m5-cancel', { code: 'm5_cancel_value' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('M5 Issue#31: unsupported globals are omitted and reported without exposing their values', async () => {
+  const runtime = rt({ snapshotRecovery: true, timeout: 5_000 })
+  try {
+    const first = await runtime.eval('m5-skipped', { code: 'm5_supported = "kept"\nm5_unsupported = lambda: "secret"' })
+    assert.ok(first.recovery?.checkpointCommitted)
+    assert.ok(first.recovery?.skipped?.some((item) => item.startsWith('m5_unsupported: unsupported function')))
+    await assert.rejects(runtime.eval('m5-skipped', { code: 'import time\ntime.sleep(1)', timeout: 100 }))
+    const restored = await runtime.eval('m5-skipped', { code: 'm5_supported' })
+    assert.equal(restored.result, 'kept')
+    await assert.rejects(
+      runtime.eval('m5-skipped', { code: 'm5_unsupported' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('M5 Issue#31 RED: a lone-surrogate global is skipped without crashing checkpoint publication', async () => {
+  const runtime = rt({ snapshotRecovery: true, timeout: 5_000 })
+  try {
+    await runtime.eval('m5-surrogate', { code: 'm5_prior = "kept"' })
+    const out = await runtime.eval('m5-surrogate', { code: 'm5_surrogate = "\\ud800"\nm5_surrogate_key = {"\\ud800": 1}' })
+    assert.equal(out.recovery?.checkpointCommitted, true)
+    assert.ok(out.recovery?.skipped?.some((item) => item.startsWith('m5_surrogate: invalid UTF-8 string')))
+    assert.ok(out.recovery?.skipped?.some((item) => item.startsWith('m5_surrogate_key: invalid UTF-8 dictionary key')))
+    await assert.rejects(runtime.eval('m5-surrogate', { code: 'import time\ntime.sleep(1)', timeout: 100 }))
+    assert.equal((await runtime.eval('m5-surrogate', { code: 'm5_prior' })).result, 'kept')
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('M5 Issue#31 RED: corrupt checkpoint context metadata and deep JSON fail closed as typed snapshot errors', () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m5-corrupt-'))
+  const metadataPath = path.join(dir, 'metadata.json')
+  const deepPath = path.join(dir, 'deep.json')
+  const surrogatePath = path.join(dir, 'surrogate.json')
+  const nonStringPath = path.join(dir, 'non-string-path.json')
+  writeFileSync(metadataPath, JSON.stringify({
+    version: 1,
+    variables: {},
+    context: { text: 'abc', meta: { kind: 'file', path: path.join(dir, 'source.txt'), bytes: 999 } },
+  }))
+  writeFileSync(deepPath, '{"version":1,"variables":{"x":' + '['.repeat(1200) + '0' + ']'.repeat(1200) + '},"context":null}')
+  writeFileSync(surrogatePath, '{"version":1,"variables":{},"context":{"text":"\\ud800","meta":{"kind":"file","path":"' + path.join(dir, 'source.txt').replaceAll('\\', '\\\\') + '","bytes":1}}}')
+  writeFileSync(nonStringPath, JSON.stringify({ version: 1, variables: {}, context: { text: 'x', meta: { kind: 'file', path: 7, bytes: 1 } } }))
+  const script = [
+    'import importlib.util, sys',
+    'spec = importlib.util.spec_from_file_location("rlm_kernel_under_test", sys.argv[1])',
+    'module = importlib.util.module_from_spec(spec)',
+    'assert spec.loader is not None',
+    'spec.loader.exec_module(module)',
+    'for checkpoint in sys.argv[2:]:',
+    '    try:',
+    '        module.RlmKernel()._restore_checkpoint(checkpoint, 1024 * 1024)',
+    '    except module.RlmSnapshotError:',
+    '        continue',
+    '    raise SystemExit(1)',
+  ].join('\n')
+  try {
+    const result = spawnSync(pythonCmd, ['-c', script, kernelPath, metadataPath, deepPath, surrogatePath, nonStringPath], { encoding: 'utf8' })
+    assert.equal(result.status, 0, 'corrupt checkpoints must become typed snapshot errors; stderr: ' + result.stderr)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

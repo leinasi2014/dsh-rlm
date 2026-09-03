@@ -1,6 +1,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
+import { createHash } from 'node:crypto'
+import { mkdtempSync, rmSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -13,13 +16,15 @@ const KERNEL_PATH = path.resolve(
   'python-runtime',
   'rlm_kernel.py',
 )
-const PROTOCOL_VERSION = 2
+const PROTOCOL_VERSION = 3
 const DEFAULT_TIMEOUT = 30_000
 const DEFAULT_MAX_STDOUT = 64 * 1024
 const DEFAULT_MAX_RESULT = 64 * 1024
 const DEFAULT_MAX_QUERIES = 16
 const DEFAULT_MAX_CONTEXT_BYTES = 64 * 1024 * 1024
 const DEFAULT_MAX_DEPTH = 1
+const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+const MAX_SNAPSHOT_ROOT_BYTES = 64 * 1024 * 1024
 const MAX_FRAME_BYTES = 256 * 1024
 const MAX_STDERR_BYTES = 64 * 1024
 const MAX_QUERY_RESULT_BYTES = 64 * 1024
@@ -201,6 +206,8 @@ export interface RlmRuntimeConfig {
   maxQueries?: number
   /** Byte cap for one kernel-managed UTF-8 context file. */
   maxContextBytes?: number
+  /** Opt-in M5 recovery after an owned timeout/crash/protocol-fatal loss. */
+  snapshotRecovery?: boolean
 }
 
 /** Plugin-facing configuration: runtime settings plus the subagent provider. */
@@ -225,6 +232,7 @@ export const ConfigSchema: z<RlmPluginConfig> = z.object({
   maxResult: z.natural().min(1024).max(262144).default(65536).description('Byte cap for a cell last-expression result.'),
   maxQueries: z.natural().min(1).max(4096).default(16).description('Max rlm_query calls per cell.'),
   maxContextBytes: z.natural().min(1048576).max(1073741824).default(67108864).description('Byte cap for one kernel-managed UTF-8 context file.'),
+  snapshotRecovery: z.boolean().default(false).description('Restore a private bounded checkpoint after an owned kernel fault.'),
   maxDepth: z.natural().min(1).max(8).default(DEFAULT_MAX_DEPTH).description('Absolute DSH delegation-depth cap for recursive rlm_query children.'),
 })
 
@@ -255,6 +263,7 @@ export interface RlmEvalOutput {
   stdout: string
   result?: string
   truncated: boolean
+  recovery?: { restored: boolean; checkpointCommitted: boolean; checkpointBytes?: number; skipped?: string[]; reason?: string }
 }
 
 export type RlmErrorKind =
@@ -266,18 +275,19 @@ export type RlmErrorKind =
   | 'eval' // the Python cell failed with a typed error
   | 'query' // an rlm_query call failed
   | 'context' // a managed context source was rejected atomically
+  | 'snapshot' // a private M5 checkpoint failed closed
   | 'protocol' // the kernel violated the protocol and was terminated
 
 export class RlmError extends Error {
   readonly kind: RlmErrorKind
-  readonly phase?: 'eval' | 'query' | 'context'
+  readonly phase?: 'eval' | 'query' | 'context' | 'snapshot'
   readonly detailed?: string
   /** True when the underlying error frame reported a truncation. */
   readonly truncated: boolean
   constructor(
     kind: RlmErrorKind,
     message: string,
-    opts: { phase?: 'eval' | 'query' | 'context'; detailed?: string; truncated?: boolean } = {},
+    opts: { phase?: 'eval' | 'query' | 'context' | 'snapshot'; detailed?: string; truncated?: boolean } = {},
   ) {
     super(message)
     this.name = 'RlmError'
@@ -333,7 +343,7 @@ class Kernel {
   readonly key: string
   child: ChildProcess | null = null
   private config: Required<
-    Pick<RlmRuntimeConfig, 'python' | 'timeout' | 'maxStdout' | 'maxResult' | 'maxQueries' | 'maxContextBytes'>
+    Pick<RlmRuntimeConfig, 'python' | 'timeout' | 'maxStdout' | 'maxResult' | 'maxQueries' | 'maxContextBytes' | 'snapshotRecovery'>
   >
   private buf = ''
   private exited = false
@@ -355,9 +365,13 @@ class Kernel {
   /** True once the kernel was evicted from the session map (exactly once). */
   private evicted = false
   private disposedPromise: Promise<void> | undefined
+  private readonly snapshotPath: string | undefined
+  private restoreSnapshot: boolean
+  private readonly maxSnapshotBytes: number
+  private retainCheckpoint = true
   onExit: ((k: Kernel) => void) | null = null
 
-  constructor(key: string, config: RlmRuntimeConfig) {
+  constructor(key: string, config: RlmRuntimeConfig, snapshot?: { path: string; restore: boolean; maxBytes: number }) {
     this.key = key
     this.config = {
       python: config.python ?? 'python',
@@ -366,7 +380,11 @@ class Kernel {
       maxResult: config.maxResult ?? DEFAULT_MAX_RESULT,
       maxQueries: config.maxQueries ?? DEFAULT_MAX_QUERIES,
       maxContextBytes: config.maxContextBytes ?? DEFAULT_MAX_CONTEXT_BYTES,
+      snapshotRecovery: config.snapshotRecovery ?? false,
     }
+    this.snapshotPath = snapshot?.path
+    this.restoreSnapshot = snapshot?.restore === true
+    this.maxSnapshotBytes = snapshot?.maxBytes ?? 0
     this.ready = new Promise<void>((resolve, reject) => {
       this.resolveReady = resolve
       this.rejectReady = reject
@@ -668,6 +686,16 @@ class Kernel {
       truncated: frame.truncated === true,
     }
     if (typeof frame.result === 'string') out.result = frame.result
+    if (frame.recovery && typeof frame.recovery === 'object' && !Array.isArray(frame.recovery)) {
+      const recovery = frame.recovery as Record<string, unknown>
+      out.recovery = {
+        restored: recovery.restored === true,
+        checkpointCommitted: recovery.checkpoint_committed === true,
+      }
+      if (typeof recovery.checkpoint_bytes === 'number') out.recovery.checkpointBytes = recovery.checkpoint_bytes
+      if (Array.isArray(recovery.skipped)) out.recovery.skipped = recovery.skipped.filter((x): x is string => typeof x === 'string').slice(0, 64)
+      if (typeof recovery.reason === 'string') out.recovery.reason = recovery.reason
+    }
     if (!this.cellFinish) this.cellFinish = this.finishCell(p, out)
   }
 
@@ -682,8 +710,8 @@ class Kernel {
     this.pending = null
     // Block routing now; the public settle waits for child quiescence.
     this.settling = true
-    const phase = frame.phase === 'query' || frame.phase === 'context' ? frame.phase : 'eval'
-    const kind = phase === 'query' ? 'query' : phase === 'context' ? 'context' : 'eval'
+    const phase = frame.phase === 'query' || frame.phase === 'context' || frame.phase === 'snapshot' ? frame.phase : 'eval'
+    const kind = phase === 'query' ? 'query' : phase === 'context' ? 'context' : phase === 'snapshot' ? 'snapshot' : 'eval'
     const message = safeErrorText(frame.message ?? 'kernel reported an error')
     if (!this.cellFinish) {
       this.cellFinish = this.finishCell(p, undefined, new RlmError(kind, message, {
@@ -734,6 +762,7 @@ class Kernel {
     this.detachAbort()
     this.pending = null
     const err = new RlmError('cancel', message)
+    this.retainCheckpoint = false
     this.exited = true
     this.settling = true
     this.kill()
@@ -844,6 +873,18 @@ class Kernel {
       max_stdout: this.config.maxStdout,
       max_result: this.config.maxResult,
       max_context_bytes: this.config.maxContextBytes,
+    }
+    if (this.config.snapshotRecovery && this.snapshotPath) {
+      evalFrame.snapshot_recovery = true
+      evalFrame.snapshot_path = this.snapshotPath
+      evalFrame.max_snapshot_bytes = this.maxSnapshotBytes
+      if (this.restoreSnapshot) {
+        // Recovery is a one-shot bootstrap action. Consume before writing so a
+        // typed restore failure leaves this fresh kernel clean on its next
+        // eval instead of replaying a stale/malformed checkpoint forever.
+        this.restoreSnapshot = false
+        evalFrame.restore_snapshot = true
+      }
     }
     if (input.contextPath !== undefined) evalFrame.context_path = input.contextPath
     if (this.outboundFrameBytes(evalFrame) > MAX_FRAME_BYTES) {
@@ -1022,6 +1063,7 @@ class Kernel {
     // Terminal state is set synchronously so no eval can enter after unload;
     // the awaitable barrier resolves only after the child cleanup barrier.
     this.disposed = true
+    this.retainCheckpoint = false
     this.exited = true
     this.settling = true
     // A dispose during the ready handshake must settle the waiting eval; the
@@ -1042,6 +1084,8 @@ class Kernel {
       : (this.cellFinish ?? Promise.resolve().then(() => this.evict()))
     return this.disposedPromise
   }
+
+  get keepsCheckpoint(): boolean { return this.retainCheckpoint }
 }
 
 export interface RlmRuntime {
@@ -1061,6 +1105,9 @@ export interface RlmRuntime {
 
 class RlmRuntimeImpl implements RlmRuntime {
   private kernels = new Map<string, Kernel>()
+  private readonly checkpointRoot: string | undefined
+  private readonly checkpoints = new Set<string>()
+  private readonly checkpointReservations = new Map<string, number>()
   private queues = new Map<string, QueuedEval[]>()
   private drains = new Map<string, Promise<void>>()
   private config: RlmRuntimeConfig
@@ -1068,6 +1115,30 @@ class RlmRuntimeImpl implements RlmRuntime {
   private disposePromise: Promise<void> | undefined
   constructor(config: RlmRuntimeConfig) {
     this.config = config
+    if (config.snapshotRecovery === true) {
+      this.checkpointRoot = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m5-'))
+    }
+  }
+
+  private snapshotFor(sessionKey: string): { path: string; restore: boolean; maxBytes: number } | undefined {
+    if (!this.checkpointRoot) return undefined
+    let reservation = this.checkpointReservations.get(sessionKey)
+    if (reservation === undefined) {
+      const used = [...this.checkpointReservations.values()].reduce((total, bytes) => total + bytes, 0)
+      reservation = Math.min(MAX_SNAPSHOT_BYTES, Math.max(0, MAX_SNAPSHOT_ROOT_BYTES - used))
+      this.checkpointReservations.set(sessionKey, reservation)
+    }
+    return { path: this.checkpointPath(sessionKey), restore: this.checkpoints.has(sessionKey), maxBytes: reservation }
+  }
+
+  private checkpointPath(sessionKey: string): string {
+    return path.join(this.checkpointRoot!, createHash('sha256').update(sessionKey).digest('hex') + '.json')
+  }
+
+  private dropCheckpoint(sessionKey: string): void {
+    this.checkpoints.delete(sessionKey)
+    this.checkpointReservations.delete(sessionKey)
+    if (this.checkpointRoot) rmSync(this.checkpointPath(sessionKey), { force: true })
   }
 
   async eval(sessionKey: string, input: RlmEvalInput): Promise<RlmEvalOutput> {
@@ -1248,9 +1319,10 @@ class RlmRuntimeImpl implements RlmRuntime {
       // old kernel before the next dequeue, so an entry can never reuse a dead one.
       let kernel = this.kernels.get(sessionKey)
       if (!kernel) {
-        kernel = new Kernel(sessionKey, this.config)
-        kernel.onExit = () => {
+        kernel = new Kernel(sessionKey, this.config, this.snapshotFor(sessionKey))
+        kernel.onExit = (exited) => {
           if (this.kernels.get(sessionKey) === kernel) this.kernels.delete(sessionKey)
+          if (!exited.keepsCheckpoint || !this.checkpoints.has(sessionKey)) this.dropCheckpoint(sessionKey)
         }
         this.kernels.set(sessionKey, kernel)
       }
@@ -1260,10 +1332,14 @@ class RlmRuntimeImpl implements RlmRuntime {
         ...(entry.input.signal ? { signal: entry.input.signal } : {}),
       })
       const out = await kernel.evalCell(entry.input, entry.deadline)
+      if (out.recovery?.checkpointCommitted) {
+        this.checkpoints.add(sessionKey)
+      }
       this.settleEntry(entry, out)
     } catch (err) {
       if (entry.settled) return
       const rlmErr = err instanceof RlmError ? err : new RlmError('closed', String(err))
+      if (rlmErr.kind === 'snapshot') this.dropCheckpoint(sessionKey)
       this.settleEntry(entry, undefined, rlmErr)
     }
   }
@@ -1288,6 +1364,9 @@ class RlmRuntimeImpl implements RlmRuntime {
       drainWait,
     ]).then(() => {
       this.kernels.clear()
+      this.checkpoints.clear()
+      this.checkpointReservations.clear()
+      if (this.checkpointRoot) rmSync(this.checkpointRoot, { recursive: true, force: true })
     })
     return this.disposePromise
   }
@@ -1376,12 +1455,14 @@ interface RlmEvalValue {
   stdout: string
   result?: string
   truncated: boolean
+  recovery?: string
 }
 
 function renderValue(value: RlmEvalValue): string {
   const parts: string[] = []
   if (value.stdout) parts.push(value.stdout)
   if (value.result !== undefined) parts.push(value.result)
+  if (value.recovery) parts.push('[recovery: ' + value.recovery + ']')
   if (parts.length === 0) parts.push('(no output)')
   let text = parts.join('\n')
   if (value.truncated) text += '\n[output truncated]'
@@ -1439,6 +1520,7 @@ export function registerRlmPlugin(
           stdout: { type: 'string', required: true },
           result: { type: 'string' },
           truncated: { type: 'boolean', required: true },
+          recovery: { type: 'string' },
         },
       },
       render: (_args: unknown, value: RlmEvalValue) => [{ type: 'text', text: renderValue(value) }],
@@ -1475,6 +1557,15 @@ export function registerRlmPlugin(
       }
       const value: RlmEvalValue = { stdout: output.stdout, truncated: output.truncated }
       if (output.result !== undefined) value.result = output.result
+      if (output.recovery) {
+        const status = [
+          output.recovery.restored ? 'restored' : 'not-restored',
+          output.recovery.checkpointCommitted ? 'checkpoint-committed' : 'checkpoint-unchanged',
+          ...(output.recovery.skipped?.length ? ['skipped=' + output.recovery.skipped.join(', ')] : []),
+          ...(output.recovery.reason ? ['reason=' + output.recovery.reason] : []),
+        ].join('; ')
+        value.recovery = truncateUtf8(status, MAX_QUERY_ERROR_BYTES)
+      }
       return value
     },
   }))

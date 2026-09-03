@@ -36,10 +36,12 @@ import sys
 import threading
 from typing import Any, Optional
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 DEFAULT_MAX_STDOUT = 64 * 1024
 DEFAULT_MAX_RESULT = 64 * 1024
 DEFAULT_MAX_CONTEXT_BYTES = 64 * 1024 * 1024
+DEFAULT_MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
+MAX_SAFE_INTEGER = 2**53 - 1
 MAX_QUERY_TEXT = 64 * 1024
 MAX_FRAME_BYTES = 256 * 1024
 MAX_ERROR_TEXT = 64 * 1024
@@ -86,6 +88,10 @@ class RlmQueryError(Exception):
         self.message = message
         self.detail = detail
         self.truncated = truncated
+
+
+class RlmSnapshotError(Exception):
+    """A private M5 checkpoint cannot be restored safely."""
 
 
 class RlmContextError(Exception):
@@ -579,6 +585,165 @@ class RlmKernel:
             "bytes": len(payload),
         }
 
+    def _snapshot_value(self, value: Any, seen: set[int]) -> "tuple[bool, Any, str]":
+        """Detach the intentionally tiny M5 JSON subset without invoking user hooks."""
+        kind = type(value)
+        if value is None or kind is bool:
+            return True, value, ""
+        if kind is str:
+            try:
+                value.encode("utf-8", "strict")
+            except UnicodeEncodeError:
+                return False, None, "invalid UTF-8 string"
+            return True, value, ""
+        if kind is int:
+            if -MAX_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER:
+                return True, value, ""
+            return False, None, "integer outside JavaScript safe range"
+        if kind is float:
+            if value == value and value not in (float("inf"), float("-inf")):
+                return True, value, ""
+            return False, None, "non-finite number"
+        if kind not in (list, dict):
+            return False, None, "unsupported " + kind.__name__
+        identity = id(value)
+        if identity in seen:
+            return False, None, "cyclic value"
+        seen.add(identity)
+        try:
+            if kind is list:
+                output: list[Any] = []
+                for item in value:
+                    ok, detached, reason = self._snapshot_value(item, seen)
+                    if not ok:
+                        return False, None, reason
+                    output.append(detached)
+                return True, output, ""
+            output_dict: dict[str, Any] = {}
+            for key, item in value.items():
+                if type(key) is not str:
+                    return False, None, "dictionary key is not a string"
+                try:
+                    key.encode("utf-8", "strict")
+                except UnicodeEncodeError:
+                    return False, None, "invalid UTF-8 dictionary key"
+                ok, detached, reason = self._snapshot_value(item, seen)
+                if not ok:
+                    return False, None, reason
+                output_dict[key] = detached
+            return True, output_dict, ""
+        finally:
+            seen.discard(identity)
+
+    def _checkpoint(self, snapshot_path: str, max_bytes: int) -> dict[str, Any]:
+        """Atomically replace a private checkpoint after a successful cell."""
+        skipped: list[str] = []
+        variables: dict[str, Any] = {}
+        reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "context", "context_meta"}
+        for name in sorted(name for name in self.namespace if type(name) is str and name not in reserved):
+            try:
+                ok, detached, reason = self._snapshot_value(self.namespace[name], set())
+            except BaseException:
+                ok, detached, reason = False, None, "snapshot validation failed"
+            if ok:
+                variables[name] = detached
+            elif len(skipped) < 64:
+                safe_name, _ = self._cut(name, 128)
+                safe_reason, _ = self._cut(reason, 128)
+                skipped.append(safe_name + ": " + safe_reason)
+        envelope: dict[str, Any] = {"version": 1, "variables": variables, "context": None}
+        if self.managed_context is not None:
+            envelope["context"] = {"text": self.managed_context, "meta": dict(self.managed_context_meta or {})}
+        try:
+            payload = json.dumps(envelope, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            return {"restored": False, "checkpoint_committed": False, "skipped": skipped, "reason": "serialization failed: " + str(exc)}
+        if len(payload) > max_bytes:
+            return {"restored": False, "checkpoint_committed": False, "skipped": skipped, "reason": "checkpoint exceeds maxSnapshotBytes"}
+        temp_path = snapshot_path + ".tmp-" + str(os.getpid())
+        fd = -1
+        try:
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(fd, payload[offset:])
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            os.replace(temp_path, snapshot_path)
+            return {"restored": False, "checkpoint_committed": True, "checkpoint_bytes": len(payload), "skipped": skipped}
+        except OSError as exc:
+            return {"restored": False, "checkpoint_committed": False, "skipped": skipped, "reason": "checkpoint write failed"}
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+    def _restore_checkpoint(self, snapshot_path: str, max_bytes: int) -> None:
+        try:
+            with open(snapshot_path, "rb") as source:
+                payload = source.read(max_bytes + 1)
+        except OSError as exc:
+            raise RlmSnapshotError("could not read checkpoint") from exc
+        if len(payload) > max_bytes:
+            raise RlmSnapshotError("checkpoint exceeds maxSnapshotBytes")
+        try:
+            envelope = json.loads(payload.decode("utf-8", "strict"))
+        except BaseException as exc:
+            raise RlmSnapshotError("checkpoint is not valid UTF-8 JSON") from exc
+        if not isinstance(envelope, dict) or envelope.get("version") != 1 or not isinstance(envelope.get("variables"), dict):
+            raise RlmSnapshotError("checkpoint version or variables are invalid")
+        restored: dict[str, Any] = {}
+        reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "context", "context_meta"}
+        for name, value in envelope["variables"].items():
+            if type(name) is not str or name in reserved:
+                raise RlmSnapshotError("checkpoint contains an invalid variable name")
+            try:
+                ok, detached, _reason = self._snapshot_value(value, set())
+            except BaseException as exc:
+                raise RlmSnapshotError("checkpoint contains an unsupported value") from exc
+            if not ok:
+                raise RlmSnapshotError("checkpoint contains an unsupported value")
+            restored[name] = detached
+        context = envelope.get("context")
+        restored_context: Optional[str] = None
+        restored_meta: Optional[dict[str, Any]] = None
+        if context is not None:
+            if not isinstance(context, dict) or type(context.get("text")) is not str or not isinstance(context.get("meta"), dict):
+                raise RlmSnapshotError("checkpoint context is invalid")
+            restored_context = context["text"]
+            restored_meta = dict(context["meta"])
+            if type(restored_meta.get("path")) is not str:
+                raise RlmSnapshotError("checkpoint context metadata is invalid")
+            try:
+                context_bytes = len(restored_context.encode("utf-8"))
+                canonical_context_path = os.path.realpath(restored_meta["path"])
+            except (UnicodeError, OSError, TypeError) as exc:
+                raise RlmSnapshotError("checkpoint context metadata is invalid") from exc
+            if (
+                restored_meta.get("kind") != "file"
+                or type(restored_meta.get("path")) is not str
+                or not os.path.isabs(restored_meta["path"])
+                or type(restored_meta.get("bytes")) is not int
+                or restored_meta["bytes"] < 0
+                or restored_meta["bytes"] != context_bytes
+                or canonical_context_path != restored_meta["path"]
+            ):
+                raise RlmSnapshotError("checkpoint context metadata is invalid")
+        fresh = {"__name__": "__rlm__", "__builtins__": builtins, "asyncio": asyncio, "rlm_query": self._rlm_query}
+        fresh.update(restored)
+        self.namespace = fresh
+        self.managed_context = restored_context
+        self.managed_context_meta = restored_meta
+
     @staticmethod
     def _compile_cell(code: str) -> "tuple[Any, Optional[Any]]":
         """Split a cell into its statement body and the final top-level
@@ -640,19 +805,45 @@ class RlmKernel:
         max_result = frame.get("max_result", DEFAULT_MAX_RESULT)
         max_context_bytes = frame.get("max_context_bytes", DEFAULT_MAX_CONTEXT_BYTES)
         context_path = frame.get("context_path")
+        snapshot_recovery = frame.get("snapshot_recovery", False)
+        snapshot_path = frame.get("snapshot_path")
+        max_snapshot_bytes = frame.get("max_snapshot_bytes", DEFAULT_MAX_SNAPSHOT_BYTES)
+        restore_snapshot = frame.get("restore_snapshot", False)
         if (
             not isinstance(max_stdout, int)
             or not isinstance(max_result, int)
             or not isinstance(max_context_bytes, int)
+            or not isinstance(max_snapshot_bytes, int)
             or max_stdout < 0
             or max_result < 0
             or max_context_bytes < 0
+            or max_snapshot_bytes < 0
         ):
             self._fatal("invalid limits in eval frame: " + repr(frame))
             return
         if context_path is not None and not isinstance(context_path, str):
             self._fatal("invalid context_path in eval frame: " + repr(frame))
             return
+        if type(snapshot_recovery) is not bool or type(restore_snapshot) is not bool:
+            self._fatal("invalid snapshot recovery flags in eval frame: " + repr(frame))
+            return
+        if snapshot_recovery and (not isinstance(snapshot_path, str) or not snapshot_path):
+            self._fatal("invalid snapshot_path in eval frame: " + repr(frame))
+            return
+        recovery: Optional[dict[str, Any]] = None
+        if restore_snapshot:
+            try:
+                self._restore_checkpoint(str(snapshot_path), max_snapshot_bytes)
+                recovery = {"restored": True, "checkpoint_committed": False}
+            except RlmSnapshotError as exc:
+                try:
+                    os.unlink(str(snapshot_path))
+                except OSError:
+                    pass
+                self._send(self._error_frame(
+                    eval_id, "snapshot", "snapshot_error", exc, name="RlmSnapshotError"
+                ))
+                return
         if context_path is not None:
             try:
                 context, context_meta = self._read_context(context_path, max_context_bytes)
@@ -750,6 +941,13 @@ class RlmKernel:
         if result is not None:
             frame_out["result"] = result
         self._end_cell()
+        if snapshot_recovery:
+            checkpoint = self._checkpoint(str(snapshot_path), max_snapshot_bytes)
+            if recovery is not None:
+                checkpoint["restored"] = True
+            frame_out["recovery"] = checkpoint
+        elif recovery is not None:
+            frame_out["recovery"] = recovery
         self._send(frame_out)
 
     # ---- error helpers ----

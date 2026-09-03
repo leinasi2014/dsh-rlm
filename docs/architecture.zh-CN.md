@@ -1,4 +1,4 @@
-# dsh-rlm 核心与 M3/M4 架构
+# dsh-rlm 核心与 M3/M4/M5 架构
 
 > [English](architecture.md) | 简体中文
 
@@ -24,7 +24,7 @@ DSH Agent Loop
 
 已交付的 V1 基线不包含公共 Service、Storage Domain、run ID、checkpoint、
 restore、`rlm_spawn`、Provider 框架、后台任务、UI、Workflow 或 Team。托管
-上下文和递归子 RLM 现已晋升为有序 M3、M4 契约，但不属于已交付的 V1 行为。
+上下文、递归子 RLM 和可选故障恢复现由有序 M3、M4、M5 契约约束，但不属于已交付的 V1 行为。
 
 ## 2. DSH 边界
 
@@ -59,6 +59,7 @@ interface RlmEvalResult {
   stdout: string
   result?: string
   truncated: boolean
+  recovery?: { restored: boolean; checkpointCommitted: boolean }
 }
 ```
 
@@ -156,6 +157,14 @@ ready, eval, query, query_result, result, error
 - 插件卸载：停止接收新 cell，终止全部插件拥有的 Python 进程。
 
 V1 不承诺故障后恢复变量。恢复能力只有在真实使用需要时才添加。
+
+#### 可选恢复状态（M5）
+
+`snapshotRecovery=true` 时，符合条件的 timeout、process exit 或致命协议故障会保留该
+runtime/Session 的最近私有 checkpoint；替换 kernel 会在下一 cell 前恢复它。取消与卸载会删除
+checkpoint，宿主重启不存在可复用映射。checkpoint 是有界 JSON-safe globals 加受保护 M3 context，
+在私有 runtime 临时根中原子保存；其值不进入模型可见 frame 或 tool result，只可返回有界恢复状态。
+见 [M5 架构](m5-session-snapshot-recovery.zh-CN.md)。
 
 #### 取消状态机（M2）
 
@@ -265,14 +274,16 @@ V1 通过一个 `Config` schema（`src/runtime.ts` 中的 `ConfigSchema`，由�
 - `maxQueries`（默认 `16`）：整数 `1..4096`（每 cell 的 `rlm_query` 次数）。
 - `maxContextBytes`（默认 `67108864`）：整数 `1048576..1073741824`（一个由内核
   托管的 UTF-8 文件上下文的源字节数）。
+- `snapshotRecovery`（默认 `false`）：开启固定限制的私有 M5 故障 checkpoint，
+  它不是持久 Session storage。
 
 校验后的 config 对象直接传给 `createRlmRuntime`；插件不提供环境变量透传，
 也没有 registry 或 Provider/framework 表面。未知 Provider、Python 启动失败
 或 Provider 无法禁用 RLM 工具时，插件在首次使用时明确失败，不静默切换实现。
 
-## 9. 有序 M3 与 M4 目标
+## 9. 有序 M3、M4 与 M5 目标
 
-M3、M4 在不改变 DSH 权威边界的前提下扩展同一条单工具路径：
+M3、M4、M5 在不改变 DSH 权威边界的前提下扩展同一条单工具路径：
 
 ```text
 M3: rlm_eval(code, contextPath?)
@@ -282,19 +293,26 @@ M4: kernel -> rlm_query(prompt)
       -> 受深度限制的官方 DSH 子 Session
       -> 上限以下子节点拥有自己的 rlm_eval 内核
       -> 上限处叶子禁用 rlm_eval
+
+M5: 成功 cell -> 私有原子 checkpoint
+      -> 合格 kernel 故障 -> 下一 cell 前恢复
 ```
 
 - [M3 托管上下文架构](m3-managed-context.zh-CN.md) 冻结加载、原子性、限制、
   错误与 Session 隔离；
 - [M4 递归子 RLM 架构](m4-recursive-child-rlm.zh-CN.md) 冻结官方深度权威、
   每 Session 内核与后代静止；
+- [M5 会话快照恢复架构](m5-session-snapshot-recovery.zh-CN.md) 冻结可选
+  checkpoint 的范围、原子性与恢复边界；
 - [M3/M4 开发契约](m3-m4-development-contract.zh-CN.md) 冻结文档先行、
   M3→M4、TDD、审查、Git、dogfood 与活体验收门禁；
+- [M5 交互式验收架构图](m5-session-snapshot-recovery.html) 由受版本管理的
+  [Archify 源](m5-session-snapshot-recovery.archify.json) 生成；
 - [交互式目标架构图](dsh-rlm-architecture.html) 由受版本管理的
   [Archify 源](dsh-rlm-architecture.archify.json) 生成。
 
-Storage、快照、continuable spawn、批量查询和第二 runtime 仍不在范围内。
-M3 必须合并并通过干净 Profile 验收后，才开始 M4 生产开发。
+Storage、宿主重启持久化、continuable spawn、批量查询和第二 runtime 仍不在范围内。
+M3 必须通过后才开始 M4，M4 必须被接受后才开始 M5 生产开发。
 
 ## 10. 首个验收场景
 

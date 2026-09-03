@@ -83,14 +83,30 @@ M1 通过前，不实现 snapshot、spawn、Storage、公共 Service 或第二 P
 
 见 [M4 架构](m4-recursive-child-rlm.zh-CN.md)。
 
-## M4 之后的条件里程碑
+## M5：会话快照恢复
+
+**结果**：显式开启时，既有 `rlm_eval` 路径在所属 timeout、crash 或致命协议丢失后，
+在下一 cell 执行前恢复同一 Session 最近有效且受支持的 checkpoint。
+
+**退出条件**：
+
+1. `snapshotRecovery=false` 完全保持 M2 namespace-loss 行为；
+2. 合格的致命丢失创建新 PID，只恢复同一 Session 的有界 JSON-safe globals 与受保护 M3 context；
+3. checkpoint 发布原子化；损坏、超大或半写候选不能替换有效 checkpoint，失效恢复 fail closed；
+4. 取消、reset、卸载、宿主重启、sibling 与 recursive child 边界不能恢复无关或陈旧 checkpoint；
+5. 值与 context 文本不进入模型可见协议数据或 recovery metadata；跳过项只以有界摘要报告；
+6. 单元/集成测试、独立审查、CI、远端 main 回读和干净已安装插件 DSV4-FVE Profile smoke 均通过。
+
+见 [M5 架构](m5-session-snapshot-recovery.zh-CN.md) 与
+[M5 交付契约](m5-development-contract.zh-CN.md)。
+
+## M5 之后的条件里程碑
 
 以下里程碑没有预定顺序。只有
 [后续扩展架构](future-extensions.zh-CN.md) 中对应触发条件成立才启动。
 
 | 里程碑 | 完成结果 |
 |---|---|
-| F1 Snapshot 恢复 | kernel 被杀后恢复支持的变量，并报告跳过项 |
 | F4 Batched query | 有界并发、顺序稳定、可取消的批量查询 |
 | F5 第二内核实现 | 第二实现与本地实现通过同一端到端闭环 |
 | F6 外部 Consumer | Jobs、UI 或 swarm 复用现有 runtime，不产生第二权威循环 |
