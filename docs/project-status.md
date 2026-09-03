@@ -19,75 +19,71 @@ DSH Agent -> rlm_eval(code) -> Session Python kernel
 
 The target boundary keeps the DSH Session log as the model-visible history
 authority and keeps Provider credentials in the host. Python executes code,
-holds Session-local globals, and asks the host for one-shot child calls.
+holds Session-local globals, and asks the host for child calls.
 
 ## Publication baseline
 
-- Accepted M1/M2 base: `260484d7d92e43fcb99c54ab987436d494501845`
-- Status date: 2026-09-03
+- Accepted milestone ladder: M1 through M8 on `main`.
+- Status date: 2026-09-04
 - Pinned references: `ref/rlm` and `ref/prime-agent`, used as design evidence,
   not literal compatibility targets
-- Current stage: M1 and M2 passed their local, review, CI, remote-main, and real
-  clean-Profile gates; M3 architecture/contract integration is in progress
+- DSH source-freshness evidence for M8: official `master` at
+  `76fda729799fe9b3848dbe2c211d4b231032b81e` (ahead=0 behind=0) with the loaded
+  Profile runtime exercising the official continuable Subagent adapter
+- Current stage: M1-M7 are accepted baselines; M8 Continuable Spawn (Issue #39)
+  is accepted on `main` with final DSV4-FVE clean-Profile evidence. Conditional
+  future extensions remain trigger-gated.
 
 ## Delivered
 
-### M1A: Python kernel
+### M1A-M1E: RLM loop
+- persistent Python kernel with top-level `await`, typed errors, and bounded
+  stdout/results per Session;
+- JSON-lines host bridge in `src/runtime.ts` with start/eval/result/error/
+  timeout/cancel/dispose and process-tree cleanup;
+- single Session-scoped `rlm_eval` tool; one-shot `rlm_query` Subagent with
+  child `rlm_eval` denial;
+- clean-Profile M1E smoke on the DSV4-FVE route.
 
-- persistent globals;
-- top-level `await`;
-- last-expression result;
-- UTF-8 byte truncation for stdout and result;
-- typed cell failures.
+### M2: local reliability baseline
+- Session FIFO serialization, bounded protocol frames and errors, query/child
+  quiescence, scaffold/result isolation, validated configuration and system
+  prompt, and safe-name Python environment allowlist.
 
-### M1B: TypeScript runtime
+### M3: Managed Context
+- atomic bounded absolute UTF-8 file loading into protected Session-local
+  `context`, typed and atomic failures, bytes never model-visible.
 
-- JSON-lines child-process protocol;
-- one kernel per Session;
-- main eval, result, error, timeout, cancel, and dispose paths;
-- process-tree kill and lazy clean-kernel recreation after timeout.
+### M4: Recursive Child RLM
+- official depth-bounded child Sessions with isolated kernels and whole-branch
+  quiescence; leaf retains one-shot tool denial.
 
-### M1C / M1D: DSH integration and query bridge
+### M5: Session Snapshot Recovery
+- opt-in checkpoint restore after owned kernel loss with JSON-safe globals and
+  managed context, atomic publication, and fail-closed recovery.
 
-- only public tool: `rlm_eval`;
-- Session-scoped isolation;
-- `await rlm_query(prompt)` round trip through a one-shot DSH Subagent;
-- child recursion prevented with `toolFilter` denying `rlm_eval`;
-- child disposal on normal completion.
+### M6: Manual Reset
+- Session-local FIFO reset through `rlm_eval({ reset: true })` with a cleanup
+  barrier and fresh-kernel guarantee.
 
-### M1E: Real Profile smoke
+### M7: Bounded Ordered Batched Query
+- `rlm_query_batched` with at most four admitted children, input-ordered
+  results, drain-before-failure, and no helper bookkeeping in checkpoints.
 
-A fresh DSH Profile verified real package installation/loading, a Chinese UTF-8
-file read, Python continuation after `rlm_query`, cross-cell variable reuse,
-bounded tool results in the official Session log, and no recursive `rlm_eval`
-availability in the child.
-
-Live tests are gated by `RLM_LIVE_SMOKE=1` so ordinary test runs cannot make
-accidental model calls.
-
-## Accepted M2 reliability
-
-The public M2 repair Issues are closed. The accepted base includes Session FIFO
-serialization, bounded protocol frames and errors, query/child quiescence,
-scaffold/result isolation, validated configuration and system prompt, and a
-safe-name Python environment allowlist. The complete base has 138 tests (136
-passing plus two deliberately live-gated smokes) and passed the DSV4-FVE clean
-Profile path.
+### M8: Continuable Spawn
+- `rlm_spawn` / `rlm_followup` private helpers over the existing host bridge;
+  opaque non-snapshottable live-kernel capability; official continuable
+  Subagent and parent inbox ownership; no custom queue or second loop;
+- pre-admission gate requires the official host-delivery Symbol
+  (`Symbol.for('dsh.subagent.deliverPrompt')`) and fails via the typed
+  `kind=query, phase=query` path without child admission on older hosts.
 
 ## Ordered open work
 
-1. [M3 Managed Context](m3-managed-context.md): bounded, atomic, protected
-   absolute-file loading without copying contents through model-visible input.
-2. [M4 Recursive Child RLM](m4-recursive-child-rlm.md): official depth-bounded
-   child Sessions with isolated kernels and whole-branch quiescence.
+None within the frozen V1 boundary. The remaining Future-extension rows stay
+conditional until their observed trigger is real; any new milestone starts from
+architecture design plus its tracked Archify diagram using the same
+contract-first TDD pipeline.
 
-The [development contract](m3-m4-development-contract.md) requires docs-first
-integration, WIP=1, TDD, independent review, CI, remote-main read-back, and a
-real DSH/Profile acceptance for each milestone. Dogfood findings are reproduced,
-aggregated, and filed separately rather than silently widening M3/M4.
-
-## Conditional future work
-
-Snapshot/restore, Storage Domain, run records, continuable spawn, batch queries,
-a second kernel, cross-host recovery, cost accounting, UI, Workflow, Jobs, and
-swarm remain conditional and have not started.
+Live tests are gated by `RLM_LIVE_SMOKE=1` so ordinary test runs cannot make
+accidental model calls.
