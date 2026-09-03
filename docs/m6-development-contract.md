@@ -28,7 +28,8 @@ separately unless they block manual reset acceptance.
 - RED must prove the accepted Profile cannot perform the intended reset journey;
   mocks may supplement but cannot replace the Python process/session boundary.
 - GREEN must cover FIFO ordering, kernel/child cleanup, M3 context loss, M5
-  checkpoint deletion, cancellation, and Session isolation.
+  checkpoint deletion, queued and active-reset cancellation finality, and
+  Session isolation.
 - The real acceptance uses a disposable DSH Home, installs this local package,
   enables `snapshotRecovery`, pins `DeepSeek-V4-Flash-Vision-Exp` through the
   vLLM/PTC route, and proves ambient settings/credentials are byte-unchanged.

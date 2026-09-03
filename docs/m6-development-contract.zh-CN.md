@@ -22,7 +22,8 @@
 
 - 每次生产或测试编辑前立即运行官方 DSH upstream gate。
 - RED 必须证明接受的 Profile 不能完成预期 reset journey；mock 可补充，不能替代 Python process/session 边界。
-- GREEN 覆盖 FIFO 顺序、kernel/child cleanup、M3 context 丢失、M5 checkpoint 删除、取消和 Session 隔离。
+- GREEN 覆盖 FIFO 顺序、kernel/child cleanup、M3 context 丢失、M5 checkpoint 删除、
+  排队与已激活 reset 的取消终态，以及 Session 隔离。
 - 真实验收使用 disposable DSH Home、安装本地包、启用 `snapshotRecovery`、固定
   DSV4-FVE vLLM/PTC，并确认 ambient settings/credentials 字节不变。
 

@@ -51,6 +51,7 @@ M5 不得向新命名空间恢复旧状态。M3 context 也不存在，直到后
 |---|---|
 | reset signal 已预先取消 | 类型化 `cancel`；不排队、不动 kernel/checkpoint |
 | reset 等待 cell 时调用者取消 | 类型化 `cancel`；运行中的 cell 与 live state 不变 |
+| reset 已激活后调用者取消 | reset 拥有 cleanup barrier，继续完成删除并以 success 结算；同 Session 后续 eval 必须等其完成 |
 | 插件 runtime 卸载 | 既有 terminal dispose 优先；reset 之后不得开始 |
 | kernel dispose 失败 | 类型化失败；reset 不启动新 kernel，也不跨 Session 操作 |
 | 其他 Session 的 reset/eval | 不影响当前 Session 的 kernel、context 或 checkpoint |
@@ -69,6 +70,6 @@ DSH Session history，也不跨递归父/子/兄弟 Session 边界。
 
 1. **接受的 M5 main 上的 RED：** 新安装插件的干净 DSH Profile 能跨 cell 保持 marker，但不接受 `reset:true`。
 2. **本地进程 GREEN：** globals 与 managed context 后的 reset 处置旧 PID；下一 cell 有新 PID，读不到旧 globals/context。
-3. **隔离/顺序：** 排队 reset 不触碰运行 cell 或兄弟 Session；激活后同 Session 的后续 eval 看到干净命名空间。
+3. **隔离/顺序：** 排队 reset 不触碰运行 cell 或兄弟 Session；激活后的 abort 不得留下半状态，同 Session 后续 eval 只在 cleanup barrier 完成后看到干净命名空间。
 4. **M5 边界：** `snapshotRecovery=true` 时 reset 删除 checkpoint，之后 owned timeout 也不能复活 reset 前状态。
 5. **干净 Profile：** disposable DSH Home 安装本包、启用 M5、固定 DSV4-FVE vLLM/PTC，执行 set -> reset -> read，并证明官方 Session log 记录 reset 调用但不泄露被删除内容。

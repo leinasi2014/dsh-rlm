@@ -57,6 +57,7 @@ namespace. M3 context is absent until a later code-bearing call supplies a new
 |---|---|
 | Pre-aborted reset signal | Typed `cancel`; no queue entry, kernel action, or checkpoint deletion |
 | Reset waiting behind a cell and caller cancels | Typed `cancel`; running cell and live state remain unchanged |
+| Caller cancels after reset is active | Reset owns the cleanup barrier, continues to successful deletion, and resolves success; no later same-Session eval starts before it completes |
 | Plugin runtime unload | Existing terminal dispose wins; reset never starts afterward |
 | Kernel disposal failure | Typed failure; no new kernel is started by reset and no cross-Session action occurs |
 | Other Session reset/eval | Has no effect on this Session's kernel, context, or checkpoint |
@@ -85,8 +86,9 @@ parent/child/sibling Session boundary.
    disposes the old PID; the next cell has a new PID and cannot read either
    prior globals or context.
 3. **Isolation/ordering:** a queued reset never touches a running cell or a
-   sibling Session; after it becomes active, later same-Session evals see the
-   clean namespace.
+   sibling Session; after it becomes active, an abort cannot leave partial
+   state, and later same-Session evals see the clean namespace only after the
+   cleanup barrier completes.
 4. **M5 boundary:** with `snapshotRecovery=true`, reset removes the checkpoint
    so a subsequent owned timeout cannot resurrect pre-reset state.
 5. **Clean Profile:** a disposable DSH Home installs this local package, enables
