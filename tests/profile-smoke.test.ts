@@ -364,6 +364,72 @@ test('M4 Issue#25: fresh isolated DSH Profile completes a depth-three RLM branch
   }
 })
 
+test('M5 Issue#31 RED: a timed-out kernel restores supported Session globals in a fresh installed Profile', { timeout: 15 * 60_000 }, async (t) => {
+  if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the M5 recovery acceptance'); return }
+  const ambientHome = process.env.DSH_HOME
+  if (!ambientHome || !fs.existsSync(path.join(ambientHome, 'settings.yaml'))) {
+    t.skip('DSH_HOME with settings.yaml is required; it supplies the configured vLLM provider and credential refs')
+    return
+  }
+  assert.ok(fs.existsSync(BIN), 'DSH harness bin.ts not found at ' + REPO_ROOT)
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m5-recovery-'))
+  const profileDir = path.join(home, 'profiles', PROFILE)
+  fs.mkdirSync(path.join(home, 'profiles'), { recursive: true })
+  const ambientSettingsPath = path.join(ambientHome, 'settings.yaml')
+  const ambientSettingsBytes = fs.readFileSync(ambientSettingsPath)
+  const ambientCredsPath = path.join(ambientHome, '.credentials.yaml')
+  const ambientCredsBytes = fs.existsSync(ambientCredsPath) ? fs.readFileSync(ambientCredsPath) : null
+  fs.writeFileSync(path.join(home, 'settings.yaml'), replaceAgentDefaultModel(ambientSettingsBytes.toString('utf8'), LIVE_PROVIDER, LIVE_MODEL))
+  if (ambientCredsBytes !== null) fs.writeFileSync(path.join(home, '.credentials.yaml'), ambientCredsBytes)
+  const env = { DSH_HOME: home }
+  const marker = 'M5_STATE_LOSS_MARKER_88be31'
+  const task = [
+    'You are validating M5 RLM recovery. Use rlm_eval exactly three times in this order.',
+    `1. Run exactly: m5_marker = ${JSON.stringify(marker)}`,
+    '2. Run exactly: import time; time.sleep(2). This is expected to time out and replace the kernel.',
+    '3. Run exactly: m5_marker. It must now return the original marker because M5 recovery restores the checkpoint.',
+    'After the third call succeeds and returns the marker, reply with exactly M5_STATE_RECOVERY_OBSERVED.',
+  ].join('\n')
+  try {
+    const add = runDsh(['plugin', '--profile', PROFILE, 'add', '-w', PKG_ROOT], env, REPO_ROOT, 180_000)
+    assert.equal(add.status, 0, 'dsh plugin add failed: ' + add.stderr)
+    assert.ok(fs.existsSync(path.join(profileDir, 'node_modules', 'dsh-rlm')), 'dsh-rlm not installed into the profile')
+    const manifestPath = path.join(profileDir, 'package.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    manifest.dsh = { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'] } }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+    fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), [
+      '- insert:',
+      '    - id: rlm',
+      '      name: dsh-rlm',
+      '      config:',
+      '        enabled: true',
+      '        provider: spawn',
+      '        timeout: 1000',
+      '        snapshotRecovery: true',
+      '',
+    ].join('\n'))
+    const run = runDsh(['--profile', PROFILE, task], env, REPO_ROOT, 8 * 60_000)
+    const outTail = run.stdout.slice(-1200)
+    assert.equal(run.status, 0, 'headless M5 recovery failed: ' + outTail + ' ' + run.stderr.slice(-1200))
+    assert.match(outTail, /M5_STATE_RECOVERY_OBSERVED/)
+    const logs = await readSessionLogs(home)
+    const main = [...logs.values()].find((text) => JSON.parse(text.split('\n')[0]).delegationDepth === 0)
+    assert.ok(main, 'no persisted depth-0 Session log')
+    assert.ok(countToolCalls(main, 'rlm_eval') >= 3, 'expected three rlm_eval attempts')
+    assert.match(main, /timeout/i, 'Session log did not record the induced timeout')
+    assert.match(main, new RegExp(marker), 'Session log did not record the restored marker')
+    assert.doesNotMatch(main, /m5_marker.*not defined|NameError/i, 'Session log recorded loss of the checkpointed marker')
+  } finally {
+    try {
+      assert.ok(ambientSettingsBytes.equals(fs.readFileSync(ambientSettingsPath)), 'ambient settings.yaml was modified by the M5 recovery smoke')
+      if (ambientCredsBytes !== null) assert.ok(ambientCredsBytes.equals(fs.readFileSync(ambientCredsPath)), 'ambient .credentials.yaml was modified by the M5 observation')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  }
+})
+
 test('M1E: runtime dispose releases the Python kernel process', { timeout: 30_000 }, async (t) => {
   if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the live kernel-dispose smoke'); return }
   const { createRlmRuntime } = await import('../src/runtime.ts')
