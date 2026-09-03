@@ -254,6 +254,116 @@ test('M1E: fresh isolated DSH Profile runs the real RLM loop', { timeout: 15 * 6
   }
 })
 
+test('M4 Issue#25: fresh isolated DSH Profile completes a depth-three RLM branch', { timeout: 15 * 60_000 }, async (t) => {
+  if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the M4 recursive live smoke (needs the configured vLLM model)'); return }
+  const ambientHome = process.env.DSH_HOME
+  if (!ambientHome || !fs.existsSync(path.join(ambientHome, 'settings.yaml'))) {
+    t.skip('DSH_HOME with settings.yaml is required; it supplies the configured vLLM provider and credential refs')
+    return
+  }
+  assert.ok(fs.existsSync(BIN), 'DSH harness bin.ts not found at ' + REPO_ROOT)
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m4-smoke-'))
+  const profileDir = path.join(home, 'profiles', PROFILE)
+  fs.mkdirSync(path.join(home, 'profiles'), { recursive: true })
+  const ambientSettingsPath = path.join(ambientHome, 'settings.yaml')
+  const ambientSettingsBytes = fs.readFileSync(ambientSettingsPath)
+  const ambientCredsPath = path.join(ambientHome, '.credentials.yaml')
+  const ambientCredsBytes = fs.existsSync(ambientCredsPath) ? fs.readFileSync(ambientCredsPath) : null
+  fs.writeFileSync(path.join(home, 'settings.yaml'), replaceAgentDefaultModel(ambientSettingsBytes.toString('utf8'), LIVE_PROVIDER, LIVE_MODEL))
+  if (ambientCredsBytes !== null) fs.writeFileSync(path.join(home, '.credentials.yaml'), ambientCredsBytes)
+  const env = { DSH_HOME: home }
+
+  const leafPrompt = 'Reply exactly M4_LEAF_OK. Do not call tools.'
+  const depth2Prompt = [
+    'You are the depth-2 child in an RLM acceptance test. Call rlm_eval exactly once with the following Python source, then reply with one line beginning M4_D2_OK followed by its visible result.',
+    'try:',
+    '    root_marker',
+    '    isolation = "M4_D2_LEAK"',
+    'except NameError:',
+    '    isolation = "M4_D2_ISOLATED"',
+    `leaf = await rlm_query(${JSON.stringify(leafPrompt)})`,
+    'isolation + " " + leaf',
+  ].join('\n')
+  const depth1Prompt = [
+    'You are the depth-1 child in an RLM acceptance test. Call rlm_eval exactly once with the following Python source, then reply with one line beginning M4_D1_OK followed by its visible result.',
+    'try:',
+    '    root_marker',
+    '    isolation = "M4_D1_LEAK"',
+    'except NameError:',
+    '    isolation = "M4_D1_ISOLATED"',
+    `child = await rlm_query(${JSON.stringify(depth2Prompt)})`,
+    'isolation + " " + child',
+  ].join('\n')
+  const rootCode = [
+    'root_marker = "M4_ROOT_ONLY"',
+    `child = await rlm_query(${JSON.stringify(depth1Prompt)})`,
+    'child',
+  ].join('\n')
+  const task = [
+    'You are running a recursive RLM acceptance test. Call rlm_eval exactly once with this exact Python source, then reply with one line beginning RLM_M4_ACCEPT_OK followed by its visible result.',
+    '',
+    rootCode,
+  ].join('\n')
+
+  try {
+    const add = runDsh(['plugin', '--profile', PROFILE, 'add', '-w', PKG_ROOT], env, REPO_ROOT, 180_000)
+    assert.equal(add.status, 0, 'dsh plugin add failed: ' + add.stderr)
+    assert.ok(fs.existsSync(path.join(profileDir, 'node_modules', 'dsh-rlm')), 'dsh-rlm not installed into the profile')
+    const manifestPath = path.join(profileDir, 'package.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    manifest.dsh = { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'] } }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+    fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), [
+      '- insert:',
+      '    - id: rlm',
+      '      name: dsh-rlm',
+      '      config:',
+      '        enabled: true',
+      '        provider: spawn',
+      '        maxDepth: 3',
+      '',
+    ].join('\n'))
+
+    const run = runDsh(['--profile', PROFILE, task], env, REPO_ROOT, 12 * 60_000)
+    const outTail = run.stdout.slice(-1200)
+    assert.equal(run.status, 0, 'headless M4 run failed: ' + outTail + ' ' + run.stderr.slice(-1200))
+    assert.match(outTail, /RLM_M4_ACCEPT_OK[\s\S]*M4_D1_OK[\s\S]*M4_D1_ISOLATED[\s\S]*M4_D2_OK[\s\S]*M4_D2_ISOLATED[\s\S]*M4_LEAF_OK/)
+
+    const logs = await readSessionLogs(home)
+    const headers = [...logs.values()].map((text) => JSON.parse(text.split('\n')[0]))
+    const depths = headers.map((header) => header.delegationDepth).sort((a, b) => a - b)
+    assert.ok(depths.includes(0) && depths.includes(1) && depths.includes(2) && depths.includes(3), 'missing persisted root/depth-1/depth-2/leaf lineage: ' + JSON.stringify(depths))
+    assert.ok(headers.every((header) => header.delegationDepth <= 3), 'a Session exceeded maxDepth=3: ' + JSON.stringify(depths))
+    const headerById = new Map(headers.map((header) => [header.id, header]))
+    for (const header of headers) {
+      if (header.delegationDepth === 0) continue
+      const parentHeader = headerById.get(header.parentSession)
+      assert.ok(parentHeader, 'child Session has no persisted parent header: ' + JSON.stringify(header))
+      assert.equal(parentHeader.delegationDepth, header.delegationDepth - 1, 'persisted parent/child depths are not adjacent')
+    }
+    for (const [id, text] of logs) {
+      const header = JSON.parse(text.split('\n')[0])
+      if (header.delegationDepth === 1 || header.delegationDepth === 2) {
+        assert.ok(countToolCalls(text, 'rlm_eval') >= 1, 'recursive Session ' + id + ' did not call rlm_eval')
+      }
+      if (header.delegationDepth === 3) {
+        assert.equal(countToolCalls(text, 'rlm_eval'), 0, 'exact-depth leaf ' + id + ' called rlm_eval')
+      }
+    }
+    const allLogs = [...logs.values()].join('\n')
+    assert.match(allLogs, /M4_D1_ISOLATED/)
+    assert.match(allLogs, /M4_D2_ISOLATED/)
+  } finally {
+    try {
+      assert.ok(ambientSettingsBytes.equals(fs.readFileSync(ambientSettingsPath)), 'ambient settings.yaml was modified by the M4 live smoke')
+      if (ambientCredsBytes !== null) assert.ok(ambientCredsBytes.equals(fs.readFileSync(ambientCredsPath)), 'ambient .credentials.yaml was modified by the M4 live smoke')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  }
+})
+
 test('M1E: runtime dispose releases the Python kernel process', { timeout: 30_000 }, async (t) => {
   if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the live kernel-dispose smoke'); return }
   const { createRlmRuntime } = await import('../src/runtime.ts')

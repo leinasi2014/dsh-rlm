@@ -845,10 +845,14 @@ test('M1B Issue#5: a raising __repr__ is kind=eval and the same kernel keeps its
 
 import { registerRlmPlugin } from '../src/runtime.ts'
 
-interface FakeExec { agent: { id: string }; signal: AbortSignal }
+interface FakeExec { agent: any; signal: AbortSignal }
+
+function makeAgent(agentId: string, delegationDepth = 0): any {
+  return { id: agentId, options: {}, session: { header: { delegationDepth } } }
+}
 
 function makeExec(agentId: string): FakeExec {
-  return { agent: { id: agentId }, signal: new AbortController().signal }
+  return { agent: makeAgent(agentId), signal: new AbortController().signal }
 }
 
 interface MockCtx {
@@ -861,7 +865,11 @@ interface MockCtx {
   sections: any[]
 }
 
-function makeMockCtx(options: { queryText?: string } = {}): MockCtx {
+function makeMockCtx(options: {
+  queryText?: string
+  providerCapabilities?: { depthLimit: boolean; toolFilter: boolean }
+  enforceDepthLimit?: boolean
+} = {}): MockCtx {
   const registered: any[] = []
   const starts: { provider: string; request: any }[] = []
   const sections: any[] = []
@@ -881,7 +889,16 @@ function makeMockCtx(options: { queryText?: string } = {}): MockCtx {
       },
     },
     subagents: {
+      getProvider() {
+        return { capabilities: options.providerCapabilities ?? { depthLimit: true, toolFilter: true } }
+      },
       async start(provider: string, request: any) {
+        if (options.enforceDepthLimit) {
+          const attemptedDepth = (request.parent.session.header.delegationDepth ?? 0) + 1
+          if (attemptedDepth > request.maxDepth) {
+            throw new Error(`subagent depth ${attemptedDepth} exceeds maxDepth ${request.maxDepth}`)
+          }
+        }
         starts.push({ provider, request })
         return run
       },
@@ -933,7 +950,7 @@ test('M1D: the one-shot child request filters out rlm_eval and uses the calling 
   const m = makeMockCtx({ queryText: 'four' })
   registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn' })
   const tool = m.registered[0]
-  const exec = { agent: { id: 'sess-a' }, signal: ctl.signal }
+  const exec = { agent: makeAgent('sess-a'), signal: ctl.signal }
 
   try {
     const out = await tool.execute({ code: 't = await rlm_query("what is 2+2?")\nt + "!"' }, exec)
@@ -956,6 +973,90 @@ test('M1D: the one-shot child request filters out rlm_eval and uses the calling 
     assert.deepEqual(request.prompt, [{ type: 'text', text: 'what is 2+2?' }])
     // Foreground call must dispose the child after collecting its text.
     assert.equal(m.run.disposed, true)
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M4 Issue#25: maxDepth defaults to one and makes the first child a structurally denied leaf', async () => {
+  const m = makeMockCtx({ queryText: 'leaf text' })
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn' })
+  try {
+    const out = await m.registered[0].execute(
+      { code: 'await rlm_query("leaf")' },
+      { agent: { id: 'm4-root', options: {}, session: { header: { delegationDepth: 0 } } }, signal: new AbortController().signal },
+    )
+    assert.equal(out.result, 'leaf text')
+    assert.equal(m.starts.length, 1)
+    assert.equal(m.starts[0].request.maxDepth, 1)
+    assert.deepEqual(m.starts[0].request.toolFilter, { deny: ['rlm_eval'] })
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M4 Issue#25: a child below maxDepth keeps rlm_eval available while retaining the absolute DSH cap', async () => {
+  const m = makeMockCtx({ queryText: 'recursive text' })
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', maxDepth: 2 })
+  try {
+    const out = await m.registered[0].execute(
+      { code: 'await rlm_query("recursive")' },
+      { agent: { id: 'm4-root-under-cap', options: {}, session: { header: { delegationDepth: 0 } } }, signal: new AbortController().signal },
+    )
+    assert.equal(out.result, 'recursive text')
+    assert.equal(m.starts.length, 1)
+    assert.equal(m.starts[0].request.maxDepth, 2)
+    assert.equal(m.starts[0].request.toolFilter, undefined)
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M4 Issue#25: an exact-depth recursive child is structurally denied rlm_eval', async () => {
+  const m = makeMockCtx({ queryText: 'leaf text' })
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', maxDepth: 2 })
+  try {
+    const out = await m.registered[0].execute(
+      { code: 'await rlm_query("exact leaf")' },
+      { agent: makeAgent('m4-depth-one-leaf', 1), signal: new AbortController().signal },
+    )
+    assert.equal(out.result, 'leaf text')
+    assert.equal(m.starts[0].request.maxDepth, 2)
+    assert.deepEqual(m.starts[0].request.toolFilter, { deny: ['rlm_eval'] })
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M4 Issue#25: a depth request beyond the official cap publishes no child run', async () => {
+  const m = makeMockCtx({ enforceDepthLimit: true })
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', maxDepth: 2 })
+  try {
+    await assert.rejects(
+      m.registered[0].execute(
+        { code: 'await rlm_query("beyond cap")' },
+        { agent: makeAgent('m4-beyond-cap', 2), signal: new AbortController().signal },
+      ),
+      (err: unknown) => err instanceof Error && /subagent depth 3 exceeds maxDepth 2/.test(err.message),
+    )
+    assert.equal(m.starts.length, 0)
+  } finally {
+    m.teardown?.()
+  }
+})
+
+test('M4 Issue#25: missing DSH recursion capability fails before a child is started', async () => {
+  const m = makeMockCtx({ providerCapabilities: { depthLimit: true, toolFilter: false } })
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', maxDepth: 2 })
+  try {
+    await assert.rejects(
+      m.registered[0].execute(
+        { code: 'await rlm_query("must not start")' },
+        { agent: makeAgent('m4-capability'), signal: new AbortController().signal },
+      ),
+      (err: unknown) => err instanceof Error && /must support depthLimit and toolFilter/.test(err.message),
+    )
+    assert.equal(m.starts.length, 0)
   } finally {
     m.teardown?.()
   }
@@ -1111,7 +1212,7 @@ test('M2: rlm_eval forwards exec.signal so a parent cancel stops the cell', asyn
   const tool = m.registered[0]
   const ctl = new AbortController()
   try {
-    const exec = { agent: { id: 'sess-sig' }, signal: ctl.signal }
+    const exec = { agent: makeAgent('sess-sig'), signal: ctl.signal }
     const pending = tool.execute({ code: runningCell() }, exec)
     await new Promise((r) => setTimeout(r, SHORT_DELAY))
     ctl.abort('user-cancel')
@@ -2232,6 +2333,9 @@ function makeLifecycleMockCtx(options: {
       },
     },
     subagents: {
+      getProvider() {
+        return { capabilities: { depthLimit: true, toolFilter: true } }
+      },
       async start(provider: string, request: any) {
         const result = new Deferred<{ output: { type: string; text?: string }[]; stopReason: string; diagnostic?: string }>()
         const run: LifecycleRun = { result, disposed: false, signal: request.signal }
@@ -2309,6 +2413,27 @@ test('M2 Issue#4: plugin teardown aborts and disposes the active one-shot child 
   }
 })
 
+test('M4 Issue#25: cancelling a recursively admissible branch aborts and disposes its DSH-owned run before settlement', async () => {
+  const m = makeLifecycleMockCtx({ disposeAsync: true })
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', maxDepth: 3 })
+  const ctl = new AbortController()
+  try {
+    const pending = m.registered[0].execute(
+      { code: 'await rlm_query("recursive branch")' },
+      { agent: makeAgent('m4-cancel', 1), signal: ctl.signal },
+    )
+    await until(() => m.starts.length === 1)
+    assert.equal(m.starts[0].request.maxDepth, 3)
+    assert.equal(m.starts[0].request.toolFilter, undefined, 'depth-2 child remains recursion-capable')
+    ctl.abort('cancel recursive branch')
+    await assert.rejects(pending, (err: unknown) => err instanceof Error && /cancel/.test(err.message))
+    assert.equal(m.starts[0].run.signal.aborted, true)
+    assert.equal(m.starts[0].run.disposed, true)
+  } finally {
+    m.teardown?.()
+  }
+})
+
 test('M2 Issue#4: a kernel protocol fault leaves no active one-shot child behind', async () => {
   const m = makeLifecycleMockCtx()
   registerRlmPlugin(m.ctx, { enabled: true, timeout: 8000 })
@@ -2370,7 +2495,7 @@ test('M2 Issue#4: caller cancel disposes the active one-shot child before the to
   const tool = m.registered[0]
   const ctl = new AbortController()
   try {
-    const exec = { agent: { id: 'sess-cancel-child' }, signal: ctl.signal }
+    const exec = { agent: makeAgent('sess-cancel-child'), signal: ctl.signal }
     const pending = tool.execute({ code: 'x = await rlm_query("q")\nx' }, exec)
     await until(() => m.starts.length === 1)
     ctl.abort('user-cancel')
@@ -3234,6 +3359,7 @@ test('M2 Issue#6 / M3 Issue#24: Config schema defaults and range-validates runti
   assert.equal(parsed.maxStdout, 65536)
   assert.equal(parsed.maxResult, 65536)
   assert.equal(parsed.maxQueries, 16)
+  assert.equal(parsed.maxDepth, 1)
   assert.equal(parsed.maxContextBytes, 67108864)
   assert.throws(() => S({ python: '' }))
   assert.throws(() => S({ timeout: 999 }))
@@ -3249,6 +3375,9 @@ test('M2 Issue#6 / M3 Issue#24: Config schema defaults and range-validates runti
   assert.throws(() => S({ maxContextBytes: 1048575 }))
   assert.throws(() => S({ maxContextBytes: 1073741825 }))
   assert.equal(S({ maxContextBytes: 1073741824 }).maxContextBytes, 1073741824)
+  assert.throws(() => S({ maxDepth: 0 }))
+  assert.throws(() => S({ maxDepth: 9 }))
+  assert.equal(S({ maxDepth: 8 }).maxDepth, 8)
 })
 
 test('M2 Issue#6: parsed runtime settings propagate end to end (maxQueries limit observable)', async () => {
@@ -3264,7 +3393,7 @@ test('M2 Issue#6: parsed runtime settings propagate end to end (maxQueries limit
     await assert.rejects(
       tool.execute(
         { code: 'a = await rlm_query("one")\nb = await rlm_query("two")' },
-        { agent: { id: 'issue6-prop' }, signal: ctl.signal },
+        { agent: makeAgent('issue6-prop'), signal: ctl.signal },
       ),
       (err: unknown) => err instanceof Error && /query limit/.test(err.message),
     )

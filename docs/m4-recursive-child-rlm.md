@@ -34,8 +34,11 @@ root DSH Agent (depth 0)
 
 The runtime derives depth from official DSH Session/runtime metadata and passes
 the cap through `ctx.subagents.start`. It does not trust model-supplied depth or
-maintain a parallel counter. Providers without the required `depthLimit`
-capability fail explicitly; leaf execution also requires `toolFilter`.
+maintain a parallel counter. Before the first branch admission it obtains the
+selected official provider and requires both `depthLimit` and `toolFilter`:
+the former authorizes the absolute cap and the latter guarantees structural
+leaf denial. Capability absence therefore fails before any recursive child is
+created; `start()` remains the authoritative enforcement point at each child.
 
 ## Ownership and isolation
 

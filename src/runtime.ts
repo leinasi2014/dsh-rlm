@@ -5,7 +5,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import type { SubagentRun, SubagentResult } from '@deepseek-ai/dsh-subagent'
+import { delegationDepthOf, type SubagentRun, type SubagentResult } from '@deepseek-ai/dsh-subagent'
 
 const KERNEL_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -19,6 +19,7 @@ const DEFAULT_MAX_STDOUT = 64 * 1024
 const DEFAULT_MAX_RESULT = 64 * 1024
 const DEFAULT_MAX_QUERIES = 16
 const DEFAULT_MAX_CONTEXT_BYTES = 64 * 1024 * 1024
+const DEFAULT_MAX_DEPTH = 1
 const MAX_FRAME_BYTES = 256 * 1024
 const MAX_STDERR_BYTES = 64 * 1024
 const MAX_QUERY_RESULT_BYTES = 64 * 1024
@@ -206,6 +207,8 @@ export interface RlmRuntimeConfig {
 export interface RlmPluginConfig extends RlmRuntimeConfig {
   /** The `ctx.subagents` provider used for each one-shot rlm_query child. */
   provider?: string
+  /** Absolute official DSH delegation cap for an rlm_query child branch. */
+  maxDepth?: number
 }
 
 /**
@@ -222,6 +225,7 @@ export const ConfigSchema: z<RlmPluginConfig> = z.object({
   maxResult: z.natural().min(1024).max(262144).default(65536).description('Byte cap for a cell last-expression result.'),
   maxQueries: z.natural().min(1).max(4096).default(16).description('Max rlm_query calls per cell.'),
   maxContextBytes: z.natural().min(1048576).max(1073741824).default(67108864).description('Byte cap for one kernel-managed UTF-8 context file.'),
+  maxDepth: z.natural().min(1).max(8).default(DEFAULT_MAX_DEPTH).description('Absolute DSH delegation-depth cap for recursive rlm_query children.'),
 })
 
 export interface RlmEvalInput {
@@ -1318,10 +1322,11 @@ function textOf(output: readonly { type: string; text?: unknown }[]): string {
 /**
  * Answer one `rlm_query(prompt)` by starting a fresh one-shot DSH Subagent.
  *
- * The child is spawned with a tool filter that removes `rlm_eval`, so a child
- * can never recurse into another RLM loop. The call is foreground: we wait for
- * the child's terminal result and always dispose it in `finally`. Only the
- * child's final assistant text crosses back to the Python cell.
+ * DSH owns the child Session, persisted delegation depth, and capability
+ * enforcement. The plugin passes an absolute cap and only structurally removes
+ * `rlm_eval` from an exact-cap leaf. The call is foreground: we wait for the
+ * child's terminal result and always dispose it in `finally`. Only the child's
+ * final assistant text crosses back to the Python cell.
  */
 async function runQuery(
   ctx: Context,
@@ -1329,13 +1334,26 @@ async function runQuery(
   parent: Agent,
   prompt: string,
   signal: AbortSignal,
+  maxDepth: number,
 ): Promise<string> {
+  // Fail the whole branch before its first child exists if the selected
+  // provider cannot enforce both the absolute cap and the eventual leaf tool
+  // restriction. `start()` still authoritatively revalidates each request.
+  const selected = ctx.subagents.getProvider(provider)
+  if (selected === undefined) {
+    throw new RlmError('query', `rlm_query provider "${provider}" is not registered`, { phase: 'query' })
+  }
+  if (!selected.capabilities.depthLimit || !selected.capabilities.toolFilter) {
+    throw new RlmError('query', `rlm_query provider "${provider}" must support depthLimit and toolFilter`, { phase: 'query' })
+  }
+  const childDepth = delegationDepthOf(parent) + 1
   const run: SubagentRun = await ctx.subagents.start(provider, {
     label: 'rlm query',
     prompt: [{ type: 'text', text: prompt }],
     parent,
     signal,
-    toolFilter: { deny: [TOOL_NAME] },
+    maxDepth,
+    ...(childDepth === maxDepth ? { toolFilter: { deny: [TOOL_NAME] } } : {}),
   })
   try {
     const result: SubagentResult = await run.result
@@ -1381,6 +1399,7 @@ export function registerRlmPlugin(
 ): void {
   if (config.enabled !== true) return
   const provider = config.provider ?? 'spawn'
+  const maxDepth = config.maxDepth ?? DEFAULT_MAX_DEPTH
   const runtime = createRlmRuntime(ctx, config)
 
   const disposeSection = ctx.systemPrompt.section({
@@ -1390,7 +1409,7 @@ export function registerRlmPlugin(
       'Persistent globals and variables are kept across rlm_eval cells in one per-session Python kernel. '
       + 'Pass contextPath to load one absolute UTF-8 regular file into persistent context; invalid sources leave the prior context intact. '
       + 'Cells may also read files by absolute paths. Top-level await is supported, and '
-      + 'await rlm_query(prompt) delegates the prompt to a one-shot subagent and returns its text. '
+      + 'await rlm_query(prompt) delegates the prompt to a depth-bounded DSH subagent and returns its text. '
       + 'A later rlm_eval call reuses the same variables and can iterate on earlier results.',
   })
 
@@ -1399,8 +1418,8 @@ export function registerRlmPlugin(
     description:
       'Run one Python cell in the current session\'s persistent kernel and return its '
       + 'stdout and last-expression result. The cell may call `await rlm_query(prompt)`, '
-      + 'which answers by delegating the prompt to a one-shot DSH Subagent and returns only '
-      + 'its final text. The child session has no rlm_eval tool, so it cannot recurse.',
+      + 'which answers by delegating the prompt to a depth-bounded DSH Subagent and returns only '
+      + 'its final text. An exact-depth leaf has no rlm_eval tool; lower-depth children may recurse.',
     parameters: {
       code: {
         type: 'string',
@@ -1437,7 +1456,7 @@ export function registerRlmPlugin(
           code: args.code,
           signal: exec.signal,
           onQuery: async (prompt: string, cellSignal: AbortSignal) =>
-            runQuery(ctx, provider, parent, prompt, cellSignal),
+            runQuery(ctx, provider, parent, prompt, cellSignal, maxDepth),
         }
         if (args.contextPath !== undefined) input.contextPath = args.contextPath
         output = await runtime.eval(sessionKey, input)
