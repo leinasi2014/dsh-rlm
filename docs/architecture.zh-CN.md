@@ -1,4 +1,4 @@
-# dsh-rlm 核心与 M3/M4/M5 架构
+# dsh-rlm 核心与 M3/M4/M5/M6 架构
 
 > [English](architecture.md) | 简体中文
 
@@ -24,7 +24,8 @@ DSH Agent Loop
 
 已交付的 V1 基线不包含公共 Service、Storage Domain、run ID、checkpoint、
 restore、`rlm_spawn`、Provider 框架、后台任务、UI、Workflow 或 Team。托管
-上下文、递归子 RLM 和可选故障恢复现由有序 M3、M4、M5 契约约束，但不属于已交付的 V1 行为。
+上下文、递归子 RLM、可选故障恢复与显式重置现由有序 M3、M4、M5、M6 契约约束，
+但不属于已交付的 V1 行为。
 
 ## 2. DSH 边界
 
@@ -281,9 +282,9 @@ V1 通过一个 `Config` schema（`src/runtime.ts` 中的 `ConfigSchema`，由�
 也没有 registry 或 Provider/framework 表面。未知 Provider、Python 启动失败
 或 Provider 无法禁用 RLM 工具时，插件在首次使用时明确失败，不静默切换实现。
 
-## 9. 有序 M3、M4 与 M5 目标
+## 9. 有序 M3、M4、M5 与 M6 目标
 
-M3、M4、M5 在不改变 DSH 权威边界的前提下扩展同一条单工具路径：
+M3、M4、M5、M6 在不改变 DSH 权威边界的前提下扩展同一条单工具路径：
 
 ```text
 M3: rlm_eval(code, contextPath?)
@@ -296,6 +297,11 @@ M4: kernel -> rlm_query(prompt)
 
 M5: 成功 cell -> 私有原子 checkpoint
       -> 合格 kernel 故障 -> 下一 cell 前恢复
+
+M6: rlm_eval({ reset: true })
+      -> FIFO 当前 Session cleanup
+      -> 删除 kernel、M3 context 与 M5 checkpoint
+      -> 后续携带 code 的 eval 从干净状态开始
 ```
 
 - [M3 托管上下文架构](m3-managed-context.zh-CN.md) 冻结加载、原子性、限制、
@@ -304,15 +310,17 @@ M5: 成功 cell -> 私有原子 checkpoint
   每 Session 内核与后代静止；
 - [M5 会话快照恢复架构](m5-session-snapshot-recovery.zh-CN.md) 冻结可选
   checkpoint 的范围、原子性与恢复边界；
+- [M6 手动重置架构](m6-manual-reset.zh-CN.md) 冻结既有工具 reset 输入、FIFO
+  所有权、cleanup barrier 与 Session 隔离；
 - [M3/M4 开发契约](m3-m4-development-contract.zh-CN.md) 冻结文档先行、
   M3→M4、TDD、审查、Git、dogfood 与活体验收门禁；
-- [M5 交互式验收架构图](m5-session-snapshot-recovery.html) 由受版本管理的
-  [Archify 源](m5-session-snapshot-recovery.archify.json) 生成；
+- [M5 交互式验收架构图](m5-session-snapshot-recovery.html) 与
+  [M6 reset 边界图](m6-manual-reset.html) 由受版本管理 Archify 源生成；
 - [交互式目标架构图](dsh-rlm-architecture.html) 由受版本管理的
   [Archify 源](dsh-rlm-architecture.archify.json) 生成。
 
-Storage、宿主重启持久化、continuable spawn、批量查询和第二 runtime 仍不在范围内。
-M3 必须通过后才开始 M4，M4 必须被接受后才开始 M5 生产开发。
+Storage、宿主重启持久化、continuable spawn、批量查询和第二 runtime 仍不在范围内，
+直至其有序契约被接受。M5 必须被接受后才开始 M6；M6 在 M7 前，M7 在 M8 前。
 
 ## 10. 首个验收场景
 

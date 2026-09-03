@@ -1,4 +1,4 @@
-# dsh-rlm Core and M3/M4/M5 Architecture
+# dsh-rlm Core and M3/M4/M5/M6 Architecture
 
 > English | [简体中文](architecture.zh-CN.md)
 
@@ -26,7 +26,8 @@ DSH Agent Loop
 The delivered V1 baseline does not include a public Service, Storage Domain,
 run ID, checkpoint, restore, `rlm_spawn`, Provider framework, background jobs,
 UI, Workflow, or Team. Managed context, recursive child RLM, and opt-in fault
-recovery are governed by the ordered M3, M4, and M5 contracts below; they are
+recovery and explicit reset are governed by the ordered M3, M4, M5, and M6
+contracts below; they are
 not part of the already-delivered V1 behavior.
 
 ## 2. DSH boundary
@@ -319,10 +320,10 @@ surface. An unknown Provider, Python startup failure, or Provider that cannot
 deny the RLM tool must fail explicitly rather than silently switching
 implementation.
 
-## 9. Ordered M3, M4, and M5 target
+## 9. Ordered M3, M4, M5, and M6 target
 
-M3, M4, and M5 extend the same single-tool path without changing the DSH authority
-boundary:
+M3, M4, M5, and M6 extend the same single-tool path without changing the DSH
+authority boundary:
 
 ```text
 M3: rlm_eval(code, contextPath?)
@@ -335,6 +336,11 @@ M4: kernel -> rlm_query(prompt)
 
 M5: successful cell -> private atomic checkpoint
       -> eligible kernel fault -> restore before next cell
+
+M6: rlm_eval({ reset: true })
+      -> FIFO current-Session cleanup
+      -> drop kernel, M3 context, and M5 checkpoint
+      -> later code-bearing eval starts clean
 ```
 
 - [M3 Managed Context architecture](m3-managed-context.md) freezes loading,
@@ -343,16 +349,19 @@ M5: successful cell -> private atomic checkpoint
   official depth authority, per-Session kernels, and descendant quiescence.
 - [M5 Session Snapshot Recovery architecture](m5-session-snapshot-recovery.md)
   freezes opt-in checkpoint scope, atomicity, and recovery boundaries.
+- [M6 Manual Reset architecture](m6-manual-reset.md) freezes the existing-tool
+  reset input, FIFO ownership, cleanup barrier, and Session isolation.
 - [M3/M4 development contract](m3-m4-development-contract.md) freezes the
   docs-first, M3-before-M4, TDD, review, Git, dogfood, and live gates.
-- The [M5 interactive acceptance diagram](m5-session-snapshot-recovery.html) is
-  generated from the tracked [Archify source](m5-session-snapshot-recovery.archify.json).
+- The [M5 interactive acceptance diagram](m5-session-snapshot-recovery.html) and
+  [M6 reset boundary diagram](m6-manual-reset.html) are generated from their
+  tracked Archify sources.
 - The [interactive target diagram](dsh-rlm-architecture.html) is generated from
   the tracked [Archify source](dsh-rlm-architecture.archify.json).
 
 Storage, host-restart persistence, continuable spawn, batch queries, and a
-second runtime remain out of scope. M3 must merge and pass before M4 production
-work starts; M4 must be accepted before M5 production work starts.
+second runtime remain out of scope until their ordered contracts are accepted.
+M5 must be accepted before M6 production work starts; M6 before M7; M7 before M8.
 
 ## 10. First acceptance scenario
 

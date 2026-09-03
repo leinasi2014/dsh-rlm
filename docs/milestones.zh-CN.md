@@ -100,13 +100,29 @@ M1 通过前，不实现 snapshot、spawn、Storage、公共 Service 或第二 P
 见 [M5 架构](m5-session-snapshot-recovery.zh-CN.md) 与
 [M5 交付契约](m5-development-contract.zh-CN.md)。
 
-## M5 之后的条件里程碑
+## M6：手动重置
 
-以下里程碑没有预定顺序。只有
-[后续扩展架构](future-extensions.zh-CN.md) 中对应触发条件成立才启动。
+**结果**：`rlm_eval({ reset: true })` 通过既有 FIFO lifecycle path 显式丢弃仅当前
+Session 的 RLM kernel、managed context 和私有 M5 checkpoint。
+
+**退出条件**：
+
+1. 现有携带 code 的 `rlm_eval` 保持兼容；reset 与 code/context 输入互斥；
+2. reset 排在同 Session 先前已接受工作之后，且仅在既有 kernel/child cleanup barrier 完成后确认；
+3. 同 Session 下一次 eval 使用新 PID，不能读取旧 globals、managed context 或 M5 checkpoint；
+4. 取消、卸载、siblings、parents 与 recursive children 不产生跨 Session reset 或陈旧状态恢复；
+5. 单元/集成测试、独立审查、CI、远端 main 回读和干净已安装插件 DSV4-FVE Profile smoke 均通过。
+
+见 [M6 架构](m6-manual-reset.zh-CN.md) 与
+[M6 交付契约](m6-development-contract.zh-CN.md)。
+
+## M6 之后的有序里程碑
+
+M7 必须在 M6 接受后开始，M8 必须在 M7 接受后开始。
 
 | 里程碑 | 完成结果 |
 |---|---|
-| F4 Batched query | 有界并发、顺序稳定、可取消的批量查询 |
-| F5 第二内核实现 | 第二实现与本地实现通过同一端到端闭环 |
-| F6 外部 Consumer | Jobs、UI 或 swarm 复用现有 runtime，不产生第二权威循环 |
+| M7 Batched query | 有界并发、顺序稳定、可取消的批量查询 |
+| M8 Continuable spawn | 官方 child/inbox 工作在 parent cell 结束后继续 |
+| F9 第二内核实现 | 第二实现与本地实现通过同一端到端闭环 |
+| F10 外部 Consumer | Jobs、UI 或 swarm 复用现有 runtime，不产生第二权威循环 |

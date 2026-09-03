@@ -116,13 +116,36 @@ fatal protocol loss, before the next cell executes.
 See [M5 architecture](m5-session-snapshot-recovery.md) and the
 [M5 delivery contract](m5-development-contract.md).
 
-## Conditional milestones after M5
+## M6: Manual Reset
+
+**Outcome:** `rlm_eval({ reset: true })` explicitly discards only the current
+Session's RLM kernel, managed context, and private M5 checkpoint through the
+existing FIFO lifecycle path.
+
+**Exit criteria:**
+
+1. Existing code-bearing `rlm_eval` calls remain backward compatible; reset is
+   mutually exclusive with code and context input.
+2. Reset is ordered behind earlier accepted same-Session work and acknowledges
+   only after the existing kernel/child cleanup barrier completes.
+3. The next same-Session eval has a fresh PID and cannot read old globals,
+   managed context, or an old M5 checkpoint.
+4. Cancellation, unload, siblings, parents, and recursive children do not
+   cause cross-Session reset or stale-state recovery.
+5. Unit/integration tests, independent review, CI, remote-main read-back, and
+   a clean installed-plugin DSV4-FVE Profile smoke pass.
+
+See [M6 architecture](m6-manual-reset.md) and the
+[M6 delivery contract](m6-development-contract.md).
+
+## Ordered milestones after M6
 
 These milestones have no predetermined order. Start one only when the matching
 trigger in [Future extensions](future-extensions.md) is real.
 
 | Milestone | Completion outcome |
 |---|---|
-| F4 Batched query | Bounded, ordered, cancellable concurrent queries |
-| F5 Second kernel | A second implementation passes the same end-to-end loop |
-| F6 External consumer | Jobs, UI, or swarm reuse the runtime without creating a second authority loop |
+| M7 Batched query | Bounded, ordered, cancellable concurrent queries |
+| M8 Continuable spawn | Official child/inbox work continues after its parent cell exits |
+| F9 Second kernel | A second implementation passes the same end-to-end loop |
+| F10 External consumer | Jobs, UI, or swarm reuse the runtime without creating a second authority loop |
