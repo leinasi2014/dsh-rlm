@@ -31,6 +31,7 @@ import inspect
 import json
 import os
 import platform
+import secrets
 import stat
 import sys
 import threading
@@ -97,6 +98,21 @@ class RlmSnapshotError(Exception):
 
 class RlmContextError(Exception):
     """Raised when a requested managed context cannot be published safely."""
+
+
+class _RlmChildHandle:
+    """An intentionally empty live-kernel capability for one child Session.
+
+    A random local capability token stays in RlmKernel._child_handles while
+    the durable child id remains only in the TypeScript host. This type is
+    outside the deliberately tiny M5 JSON snapshot
+    subset, so neither a checkpoint nor a restored kernel can retain authority.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "<rlm child handle>"
 
 
 class _BoundedStdout:
@@ -177,10 +193,18 @@ class RlmKernel:
             "asyncio": asyncio,
             "rlm_query": self._rlm_query,
             "rlm_query_batched": self._rlm_query_batched,
+            "rlm_spawn": self._rlm_spawn,
+            "rlm_followup": self._rlm_followup,
         }
         self.loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
         self.queue: "asyncio.Queue[Optional[dict[str, Any]]]" = asyncio.Queue()
-        self.pending: dict[int, tuple[asyncio.Future, _CellOwner]] = {}
+        # future, owning cell, expected successful response kind. A matching
+        # numeric id alone is never enough to satisfy a live request.
+        self.pending: dict[int, tuple[asyncio.Future, _CellOwner, str]] = {}
+        # Opaque capability -> random local token. Durable child ids exist only
+        # in the host's per-kernel map, never in this Python process.
+        self._child_handles: dict[_RlmChildHandle, str] = {}
+        self._spawn_handles: dict[int, _RlmChildHandle] = {}
         self.next_query_id = 1
         # Cell lifecycle state (Issue #4): query ids are monotonic and cells
         # run strictly one at a time. On every cell terminal the kernel cancels
@@ -299,7 +323,7 @@ class RlmKernel:
             if not line:
                 # stdin closed cleanly between frames: release any pending query
                 # so the loop can wind down.
-                for future, _generation in list(self.pending.values()):
+                for future, _generation, _expected in list(self.pending.values()):
                     self.loop.call_soon_threadsafe(
                         future.set_exception,
                         RlmQueryError("kernel: host closed the pipe"),
@@ -334,7 +358,7 @@ class RlmKernel:
             kind = frame.get("type")
             if kind == "eval":
                 self.loop.call_soon_threadsafe(self.queue.put_nowait, frame)
-            elif kind in ("query_result", "error"):
+            elif kind in ("query_result", "spawn_result", "followup_result", "error"):
                 qid = frame.get("id")
                 if isinstance(qid, bool) or not isinstance(qid, int):
                     self._fatal("response with non-integer query id " + repr(qid))
@@ -348,6 +372,12 @@ class RlmKernel:
                     truncated = frame.get("truncated") is True
                     self.loop.call_soon_threadsafe(
                         self._deliver_query_result, qid, text, truncated
+                    )
+                elif kind == "spawn_result":
+                    self.loop.call_soon_threadsafe(self._deliver_spawn_result, qid)
+                elif kind == "followup_result":
+                    self.loop.call_soon_threadsafe(
+                        self._deliver_followup_result, qid
                     )
                 else:
                     message = str(frame.get("message", "rlm_query failed"))
@@ -398,7 +428,10 @@ class RlmKernel:
                 return
             self._fatal("response for unknown query id " + repr(qid))
             return
-        future, owner = entry
+        future, owner, expected = entry
+        if expected != "query":
+            self._fatal("query_result for " + expected + " request id " + repr(qid))
+            return
         if owner is not self._current_owner or owner.done or future.cancelled():
             # The query belongs to a retired owner or was cancelled by the
             # cell terminal: record and drop it, never wake the orphan.
@@ -423,11 +456,62 @@ class RlmKernel:
                 return
             self._fatal("response for unknown query id " + repr(qid))
             return
-        future, owner = entry
+        future, owner, expected = entry
+        # An error is the shared terminal reply for all bridge operations.
+        # Release a transient spawn lookup; _rlm_spawn's finally releases the
+        # corresponding local capability whenever admission fails.
+        if expected == "spawn":
+            self._spawn_handles.pop(qid, None)
         if owner is not self._current_owner or owner.done or future.cancelled():
             self.seen_response_ids.add(qid)
             return
         future.set_exception(RlmQueryError(message, detail, truncated))
+        self.seen_response_ids.add(qid)
+
+    def _deliver_spawn_result(self, qid: int) -> None:
+        entry = self.pending.pop(qid, None)
+        if entry is None:
+            if qid in self.seen_response_ids:
+                self._fatal("duplicate response for query id " + repr(qid))
+                return
+            if self._is_retired_qid(qid):
+                self.seen_response_ids.add(qid)
+                return
+            self._fatal("response for unknown query id " + repr(qid))
+            return
+        future, owner, expected = entry
+        if expected != "spawn":
+            self._fatal("spawn_result for " + expected + " request id " + repr(qid))
+            return
+        if owner is not self._current_owner or owner.done or future.cancelled():
+            self.seen_response_ids.add(qid)
+            return
+        handle = self._spawn_handles.pop(qid, None)
+        if handle is None:
+            self._fatal("spawn_result without a pending capability")
+            return
+        future.set_result(handle)
+        self.seen_response_ids.add(qid)
+
+    def _deliver_followup_result(self, qid: int) -> None:
+        entry = self.pending.pop(qid, None)
+        if entry is None:
+            if qid in self.seen_response_ids:
+                self._fatal("duplicate response for query id " + repr(qid))
+                return
+            if self._is_retired_qid(qid):
+                self.seen_response_ids.add(qid)
+                return
+            self._fatal("response for unknown query id " + repr(qid))
+            return
+        future, owner, expected = entry
+        if expected != "followup":
+            self._fatal("followup_result for " + expected + " request id " + repr(qid))
+            return
+        if owner is not self._current_owner or owner.done or future.cancelled():
+            self.seen_response_ids.add(qid)
+            return
+        future.set_result(None)
         self.seen_response_ids.add(qid)
 
     def _end_cell(self) -> None:
@@ -442,8 +526,9 @@ class RlmKernel:
         owner = self._current_owner
         if owner is not None:
             owner.retire()
-        for qid, (future, qowner) in list(self.pending.items()):
+        for qid, (future, qowner, _expected) in list(self.pending.items()):
             if qowner is owner and not future.done():
+                self._spawn_handles.pop(qid, None)
                 future.cancel()
 
     # ---- query bridge ----
@@ -474,12 +559,87 @@ class RlmKernel:
             raise RlmQueryError("rlm_query frame exceeds 256 KiB wire budget")
         loop = asyncio.get_running_loop()
         future: "asyncio.Future[tuple[str, bool]]" = loop.create_future()
-        self.pending[qid] = (future, owner)
+        self.pending[qid] = (future, owner, "query")
         self._send(query_frame)
         try:
             text, truncated = await future
             self.query_truncated = self.query_truncated or truncated
             return text
+        finally:
+            self.pending.pop(qid, None)
+
+    def _active_owner(self, helper: str) -> _CellOwner:
+        owner = _current_cell.get()
+        if (
+            owner is None
+            or owner.done
+            or owner.generation != self.cell_generation
+            or owner is not self._current_owner
+        ):
+            raise RlmQueryError(helper + " called from a retired cell")
+        return owner
+
+    async def _rlm_spawn(self, prompt: Any) -> _RlmChildHandle:
+        """Ask the host to admit one official continuable child.
+
+        The Python caller receives an empty capability object tied to this
+        kernel. Its random token is meaningful only to the TypeScript host;
+        this process never receives or stores a durable child id.
+        """
+        owner = self._active_owner("rlm_spawn")
+        if type(prompt) is not str:
+            raise RlmQueryError("rlm_spawn expects a string prompt")
+        if len(prompt.encode("utf-8", "backslashreplace")) > MAX_QUERY_TEXT:
+            raise RlmQueryError("rlm_spawn prompt exceeds 64 KiB")
+        qid = self.next_query_id
+        self.next_query_id += 1
+        self.cell_ceiling = self.next_query_id
+        handle = _RlmChildHandle()
+        capability = secrets.token_urlsafe(32)
+        frame = {"type": "spawn", "id": qid, "capability": capability, "prompt": prompt}
+        if self._wire_bytes(frame) > MAX_FRAME_BYTES:
+            raise RlmQueryError("rlm_spawn frame exceeds 256 KiB wire budget")
+        future: "asyncio.Future[_RlmChildHandle]" = asyncio.get_running_loop().create_future()
+        self._child_handles[handle] = capability
+        self._spawn_handles[qid] = handle
+        self.pending[qid] = (future, owner, "spawn")
+        self._send(frame)
+        admitted = False
+        try:
+            result = await future
+            admitted = True
+            return result
+        finally:
+            self.pending.pop(qid, None)
+            self._spawn_handles.pop(qid, None)
+            if not admitted:
+                self._child_handles.pop(handle, None)
+
+    async def _rlm_followup(self, handle: Any, prompt: Any) -> None:
+        """Ask the host to admit one later FIFO message for a live capability."""
+        owner = self._active_owner("rlm_followup")
+        if type(handle) is not _RlmChildHandle or handle not in self._child_handles:
+            raise RlmQueryError("rlm_followup expects a live child handle from this kernel")
+        if type(prompt) is not str:
+            raise RlmQueryError("rlm_followup expects a string prompt")
+        if len(prompt.encode("utf-8", "backslashreplace")) > MAX_QUERY_TEXT:
+            raise RlmQueryError("rlm_followup prompt exceeds 64 KiB")
+        qid = self.next_query_id
+        self.next_query_id += 1
+        self.cell_ceiling = self.next_query_id
+        frame = {
+            "type": "followup",
+            "id": qid,
+            "capability": self._child_handles[handle],
+            "prompt": prompt,
+        }
+        if self._wire_bytes(frame) > MAX_FRAME_BYTES:
+            raise RlmQueryError("rlm_followup frame exceeds 256 KiB wire budget")
+        future: "asyncio.Future[None]" = asyncio.get_running_loop().create_future()
+        self.pending[qid] = (future, owner, "followup")
+        self._send(frame)
+        try:
+            await future
         finally:
             self.pending.pop(qid, None)
 
@@ -559,6 +719,8 @@ class RlmKernel:
         """
         self.namespace["rlm_query"] = self._rlm_query
         self.namespace["rlm_query_batched"] = self._rlm_query_batched
+        self.namespace["rlm_spawn"] = self._rlm_spawn
+        self.namespace["rlm_followup"] = self._rlm_followup
 
     def _restore_context(self) -> None:
         """Publish the kernel-owned context with a fresh metadata dictionary."""
@@ -706,7 +868,7 @@ class RlmKernel:
         """Atomically replace a private checkpoint after a successful cell."""
         skipped: list[str] = []
         variables: dict[str, Any] = {}
-        reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "rlm_query_batched", "context", "context_meta"}
+        reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "rlm_query_batched", "rlm_spawn", "rlm_followup", "context", "context_meta"}
         for name in sorted(name for name in self.namespace if type(name) is str and name not in reserved):
             try:
                 ok, detached, reason = self._snapshot_value(self.namespace[name], set())
@@ -769,7 +931,7 @@ class RlmKernel:
         if not isinstance(envelope, dict) or envelope.get("version") != 1 or not isinstance(envelope.get("variables"), dict):
             raise RlmSnapshotError("checkpoint version or variables are invalid")
         restored: dict[str, Any] = {}
-        reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "rlm_query_batched", "context", "context_meta"}
+        reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "rlm_query_batched", "rlm_spawn", "rlm_followup", "context", "context_meta"}
         for name, value in envelope["variables"].items():
             if type(name) is not str or name in reserved:
                 raise RlmSnapshotError("checkpoint contains an invalid variable name")
@@ -805,7 +967,7 @@ class RlmKernel:
                 or canonical_context_path != restored_meta["path"]
             ):
                 raise RlmSnapshotError("checkpoint context metadata is invalid")
-        fresh = {"__name__": "__rlm__", "__builtins__": builtins, "asyncio": asyncio, "rlm_query": self._rlm_query, "rlm_query_batched": self._rlm_query_batched}
+        fresh = {"__name__": "__rlm__", "__builtins__": builtins, "asyncio": asyncio, "rlm_query": self._rlm_query, "rlm_query_batched": self._rlm_query_batched, "rlm_spawn": self._rlm_spawn, "rlm_followup": self._rlm_followup}
         fresh.update(restored)
         self.namespace = fresh
         self.managed_context = restored_context
@@ -941,8 +1103,9 @@ class RlmKernel:
         self.cell_floor = self.next_query_id
         self.cell_ceiling = self.next_query_id
         self.cell_done = False
-        for qid, (future, qowner) in list(self.pending.items()):
+        for qid, (future, qowner, _expected) in list(self.pending.items()):
             if qowner is not owner:
+                self._spawn_handles.pop(qid, None)
                 del self.pending[qid]
 
         capture = _BoundedStdout(max_stdout)

@@ -5032,9 +5032,10 @@
         <path data-edge-from="kernel" data-edge-to="bridge" data-edge-label="opaque spawn request" data-edge-key="1" data-edge-id="spawn" data-composition-points="485,316;560,316" d="M 485 316 L 560 316" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
         <path data-edge-from="bridge" data-edge-to="manager" data-edge-label="startContinuable" data-edge-key="2" data-edge-id="start" data-composition-points="765,316;840,316" d="M 765 316 L 840 316" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
         <path data-edge-from="manager" data-edge-to="child" data-edge-label="initial inbox message" data-edge-key="3" data-edge-id="activate" data-composition-points="1065,316;1090,316" d="M 1065 316 L 1090 316" class="a-default" stroke-width="1.5" marker-end="url(#arrowhead)"/>
-        <path data-edge-from="kernel" data-edge-to="manager" data-edge-label="followup(capability, content)" data-edge-key="4" data-edge-id="followup" data-composition-points="387.5,352;387.5,376;952.5,376;952.5,352" d="M 387.5 352 L 387.5 368 Q 387.5 376 395.5 376 L 944.5 376 Q 952.5 376 952.5 368 L 952.5 352" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
-        <path data-edge-from="child" data-edge-to="inbox" data-edge-label="reportFrom / settlement" data-edge-key="5" data-edge-id="report" data-composition-points="1195,352;1195,376;1089,376;1089,546;1065,546" d="M 1195 352 L 1195 368 Q 1195 376 1187 376 L 1097 376 Q 1089 376 1089 384 L 1089 538 Q 1089 546 1081 546 L 1065 546" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
-        <path data-edge-from="inbox" data-edge-to="parent" data-edge-label="next official turn" data-edge-key="6" data-edge-id="parent-read" data-composition-points="840,546;130,546;130,352" d="M 840 546 L 138 546 Q 130 546 130 538 L 130 352" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="kernel" data-edge-to="bridge" data-edge-label="opaque follow-up request" data-edge-key="4" data-edge-id="followup" data-composition-points="387.5,352;387.5,376;655.5,376;655.5,352" d="M 387.5 352 L 387.5 368 Q 387.5 376 395.5 376 L 647.5 376 Q 655.5 376 655.5 368 L 655.5 352" class="a-dashed" stroke-width="1.5" marker-end="url(#arrowhead-dashed)"/>
+        <path data-edge-from="bridge" data-edge-to="manager" data-edge-label="host delivery Symbol → FIFO inbox" data-edge-key="5" data-edge-id="host-delivery" data-composition-points="669.5,352;669.5,376;952.5,376;952.5,352" d="M 669.5 352 L 669.5 368 Q 669.5 376 677.5 376 L 944.5 376 Q 952.5 376 952.5 368 L 952.5 352" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
+        <path data-edge-from="child" data-edge-to="inbox" data-edge-label="official report / settlement" data-edge-key="6" data-edge-id="report" data-composition-points="1195,352;1195,376;1089,376;1089,546;1065,546" d="M 1195 352 L 1195 368 Q 1195 376 1187 376 L 1097 376 Q 1089 376 1089 384 L 1089 538 Q 1089 546 1081 546 L 1065 546" class="a-emphasis" stroke-width="1.8" marker-end="url(#arrowhead-emphasis)"/>
+        <path data-edge-from="inbox" data-edge-to="parent" data-edge-label="next official turn" data-edge-key="7" data-edge-id="parent-read" data-composition-points="840,546;130,546;130,352" d="M 840 546 L 138 546 Q 130 546 130 538 L 130 352" class="a-security" stroke-width="1.5" marker-end="url(#arrowhead-security)"/>
 
         <!-- Components -->
         <g id="node-parent" data-node-id="parent" data-node-label="Parent DSH Agent" tabindex="0" role="button" aria-label="Focus Parent DSH Agent, official Session and Agent loop, Architecture component" aria-pressed="false" data-node-kind="external" data-node-sublabel="official Session and Agent loop" data-node-context="Architecture component">
@@ -5071,17 +5072,17 @@
         <text data-detail="context" x="662.5" y="330" class="t-muted" font-size="9" text-anchor="middle">one rlm_eval tool; no second loop</text>
         </g>
 
-        <g id="node-manager" data-node-id="manager" data-node-label="Official DSH Subagent Manager" tabindex="0" role="button" aria-label="Focus Official DSH Subagent Manager, startContinuable · followup · reportFrom, Official DSH ownership boundary" aria-pressed="false" data-node-kind="security" data-node-sublabel="startContinuable · followup · reportFrom" data-node-tag="installed rc.2 authority" data-node-context="Official DSH ownership boundary">
-          <title>Official DSH Subagent Manager · startContinuable · followup · reportFrom · Official DSH ownership boundary · installed rc.2 authority</title>
+        <g id="node-manager" data-node-id="manager" data-node-label="Official DSH Subagent Runtime" tabindex="0" role="button" aria-label="Focus Official DSH Subagent Runtime, startContinuable · host delivery, Official DSH ownership boundary" aria-pressed="false" data-node-kind="security" data-node-sublabel="startContinuable · host delivery" data-node-tag="loaded runtime capability" data-node-context="Official DSH ownership boundary">
+          <title>Official DSH Subagent Runtime · startContinuable · host delivery · Official DSH ownership boundary · loaded runtime capability</title>
           <rect x="840" y="280" width="225" height="72" rx="6" class="c-mask"/>
           <rect x="840" y="280" width="225" height="72" rx="6" class="c-security" stroke-width="1.5"/>
           <g aria-hidden="true" data-semantic-sigil="security" class="semantic-sigil s-security" transform="translate(846 286) scale(0.6875)">
             <path d="M8 2.2 13 4v3.5c0 3.1-1.8 5.4-5 6.5-3.2-1.1-5-3.4-5-6.5V4Z"/>
             <path d="m5.8 8 1.5 1.5 3-3"/>
           </g>
-          <text data-node-label="" data-detail-anchor="" x="952.5" y="314" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Official DSH Subagent Manager</text>
-        <text data-detail="context" x="952.5" y="330" class="t-muted" font-size="9" text-anchor="middle">startContinuable · followup · reportFrom</text>
-        <text data-detail="fine" x="952.5" y="344" class="t-security" font-size="7" text-anchor="middle">installed rc.2 authority</text>
+          <text data-node-label="" data-detail-anchor="" x="952.5" y="314" class="t-primary" font-size="11" font-weight="600" text-anchor="middle">Official DSH Subagent Runtime</text>
+        <text data-detail="context" x="952.5" y="330" class="t-muted" font-size="9" text-anchor="middle">startContinuable · host delivery</text>
+        <text data-detail="fine" x="952.5" y="344" class="t-security" font-size="7" text-anchor="middle">loaded runtime capability</text>
         </g>
 
         <g id="node-child" data-node-id="child" data-node-label="Continuable Child Session" tabindex="0" role="button" aria-label="Focus Continuable Child Session, durable identity; official FIFO inbox, Official DSH ownership boundary" aria-pressed="false" data-node-kind="cloud" data-node-sublabel="durable identity; official FIFO inbox" data-node-context="Official DSH ownership boundary">
@@ -5126,15 +5127,19 @@
           <rect x="1022.1" y="356" width="110.8" height="14" rx="3" class="c-mask"/>
           <text x="1077.5" y="366" class="t-muted" font-size="8" text-anchor="middle">initial inbox message</text>
         </g>
-        <g data-detail="context" data-edge-from="kernel" data-edge-to="manager" data-edge-label="followup(capability, content)" data-edge-key="4" data-edge-id="followup">
-          <rect x="595.4" y="356" width="149.2" height="14" rx="3" class="c-mask"/>
-          <text x="670" y="366" class="t-messagebus" font-size="8" text-anchor="middle">followup(capability, content)</text>
+        <g data-detail="context" data-edge-from="kernel" data-edge-to="bridge" data-edge-label="opaque follow-up request" data-edge-key="4" data-edge-id="followup">
+          <rect x="458.9" y="356" width="125.19999999999999" height="14" rx="3" class="c-mask"/>
+          <text x="521.5" y="366" class="t-messagebus" font-size="8" text-anchor="middle">opaque follow-up request</text>
         </g>
-        <g data-detail="context" data-edge-from="child" data-edge-to="inbox" data-edge-label="reportFrom / settlement" data-edge-key="5" data-edge-id="report">
-          <rect x="1081.8" y="356" width="120.39999999999999" height="14" rx="3" class="c-mask"/>
-          <text x="1142" y="366" class="t-backend" font-size="8" text-anchor="middle">reportFrom / settlement</text>
+        <g data-detail="context" data-edge-from="bridge" data-edge-to="manager" data-edge-label="host delivery Symbol → FIFO inbox" data-edge-key="5" data-edge-id="host-delivery">
+          <rect x="726.8" y="356" width="168.4" height="14" rx="3" class="c-mask"/>
+          <text x="811" y="366" class="t-security" font-size="8" text-anchor="middle">host delivery Symbol → FIFO inbox</text>
         </g>
-        <g data-detail="context" data-edge-from="inbox" data-edge-to="parent" data-edge-label="next official turn" data-edge-key="6" data-edge-id="parent-read">
+        <g data-detail="context" data-edge-from="child" data-edge-to="inbox" data-edge-label="official report / settlement" data-edge-key="6" data-edge-id="report">
+          <rect x="1069.8" y="356" width="144.4" height="14" rx="3" class="c-mask"/>
+          <text x="1142" y="366" class="t-backend" font-size="8" text-anchor="middle">official report / settlement</text>
+        </g>
+        <g data-detail="context" data-edge-from="inbox" data-edge-to="parent" data-edge-label="next official turn" data-edge-key="7" data-edge-id="parent-read">
           <rect x="81.80000000000001" y="429" width="96.39999999999999" height="14" rx="3" class="c-mask"/>
           <text x="130" y="439" class="t-security" font-size="8" text-anchor="middle">next official turn</text>
         </g>
@@ -5377,8 +5382,8 @@
           <h3>Authority</h3>
         </div>
         <ul>
+          <li>&bull; Loaded DSH host must expose the official delivery Symbol</li>
           <li>&bull; DSH owns durable identity, FIFO inbox and delivery</li>
-          <li>&bull; The parent Session log remains model-visible history</li>
         </ul>
       </div>
 

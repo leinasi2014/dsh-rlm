@@ -9,15 +9,23 @@ M8 为必须在发起 RLM cell 结束后继续的工作提供最小路径：
 不可快照的不透明 child capability；`rlm_followup(handle, prompt)` 向同一 child 的
 官方 FIFO inbox 投递后续消息。二者都不返回 child 答案。
 
-child 的报告和最终结算只经 `reportFrom` 与官方 parent inbox / Session log 回到
-直接父 Agent；Python 不决定何时把 inbox 消息变成 parent turn。
+直接父 Agent 仍处于 live 状态时，child 的报告和最终结算只经官方 parent inbox /
+Session log 回到该父 Agent。若父 Agent 已离开 DSH live registry，则不能接收迟到
+通知，此时 durable child Session 是记录。Python 不决定何时把 inbox 消息变成 parent
+turn。
 
 ## 边界
 
-执行权威是已安装 `@deepseek-ai/dsh-subagent` 的
-`startContinuable`、`followup`、`reportFrom` 类型；官方 upstream 是新鲜度权威。
-M8 复用既有 `rlm_eval`、按 Session 的 kernel、host lifecycle、M4 深度策略和
-Session lineage。helper 是私有 Python scaffold，不是 DSH tool。
+执行权威是实际加载的 DSH Profile runtime，并同时以已安装
+`@deepseek-ai/dsh-subagent` 类型和最新官方 upstream 交叉核验。
+`startContinuable` 仍是公开创建操作。当前 upstream 对 host-protocol FIFO
+follow-up 有意通过其 `internal` entry 的官方 `queueHostSubagentPrompt` adapter
+提供，不再使用旧的公开 `ctx.subagents.followup`。插件只使用这一确切、进程稳定的
+host adapter：不创建队列，也不冒充 Agent sender。child admission 和 follow-up 前都会检查
+adapter：只暴露旧 `0.1.1-rc.2` public declarations 的 host 明确不受 M8 支持，并且不会创建
+continuable child。M8 复用既有 `rlm_eval`、按
+Session 的 kernel、host lifecycle、M4 深度策略和 Session lineage。helper 是私有
+Python scaffold，不是 DSH tool。
 
 handle 是仅 live kernel 可用的私有 Python capability，对用户代码不暴露 child id，且
 其类型故意不受 M5 snapshot 支持。follow-up 只接受同一 live kernel 的该 capability；
