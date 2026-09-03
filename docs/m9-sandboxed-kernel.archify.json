@@ -1,0 +1,264 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "M9 Sandbox-Backed RLM Kernel",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1280,
+      700
+    ],
+    "repository": {
+      "url": "https://github.com/leinasi2014/dsh-rlm.git",
+      "revision": "e06b65901fe5eb6b2d03fdc47dd1216759b798e3"
+    }
+  },
+  "components": [
+    {
+      "id": "agent",
+      "type": "external",
+      "label": "DSH Agent / Session",
+      "sublabel": "official Session",
+      "pos": [
+        40,
+        210
+      ],
+      "size": [
+        170,
+        70
+      ]
+    },
+    {
+      "id": "bridge",
+      "type": "backend",
+      "label": "dsh-rlm Host Bridge",
+      "sublabel": "rlm_eval tool",
+      "pos": [
+        250,
+        210
+      ],
+      "size": [
+        190,
+        70
+      ],
+      "sources": [
+        {
+          "path": "src/runtime.ts",
+          "label": "plugin runtime"
+        }
+      ]
+    },
+    {
+      "id": "policy",
+      "type": "backend",
+      "label": "ctx.sandboxPolicy",
+      "sublabel": "per-session mode",
+      "pos": [
+        250,
+        400
+      ],
+      "size": [
+        190,
+        70
+      ]
+    },
+    {
+      "id": "confine",
+      "type": "security",
+      "label": "ctx.sandbox",
+      "sublabel": "confine argv",
+      "pos": [
+        480,
+        210
+      ],
+      "size": [
+        185,
+        70
+      ]
+    },
+    {
+      "id": "runner",
+      "type": "security",
+      "label": "Platform Runner",
+      "sublabel": "bwrap · Landlock · ACL",
+      "pos": [
+        705,
+        210
+      ],
+      "size": [
+        190,
+        70
+      ]
+    },
+    {
+      "id": "kernel",
+      "type": "backend",
+      "label": "Python Kernel",
+      "sublabel": "confined child",
+      "pos": [
+        935,
+        210
+      ],
+      "size": [
+        175,
+        70
+      ],
+      "sources": [
+        {
+          "path": "python-runtime/rlm_kernel.py",
+          "label": "persistent kernel"
+        }
+      ]
+    },
+    {
+      "id": "childs",
+      "type": "external",
+      "label": "Kernel Children",
+      "sublabel": "stay confined",
+      "pos": [
+        935,
+        400
+      ],
+      "size": [
+        175,
+        70
+      ]
+    },
+    {
+      "id": "workspace",
+      "type": "database",
+      "label": "Session Workspace",
+      "sublabel": "writable + temp",
+      "pos": [
+        705,
+        400
+      ],
+      "size": [
+        190,
+        70
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "dsh-rlm scope: policy resolved once per kernel start; spawn is the only seam",
+      "wraps": [
+        "bridge",
+        "policy"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "DSH confinement boundary (same-world, fail-closed)",
+      "wraps": [
+        "confine",
+        "runner",
+        "kernel",
+        "childs"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "eval",
+      "from": "agent",
+      "to": "bridge",
+      "label": "rlm_eval cell",
+      "variant": "emphasis",
+      "labelDy": 66
+    },
+    {
+      "id": "resolve",
+      "from": "bridge",
+      "to": "policy",
+      "label": "resolve policy",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "wrap",
+      "from": "bridge",
+      "to": "confine",
+      "label": "confine(argv)",
+      "variant": "security",
+      "fromSide": "right",
+      "toSide": "left",
+      "labelDy": 66
+    },
+    {
+      "id": "policy-ride",
+      "from": "policy",
+      "to": "confine",
+      "label": "policy",
+      "variant": "dashed",
+      "fromSide": "top",
+      "toSide": "bottom"
+    },
+    {
+      "id": "chain",
+      "from": "confine",
+      "to": "runner",
+      "label": "runner chain",
+      "variant": "security",
+      "labelDy": 66
+    },
+    {
+      "id": "spawn",
+      "from": "runner",
+      "to": "kernel",
+      "label": "confined spawn",
+      "variant": "emphasis",
+      "labelDy": 66
+    },
+    {
+      "id": "descend",
+      "from": "kernel",
+      "to": "childs",
+      "label": "stay confined",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    },
+    {
+      "id": "grant",
+      "from": "runner",
+      "to": "workspace",
+      "label": "writable grants",
+      "variant": "security",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 24
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Outcome",
+      "items": [
+        "Kernel file effects follow the Session DSH policy",
+        "kernelSandbox: auto / require / off"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Authority",
+      "items": [
+        "Loaded DSH runtime: ctx.sandbox + ctx.sandboxPolicy",
+        "Fail-closed when no backend; full / partial surfaced"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Non-goals",
+      "items": [
+        "No container, microVM, remote or public KernelDriver",
+        "Reads and network stay unconfined (same-world)"
+      ]
+    }
+  ]
+}
