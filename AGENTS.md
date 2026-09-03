@@ -10,8 +10,8 @@ DSH Agent -> rlm_eval(code) -> Session Python kernel
   -> text returns to Python -> cell continues -> next rlm_eval can reuse globals
 ```
 
-M1–M6 are delivered. Extend the same loop in strict order: M7 Batched Query,
-then M8 Continuable Spawn. Do not add a second agent
+M1–M7 are delivered. Extend the same loop with M8 Continuable Spawn only under
+its accepted contract. Do not add a second agent
 loop, public service, Storage Domain, host-restart persistence, UI, Workflow,
 Jobs, or provider framework.
 

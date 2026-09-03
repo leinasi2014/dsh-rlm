@@ -137,3 +137,8 @@ active；成功文本按输入顺序返回。
 ## M8：可继续 spawn
 
 仅当 M7 在 `main` 接受且 [Future extensions](future-extensions.md) 的对应 trigger 真实存在后，才开始 M8。
+
+Issue #39 现冻结最薄契约：私有 Python spawn/follow-up helper 复用官方 continuable
+Subagent manager 与 parent inbox，不返回 child 答案，也不创建插件队列。见
+[M8 架构](m8-continuable-spawn.zh-CN.md) 与
+[M8 交付契约](m8-development-contract.zh-CN.md)。
