@@ -22,7 +22,7 @@ upstream checkout remains the freshness authority. M8 reuses the existing
 `rlm_eval` tool, Session-keyed Python kernel, host child-work lifecycle, M4
 depth policy, and official Session lineage.
 
-`rlm_spawn(prompt)` and `rlm_followup(child_id, prompt)` are private kernel
+`rlm_spawn(prompt)` and `rlm_followup(handle, prompt)` are private kernel
 helpers, not DSH tools. Prompts are exact strings. `rlm_spawn` returns a private
 Python capability object whose child id is unreadable to user code and whose type
 is deliberately unsupported by M5 snapshots. `rlm_followup` accepts only that
