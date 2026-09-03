@@ -643,10 +643,15 @@ test('M1A Issue#5: a hostile metaclass __name__ is a typed error and the kernel 
 
 // ---- M1B: TypeScript runtime process protocol ----
 
-import { createRlmRuntime, RlmError } from '../src/runtime.ts'
+import { createRlmRuntime, RlmError, type RlmEvalInput } from '../src/runtime.ts'
 
 function rt(config: Record<string, unknown> = {}) {
   return createRlmRuntime(undefined, config)
+}
+
+/** M6 RED seam: the accepted M5 input type has not admitted reset yet. */
+function manualReset(signal?: AbortSignal): RlmEvalInput {
+  return { reset: true, ...(signal ? { signal } : {}) } as unknown as RlmEvalInput
 }
 
 test('M1B: starts a kernel, returns results and reuses it per session key', async () => {
@@ -930,18 +935,42 @@ test('M1C: rlm_eval is registered only when the plugin is enabled', () => {
   try {
     assert.equal(enabled.registered.length, 1)
     assert.equal(enabled.registered[0].name, 'rlm_eval')
-    // Minimal input: only code, and it is required. defineTool normalizes
-    // `parameters` to JSON Schema ({ type, properties, required }).
+    // M6 keeps one tool but exposes the two strict-union branches. defineTool
+    // normalizes `parameters` to JSON Schema ({ type, properties, required });
+    // the execute boundary enforces the cross-field exclusivity.
     assert.equal(enabled.registered[0].parameters.type, 'object')
-    assert.deepEqual(Object.keys(enabled.registered[0].parameters.properties), ['code', 'contextPath'])
+    assert.deepEqual(Object.keys(enabled.registered[0].parameters.properties), ['code', 'contextPath', 'reset'])
     assert.equal(enabled.registered[0].parameters.properties.code.type, 'string')
-    assert.ok(enabled.registered[0].parameters.required.includes('code'))
-    assert.ok(!enabled.registered[0].parameters.required.includes('contextPath'))
+    assert.equal(enabled.registered[0].parameters.properties.reset.type, 'boolean')
+    const required: string[] = enabled.registered[0].parameters.required ?? []
+    assert.ok(!required.includes('code'))
+    assert.ok(!required.includes('contextPath'))
+    assert.ok(!required.includes('reset'))
     // The runtime teardown effect is mounted.
     assert.equal(typeof enabled.teardown, 'function')
     assert.equal(enabled.label, 'rlm runtime teardown')
   } finally {
     enabled.teardown?.()
+  }
+})
+
+test('M6 Issue#33: the registered tool accepts reset alone and rejects mixed or empty union inputs', async () => {
+  const m = makeMockCtx()
+  registerRlmPlugin(m.ctx, { enabled: true })
+  const tool = m.registered[0]
+  try {
+    const reset = await tool.execute({ reset: true }, makeExec('m6-tool-reset'))
+    assert.equal(reset.result, 'RLM state reset')
+    await assert.rejects(
+      tool.execute({ code: '1 + 1', reset: true }, makeExec('m6-tool-mixed')),
+      (err: unknown) => err instanceof Error && /reset input must not include code/i.test(err.message),
+    )
+    await assert.rejects(
+      tool.execute({}, makeExec('m6-tool-empty')),
+      (err: unknown) => err instanceof Error && /requires either code or reset/i.test(err.message),
+    )
+  } finally {
+    await m.teardown?.()
   }
 })
 
@@ -3692,6 +3721,146 @@ test('M5 Issue#31: caller cancellation deletes the private checkpoint instead of
     await assert.rejects(running, (err: unknown) => err instanceof RlmError && err.kind === 'cancel')
     await assert.rejects(
       runtime.eval('m5-cancel', { code: 'm5_cancel_value' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+// ---- M6 Issue #33: Session-local manual reset ----
+
+test('M6 Issue#33 RED: reset replaces one Session kernel and drops its M3 context and M5 checkpoint', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m6-reset-'))
+  const contextPath = path.join(dir, 'context.txt')
+  writeFileSync(contextPath, 'M6 managed context', 'utf8')
+  const runtime = rt({ snapshotRecovery: true, timeout: 5_000, maxContextBytes: 1024 * 1024 })
+  try {
+    const before = await runtime.eval('m6-reset', {
+      code: 'm6_marker = "discard me"\n__import__("os").getpid()',
+      contextPath,
+    })
+    const oldPid = Number(before.result)
+    assert.ok(Number.isInteger(oldPid) && oldPid > 0, 'expected a live pre-reset kernel PID')
+    assert.ok(before.recovery?.checkpointCommitted, 'the pre-reset state must be checkpointed for the M5 boundary')
+
+    const acknowledgement = await runtime.eval('m6-reset', manualReset())
+    assert.equal(acknowledgement.stdout, '')
+    assert.equal(acknowledgement.result, 'RLM state reset')
+    assert.equal(acknowledgement.truncated, false)
+
+    const fresh = await runtime.eval('m6-reset', {
+      code: '[__import__("os").getpid(), "m6_marker" in globals(), "context" in globals()]',
+    })
+    assert.match(fresh.result ?? '', /^\[\d+, False, False\]$/)
+    const freshPid = Number((fresh.result ?? '').match(/^\[(\d+),/)?.[1])
+    assert.ok(Number.isInteger(freshPid) && freshPid > 0 && freshPid !== oldPid, 'reset must lazily use a new Python PID')
+
+    await assert.rejects(runtime.eval('m6-reset', { code: 'import time\ntime.sleep(1)', timeout: 100 }))
+    await assert.rejects(
+      runtime.eval('m6-reset', { code: 'm6_marker' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+  } finally {
+    await runtime.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('M6 Issue#33 RED: reset is FIFO within one Session and never resets a sibling Session', async () => {
+  const runtime = rt({ timeout: 8_000 })
+  try {
+    await runtime.eval('m6-a', { code: 'm6_a = "discard"' })
+    await runtime.eval('m6-b', { code: 'm6_b = "keep"' })
+    const gate = new Deferred<string>()
+    let running = false
+    const first = runtime.eval('m6-a', {
+      code: 'await rlm_query("hold")\nm6_first_finished = True',
+      onQuery: async () => {
+        running = true
+        return gate.promise
+      },
+    })
+    await until(() => running)
+    const reset = runtime.eval('m6-a', manualReset())
+    const afterReset = runtime.eval('m6-a', { code: 'm6_a' })
+    void afterReset.catch(() => {})
+    let resetSettled = false
+    reset.then(() => { resetSettled = true }, () => { resetSettled = true })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(resetSettled, false, 'reset must wait behind the accepted same-Session cell')
+    assert.equal((await runtime.eval('m6-b', { code: 'm6_b' })).result, 'keep', 'a sibling Session must remain independent')
+    gate.resolve('released')
+    await first
+    await reset
+    await assert.rejects(
+      afterReset,
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+    )
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('M6 Issue#33 RED: pre-aborted and queued reset cancellation leave the existing Session state untouched', async () => {
+  const runtime = rt({ timeout: 8_000 })
+  try {
+    await runtime.eval('m6-cancel', { code: 'm6_marker = "keep"' })
+    const preAborted = new AbortController()
+    preAborted.abort('before reset')
+    await assert.rejects(
+      runtime.eval('m6-cancel', manualReset(preAborted.signal)),
+      (err: unknown) => err instanceof RlmError && err.kind === 'cancel',
+    )
+    assert.equal((await runtime.eval('m6-cancel', { code: 'm6_marker' })).result, 'keep')
+
+    const gate = new Deferred<string>()
+    let running = false
+    const first = runtime.eval('m6-cancel', {
+      code: 'await rlm_query("hold")',
+      onQuery: async () => {
+        running = true
+        return gate.promise
+      },
+    })
+    await until(() => running)
+    const queuedAbort = new AbortController()
+    const reset = runtime.eval('m6-cancel', manualReset(queuedAbort.signal))
+    queuedAbort.abort('while queued')
+    await assert.rejects(
+      reset,
+      (err: unknown) => err instanceof RlmError && err.kind === 'cancel',
+    )
+    gate.resolve('released')
+    await first
+    assert.equal((await runtime.eval('m6-cancel', { code: 'm6_marker' })).result, 'keep')
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('M6 Issue#33: an active reset completes its owned cleanup barrier after caller cancellation', async () => {
+  const runtime = rt({ timeout: 8_000 })
+  try {
+    await runtime.eval('m6-active-reset', { code: 'm6_marker = "discard"' })
+    const kernel = (runtime as any).kernels.get('m6-active-reset') as { dispose: () => Promise<void> }
+    assert.ok(kernel, 'seed must create the owned Session kernel')
+    const originalDispose = kernel.dispose.bind(kernel)
+    const barrier = new Deferred<void>()
+    let cleanupStarted = false
+    kernel.dispose = async () => {
+      cleanupStarted = true
+      await barrier.promise
+      await originalDispose()
+    }
+    const controller = new AbortController()
+    const reset = runtime.eval('m6-active-reset', manualReset(controller.signal))
+    await until(() => cleanupStarted)
+    controller.abort('after reset activation')
+    barrier.resolve()
+    assert.equal((await reset).result, 'RLM state reset')
+    await assert.rejects(
+      runtime.eval('m6-active-reset', { code: 'm6_marker' }),
       (err: unknown) => err instanceof RlmError && err.kind === 'eval',
     )
   } finally {
