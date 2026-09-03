@@ -7,9 +7,9 @@ loop in [Core architecture](architecture.md) passes and the matching trigger
 below exists.
 
 Managed Context and Recursive Child RLM have accumulated accepted evidence and
-are no longer conditional items. They are the ordered [M3 and M4](milestones.md)
+are no longer conditional items. They are the ordered [M3, M4, and M5](milestones.md)
 contracts; this table starts with capabilities that remain conditional after
-M4.
+M5.
 
 ## Invariants
 
@@ -27,7 +27,6 @@ Every extension must preserve these boundaries:
 | Capability | Trigger | Minimal addition | Acceptance outcome |
 |---|---|---|---|
 | Manual reset | Users need to clear variables or release a kernel explicitly | Add a reset operation to `rlm_eval`, or one `rlm_reset` tool | Only the current Session resets |
-| Snapshot/restore | An accepted use case requires variables after timeout, crash, or host restart | Serialize supported globals and atomically replace a temporary file | Restart restores supported variables and reports skipped values |
 | Continuable spawn | Work must continue after the parent cell exits | Use the official continuable Subagent and inbox | The child continues and delivers through the official Session path |
 | Cross-host persistence | Users require the same RLM Session after plugin restart | Persist only recovery metadata and snapshot references | The Session restores, while version mismatch fails explicitly |
 | Batched query | Measured sequential-query latency is a bottleneck | Add one concurrency-bounded `rlm_query_batched` | Results preserve input order and cancellation stops every child |
@@ -43,3 +42,8 @@ Every extension must preserve these boundaries:
 4. What executable result proves the extension complete?
 
 If there is no runnable trigger, do not add the feature.
+
+M5 satisfies the observed timeout/crash trigger with an opt-in, per-loaded-
+runtime checkpoint only. Cross-host or host-restart persistence remains a
+separate conditional extension and must not reuse M5's private mapping without
+a new contract.

@@ -93,14 +93,36 @@ retains one-shot tool denial.
 
 See [M4 architecture](m4-recursive-child-rlm.md).
 
-## Conditional milestones after M4
+## M5: Session Snapshot Recovery
+
+**Outcome:** When explicitly enabled, the existing `rlm_eval` path restores the
+last valid, supported Session checkpoint after an owned timeout, crash, or
+fatal protocol loss, before the next cell executes.
+
+**Exit criteria:**
+
+1. `snapshotRecovery=false` retains M2 namespace-loss behavior exactly.
+2. Eligible fatal loss creates a new PID and restores only bounded JSON-safe
+   globals and protected M3 context for the same Session.
+3. Checkpoint publication is atomic; corrupt, oversized, or partial candidates
+   never replace a valid checkpoint, and invalid recovery fails closed.
+4. Cancellation, reset, unload, host restart, sibling, and recursive child
+   boundaries cannot restore an unrelated or stale checkpoint.
+5. Values and context text never appear in model-visible protocol data or
+   recovery metadata; skipped values are reported only as bounded summaries.
+6. Unit/integration tests, independent review, CI, remote-main read-back, and
+   a clean installed-plugin DSV4-FVE Profile smoke pass.
+
+See [M5 architecture](m5-session-snapshot-recovery.md) and the
+[M5 delivery contract](m5-development-contract.md).
+
+## Conditional milestones after M5
 
 These milestones have no predetermined order. Start one only when the matching
 trigger in [Future extensions](future-extensions.md) is real.
 
 | Milestone | Completion outcome |
 |---|---|
-| F1 Snapshot recovery | Restore supported variables after kernel loss and report skipped values |
 | F4 Batched query | Bounded, ordered, cancellable concurrent queries |
 | F5 Second kernel | A second implementation passes the same end-to-end loop |
 | F6 External consumer | Jobs, UI, or swarm reuse the runtime without creating a second authority loop |

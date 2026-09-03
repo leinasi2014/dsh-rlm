@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "M5 Session Snapshot Recovery",
+    "subtitle": "An opt-in, private checkpoint restores one DSH Session after an owned kernel fault.",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "repository": {
+      "url": "https://github.com/leinasi2014/dsh-rlm",
+      "revision": "8c3c9d33449c7617f7a28fb5df2df8470bb7e76f"
+    },
+    "viewBox": [1280, 680],
+    "views": [
+      {
+        "id": "normal-checkpoint",
+        "label": "Normal checkpoint",
+        "focus": ["agent", "tool", "runtime", "kernel", "snapshot"],
+        "note": "A successful cell atomically publishes a supported, bounded checkpoint inside the loaded runtime."
+      },
+      {
+        "id": "fault-recovery",
+        "label": "Fault recovery",
+        "focus": ["runtime", "fault", "snapshot", "replacement"],
+        "note": "An owned timeout or kernel exit replaces the process; the next cell restores before execution."
+      },
+      {
+        "id": "context-integrity",
+        "label": "Managed context integrity",
+        "focus": ["kernel", "context", "snapshot", "replacement"],
+        "note": "Context text and integrity metadata remain in the private checkpoint, never in model-visible logs."
+      }
+    ]
+  },
+  "components": [
+    {
+      "id": "agent",
+      "type": "external",
+      "label": "DSH Agent",
+      "sublabel": "Official Session history",
+      "pos": [40, 285],
+      "size": [150, 70],
+      "sources": [{ "path": "src/index.ts", "label": "tool registration" }]
+    },
+    {
+      "id": "tool",
+      "type": "frontend",
+      "label": "rlm_eval",
+      "sublabel": "Single public RLM tool",
+      "pos": [255, 285],
+      "size": [150, 70],
+      "sources": [{ "path": "src/index.ts", "label": "tool handler" }]
+    },
+    {
+      "id": "runtime",
+      "type": "backend",
+      "label": "RLM Runtime",
+      "sublabel": "Session-local kernel owner",
+      "pos": [470, 285],
+      "size": [175, 70],
+      "sources": [{ "path": "src/runtime.ts", "label": "RlmRuntimeImpl" }]
+    },
+    {
+      "id": "kernel",
+      "type": "backend",
+      "label": "Python Kernel",
+      "sublabel": "Persistent globals + rlm_query",
+      "pos": [720, 285],
+      "size": [180, 70],
+      "sources": [{ "path": "python-runtime/rlm_kernel.py", "label": "kernel loop" }]
+    },
+    {
+      "id": "snapshot",
+      "type": "security",
+      "label": "Private Runtime Checkpoint",
+      "sublabel": "Atomic JSON-safe values + context",
+      "pos": [720, 475],
+      "size": [210, 70],
+      "tag": "ephemeral / private"
+    },
+    {
+      "id": "fault",
+      "type": "cloud",
+      "label": "Owned Kernel Fault",
+      "sublabel": "timeout or process exit",
+      "pos": [470, 95],
+      "size": [175, 70],
+      "tag": "not cancellation"
+    },
+    {
+      "id": "replacement",
+      "type": "backend",
+      "label": "Replacement Kernel",
+      "sublabel": "restore before next cell",
+      "pos": [965, 285],
+      "size": [180, 70]
+    },
+    {
+      "id": "context",
+      "type": "database",
+      "label": "M3 Context Source",
+      "sublabel": "used at checkpoint time only",
+      "pos": [995, 475],
+      "size": [195, 70],
+      "sources": [{ "path": "python-runtime/rlm_kernel.py", "label": "context loader" }]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "One loaded dsh-rlm plugin runtime / one DSH Session",
+      "wraps": ["tool", "runtime", "kernel", "snapshot", "fault", "replacement"],
+      "pad": 30
+    }
+  ],
+  "connections": [
+    { "id": "agent-tool", "from": "agent", "to": "tool", "label": "tool call", "variant": "emphasis" },
+    { "id": "tool-runtime", "from": "tool", "to": "runtime", "label": "current Session key", "variant": "emphasis", "labelDy": 59 },
+    { "id": "runtime-kernel", "from": "runtime", "to": "kernel", "label": "JSON-lines eval", "variant": "emphasis", "labelAt": [683, 369] },
+    { "id": "checkpoint", "from": "kernel", "to": "snapshot", "label": "atomic checkpoint", "fromSide": "bottom", "toSide": "top", "labelAt": [755, 410] },
+    { "id": "fault-evict", "from": "fault", "to": "runtime", "label": "evict owned kernel", "fromSide": "bottom", "toSide": "top", "variant": "security", "labelAt": [558, 179] },
+    { "id": "restore", "from": "snapshot", "to": "replacement", "label": "restore atomically before eval", "fromSide": "top", "toSide": "bottom", "variant": "security", "labelAt": [940, 410] },
+    { "id": "context-checkpoint", "from": "context", "to": "snapshot", "label": "read only while checkpointing", "fromSide": "left", "toSide": "right", "variant": "dashed", "labelAt": [960, 560] }
+  ],
+  "cards": [
+    {
+      "dot": "emerald",
+      "title": "M5 guarantee",
+      "items": ["Restore supported globals and M3 context after an owned kernel fault", "Publish only a complete checkpoint after a successful cell"]
+    },
+    {
+      "dot": "amber",
+      "title": "Hard limits",
+      "items": ["Strict UTF-8 byte cap and JSON-safe value subset", "No values, context text, credentials, or stderr enter the model-visible protocol"]
+    },
+    {
+      "dot": "rose",
+      "title": "Explicit non-goals",
+      "items": ["No recovery after cancellation, plugin unload, or host restart", "No Storage Domain, second Agent loop, UI, or background task"]
+    }
+  ]
+}
