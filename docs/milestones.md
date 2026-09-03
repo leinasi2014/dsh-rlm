@@ -138,14 +138,30 @@ existing FIFO lifecycle path.
 See [M6 architecture](m6-manual-reset.md) and the
 [M6 delivery contract](m6-development-contract.md).
 
-## Ordered milestones after M6
+## M7: Bounded Ordered Batched Query
 
-These milestones have no predetermined order. Start one only when the matching
-trigger in [Future extensions](future-extensions.md) is real.
+**Outcome:** Python code can call `await rlm_query_batched(prompts)` inside the
+existing Session kernel. At most four ordinary DSH child queries are active for
+one batch; successful text returns in input order.
 
-| Milestone | Completion outcome |
-|---|---|
-| M7 Batched query | Bounded, ordered, cancellable concurrent queries |
-| M8 Continuable spawn | Official child/inbox work continues after its parent cell exits |
-| F9 Second kernel | A second implementation passes the same end-to-end loop |
-| F10 External consumer | Jobs, UI, or swarm reuse the runtime without creating a second authority loop |
+**Exit criteria:**
+
+1. Invalid input starts no child; empty input returns an empty list.
+2. Out-of-order child completion and duplicate prompts still yield an exactly
+   input-ordered result list.
+3. The observed per-batch active-child count never exceeds four; existing
+   `maxQueries`, byte limits, depth rules, and child tool denial remain intact.
+4. An item error stops new admission, drains admitted children, then returns one
+   deterministic typed failure without poisoning the next cell.
+5. Cancellation, timeout, reset, and unload quiesce all admitted work and M5
+   never serializes helper bookkeeping as user state.
+6. Unit/integration tests, independent review, CI, remote-main read-back, and
+   a clean installed-plugin Profile smoke pass.
+
+See [M7 architecture](m7-batched-query.md) and the
+[M7 delivery contract](m7-development-contract.md).
+
+## M8: Continuable Spawn
+
+Start M8 only after M7 is accepted on `main` and its matching trigger in
+[Future extensions](future-extensions.md) is real.

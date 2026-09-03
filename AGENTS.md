@@ -10,8 +10,8 @@ DSH Agent -> rlm_eval(code) -> Session Python kernel
   -> text returns to Python -> cell continues -> next rlm_eval can reuse globals
 ```
 
-M1–M5 are delivered. Extend the same loop in strict order: M6 Manual Reset,
-then M7 Batched Query, then M8 Continuable Spawn. Do not add a second agent
+M1–M6 are delivered. Extend the same loop in strict order: M7 Batched Query,
+then M8 Continuable Spawn. Do not add a second agent
 loop, public service, Storage Domain, host-restart persistence, UI, Workflow,
 Jobs, or provider framework.
 
@@ -20,10 +20,10 @@ Jobs, or provider framework.
 - Treat `docs/architecture.md`, `docs/directory-structure.md`,
   `docs/milestones.md`, and `docs/future-extensions.md` as the current product
   boundary.
-- For M6, also treat `docs/m6-manual-reset.md` and
-  `docs/m6-development-contract.md` as binding; English is authoritative and
-  each has a Chinese mirror. M3/M4/M5 documents remain binding for their owned
-  boundaries.
+- For M7, also treat `docs/m7-batched-query.md` and
+  `docs/m7-development-contract.md` as binding; English is authoritative and
+  each has a Chinese mirror. M3/M4/M5/M6 documents remain binding for their
+  owned boundaries.
 - Keep the V1 source layout small:
   - `src/index.ts`
   - `src/runtime.ts`
@@ -89,11 +89,11 @@ Jobs, or provider framework.
    and dispose.
 6. Prove the M1 loop in tests and in a clean DSH Profile using the configured
    `DeepSeek-V4-Flash-Vision-Exp` vLLM/PTC model path.
-7. M3–M5 are accepted on `main`; preserve their contract boundaries.
-8. Implement M6 only after its docs slice is integrated: use strict TDD to
-   reset only the current Session through the existing `rlm_eval` path, after
-   the queue-ordered kernel/child cleanup barrier and M5 checkpoint deletion.
-9. Start M7 only after M6 acceptance; start M8 only after M7 acceptance.
+7. M3–M6 are accepted on `main`; preserve their contract boundaries.
+8. Implement M7 only after its docs slice is integrated: use strict TDD to add
+   one fixed-bounded, ordered `rlm_query_batched` helper through the existing
+   Python/host bridge; it must drain admitted children before terminal failure.
+9. Start M8 only after M7 acceptance.
 
 ## Milestone Split
 
@@ -141,7 +141,7 @@ Jobs, or provider framework.
   active assignment.
 - A model report is not completion. Completion needs committed code plus local
   checks and the clean Profile smoke required by the milestone.
-- During M6–M8, dogfood the latest completed plugin through a real clean DSH
+- During M7–M8, dogfood the latest completed plugin through a real clean DSH
   Profile with the local package installed and the configured vLLM/PTC route.
   Aggregate incidental findings, reproduce and classify them, then create a
   separate GitHub Issue; do not opportunistically fold them into the active
@@ -209,6 +209,10 @@ plugin from the local package, enables it, selects the configured
 6. with `snapshotRecovery=true`, a timeout/crash starts a new kernel and the
    next same-Session `rlm_eval` restores supported state without exposing
    checkpoint values or context text in the model-visible log.
+
+If the DSV4-FVE service is demonstrably unavailable, use `zai-coding-cn /
+glm-5.2` only as a temporary clean-Profile fallback, record that fact in the
+live evidence, and re-run the DSV4-FVE smoke after recovery.
 
 If this smoke cannot run, report the exact product blocker and keep improving the
 nearest executable slice instead of creating more design documents.

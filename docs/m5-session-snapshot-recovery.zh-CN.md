@@ -46,7 +46,7 @@ Python kernel 负责验证、序列化、恢复和原子发布。带版本的 en
 
 对象 identity/alias 不保证保留。函数、class、module、bytes、handle、task、generator、自定义对象、
 循环引用、非有限数字、超出 JavaScript 安全范围整数及内部/保留 globals 都会跳过并记录原因。
-`__builtins__`、`asyncio`、`rlm_query`、`context`、`context_meta` 绝不进入用户 globals 段。
+`__builtins__`、`asyncio`、`rlm_query`、`rlm_query_batched`、`context`、`context_meta` 绝不进入用户 globals 段。
 
 M3 context 保存的是已验证文本与元数据，而非仅保存源路径，因此恢复不会静默使用已变更、删除或替换
 的源文件。context 文本只留在本地私有 checkpoint 中，不经过模型可见 tool input、tool result、

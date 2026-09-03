@@ -1,4 +1,4 @@
-# dsh-rlm Core and M3/M4/M5/M6 Architecture
+# dsh-rlm Core and M3/M4/M5/M6/M7 Architecture
 
 > English | [简体中文](architecture.zh-CN.md)
 
@@ -6,9 +6,9 @@
 
 `dsh-rlm` adds one capability to DeepSeek Harness: the model can call one
 `rlm_eval` tool to execute code in a persistent Python namespace, and that code
-can call the model with `await rlm_query(prompt)`. The query text returns to
-Python, the current cell continues, and a later `rlm_eval` call can reuse the
-same variables.
+can call the model with `await rlm_query(prompt)` or the bounded convenience
+helper `await rlm_query_batched(prompts)`. Query text returns to Python, the
+current cell continues, and a later `rlm_eval` call can reuse the same variables.
 
 V1 is complete when this path works in a real DSH Profile:
 
@@ -26,7 +26,8 @@ DSH Agent Loop
 The delivered V1 baseline does not include a public Service, Storage Domain,
 run ID, checkpoint, restore, `rlm_spawn`, Provider framework, background jobs,
 UI, Workflow, or Team. Managed context, recursive child RLM, and opt-in fault
-recovery and explicit reset are governed by the ordered M3, M4, M5, and M6
+recovery, explicit reset, and bounded batching are governed by the ordered M3,
+M4, M5, M6, and M7
 contracts below; they are
 not part of the already-delivered V1 behavior.
 
@@ -43,7 +44,8 @@ not part of the already-delivered V1 behavior.
 When enabled, the plugin registers exactly one system-prompt section named
 `tool:rlm_eval` at order `150`; it explains persistent globals/variables,
 reading files by absolute paths, top-level `await`, `await rlm_query(prompt)`,
-and later `rlm_eval` calls reusing the same variables. Disabling the plugin or
+bounded `await rlm_query_batched(prompts)`, and later `rlm_eval` calls reusing
+the same variables. Disabling the plugin or
 unloading its fiber removes that section together with the tool and the
 runtime, so there is no registry, public service, or provider framework.
 
@@ -91,7 +93,7 @@ That process only:
 
 1. keeps one persistent `globals` namespace;
 2. serially executes cells with top-level `await`;
-3. exposes `await rlm_query(prompt)`;
+3. exposes `await rlm_query(prompt)` and the M7 bounded batch helper;
 4. buffers and bounds stdout, stderr, and results;
 5. communicates with the TypeScript host over a small JSON-lines protocol.
 
@@ -320,9 +322,9 @@ surface. An unknown Provider, Python startup failure, or Provider that cannot
 deny the RLM tool must fail explicitly rather than silently switching
 implementation.
 
-## 9. Ordered M3, M4, M5, and M6 target
+## 9. Ordered M3, M4, M5, M6, and M7 target
 
-M3, M4, M5, and M6 extend the same single-tool path without changing the DSH
+M3, M4, M5, M6, and M7 extend the same single-tool path without changing the DSH
 authority boundary:
 
 ```text
@@ -341,6 +343,11 @@ M6: rlm_eval({ reset: true })
       -> FIFO current-Session cleanup
       -> drop kernel, M3 context, and M5 checkpoint
       -> later code-bearing eval starts clean
+
+M7: kernel -> await rlm_query_batched(prompts)
+      -> at most four existing query/child paths active per batch
+      -> indexed results return in input order
+      -> item failure stops admission and drains admitted children
 ```
 
 - [M3 Managed Context architecture](m3-managed-context.md) freezes loading,
@@ -351,17 +358,21 @@ M6: rlm_eval({ reset: true })
   freezes opt-in checkpoint scope, atomicity, and recovery boundaries.
 - [M6 Manual Reset architecture](m6-manual-reset.md) freezes the existing-tool
   reset input, FIFO ownership, cleanup barrier, and Session isolation.
+- [M7 Bounded Ordered Batched Query architecture](m7-batched-query.md) freezes
+  the Python-only helper, fixed admission cap, ordered results, drain-before-
+  failure rule, and lifecycle reuse.
 - [M3/M4 development contract](m3-m4-development-contract.md) freezes the
   docs-first, M3-before-M4, TDD, review, Git, dogfood, and live gates.
-- The [M5 interactive acceptance diagram](m5-session-snapshot-recovery.html) and
-  [M6 reset boundary diagram](m6-manual-reset.html) are generated from their
+- The [M5 interactive acceptance diagram](m5-session-snapshot-recovery.html),
+  [M6 reset boundary diagram](m6-manual-reset.html), and
+  [M7 batch boundary diagram](m7-batched-query.html) are generated from their
   tracked Archify sources.
 - The [interactive target diagram](dsh-rlm-architecture.html) is generated from
   the tracked [Archify source](dsh-rlm-architecture.archify.json).
 
-Storage, host-restart persistence, continuable spawn, batch queries, and a
-second runtime remain out of scope until their ordered contracts are accepted.
-M5 must be accepted before M6 production work starts; M6 before M7; M7 before M8.
+Storage, host-restart persistence, continuable spawn, provider-native batching,
+and a second runtime remain out of scope until their ordered contracts are
+accepted. M6 must be accepted before M7 production work starts; M7 before M8.
 
 ## 10. First acceptance scenario
 

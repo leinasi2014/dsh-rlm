@@ -61,8 +61,8 @@ Object identity and aliases are not preserved. Functions, classes, modules,
 bytes, handles, tasks, generators, custom objects, cyclic values, non-finite
 numbers, integers outside the JavaScript safe range, and internal/reserved
 globals are omitted and recorded as skipped. The protected names
-`__builtins__`, `asyncio`, `rlm_query`, `context`, and `context_meta` never
-enter the user-globals section.
+`__builtins__`, `asyncio`, `rlm_query`, `rlm_query_batched`, `context`, and
+`context_meta` never enter the user-globals section.
 
 M3 context is captured as its exact validated text plus metadata in the private
 checkpoint—not merely as a source path. Recovery therefore cannot silently

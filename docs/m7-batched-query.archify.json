@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "M7 Bounded Ordered Batched Query",
+    "subtitle": "One existing RLM cell starts a bounded set of ordinary one-shot DSH child queries; it never creates a second agent loop or a global scheduler.",
+    "locale": "en",
+    "output": "m7-batched-query.html",
+    "quality_profile": "showcase",
+    "visual_preset": "signal-flow",
+    "repository": {
+      "url": "https://github.com/leinasi2014/dsh-rlm.git",
+      "revision": "4f701c999b7cb552bd6e4b7d229b2f424a3a3b01"
+    },
+    "views": [
+      {
+        "id": "normal-path",
+        "label": "Normal ordered batch",
+        "focus": ["python-cell", "batch-helper", "query-workers", "host-bridge", "dsh-children", "ordered-result"],
+        "note": "At most four queries are admitted at once; indexed results return in input order."
+      },
+      {
+        "id": "failure-and-lifecycle",
+        "label": "Failure and lifecycle",
+        "focus": ["batch-helper", "query-workers", "host-bridge", "cell-lifecycle"],
+        "note": "Stop further admission, drain started children, then surface one typed error; cancel, timeout, and unload reuse the existing cell barrier."
+      }
+    ],
+    "legend": { "mode": "hidden" },
+    "viewBox": [1320, 640]
+  },
+  "components": [
+    {
+      "id": "python-cell",
+      "type": "frontend",
+      "label": "Persistent Python Cell",
+      "sublabel": "await rlm_query_batched(prompts)",
+      "tag": "Session-local globals",
+      "pos": [60, 290],
+      "size": [190, 82],
+      "sources": [{ "path": "python-runtime/rlm_kernel.py", "label": "kernel" }]
+    },
+    {
+      "id": "batch-helper",
+      "type": "backend",
+      "label": "Batch Helper",
+      "sublabel": "strict input + indexed work queue",
+      "tag": "fixed cap: 4",
+      "pos": [320, 290],
+      "size": [180, 82],
+      "sources": [{ "path": "python-runtime/rlm_kernel.py", "label": "M7 helper" }]
+    },
+    {
+      "id": "query-workers",
+      "type": "messagebus",
+      "label": "At Most Four Workers",
+      "sublabel": "reuse _rlm_query for every item",
+      "tag": "ordered indices",
+      "pos": [570, 290],
+      "size": [190, 82],
+      "sources": [{ "path": "python-runtime/rlm_kernel.py", "label": "query bridge" }]
+    },
+    {
+      "id": "host-bridge",
+      "type": "backend",
+      "label": "Existing Host Bridge",
+      "sublabel": "JSON-lines query / query_result",
+      "tag": "existing byte + query limits",
+      "pos": [830, 290],
+      "size": [200, 82],
+      "sources": [{ "path": "src/runtime.ts", "label": "Kernel.onQuery" }]
+    },
+    {
+      "id": "dsh-children",
+      "type": "external",
+      "label": "One-shot DSH Subagents",
+      "sublabel": "RLM available below cap; denied at leaf",
+      "tag": "official DSH authority",
+      "pos": [1100, 290],
+      "size": [210, 82],
+      "sources": [{ "path": "src/runtime.ts", "label": "runQuery" }]
+    },
+    {
+      "id": "ordered-result",
+      "type": "database",
+      "label": "Ordered Result List",
+      "sublabel": "same length and input order",
+      "tag": "no partial result",
+      "pos": [570, 510],
+      "size": [190, 76],
+      "sources": [{ "path": "python-runtime/rlm_kernel.py", "label": "results" }]
+    },
+    {
+      "id": "cell-lifecycle",
+      "type": "security",
+      "label": "Existing Cell Lifecycle",
+      "sublabel": "cancel / timeout / unload barrier",
+      "tag": "abort all admitted children",
+      "pos": [830, 510],
+      "size": [200, 76],
+      "sources": [{ "path": "src/runtime.ts", "label": "settleChild" }]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "Existing Session-scoped RLM execution loop",
+      "wraps": ["python-cell", "batch-helper", "query-workers", "host-bridge", "ordered-result", "cell-lifecycle"],
+      "pad": 24
+    }
+  ],
+  "connections": [
+    { "from": "python-cell", "to": "batch-helper", "label": "validated prompts", "variant": "emphasis", "labelAt": [285, 235] },
+    { "from": "batch-helper", "to": "query-workers", "label": "admit ≤ 4", "variant": "emphasis", "labelAt": [535, 278] },
+    { "from": "query-workers", "to": "host-bridge", "label": "one query per item", "variant": "emphasis", "labelAt": [795, 278] },
+    { "from": "host-bridge", "to": "dsh-children", "label": "one-shot child", "variant": "emphasis", "labelAt": [1065, 278] },
+    { "from": "dsh-children", "to": "host-bridge", "label": "bounded text", "variant": "default", "labelAt": [1065, 395] },
+    { "from": "host-bridge", "to": "query-workers", "label": "query_result", "variant": "default", "labelAt": [795, 395] },
+    { "from": "query-workers", "to": "ordered-result", "variant": "emphasis", "fromSide": "bottom", "toSide": "top" },
+    { "from": "ordered-result", "to": "python-cell", "label": "list[str]", "variant": "emphasis", "fromSide": "left", "toSide": "bottom", "via": [[470, 548], [155, 548], [155, 372]] },
+    { "from": "cell-lifecycle", "to": "host-bridge", "label": "abort + dispose admitted work", "variant": "security", "fromSide": "top", "toSide": "bottom" }
+  ]
+}
