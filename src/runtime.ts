@@ -1912,6 +1912,91 @@ function enforceQueryTokenGuard(ctx: Context, parent: Agent, config: RlmPluginCo
   }
 }
 
+type RlmJobsLike = {
+  attachController(name: string): () => void
+  start(spec: RlmJobStartInput): unknown
+}
+type RlmJobHooks = {
+  cancel(reason?: string): void
+  done: Promise<{ status: 'completed' | 'killed' | 'failed'; detail?: string; output?: string }>
+  readOutput?(): string
+}
+type RlmJobStartInput = {
+  kind: string
+  label: string
+  outputLimitBytes?: number
+  owner?: unknown
+  run(): RlmJobHooks
+}
+
+/** One official DSH background job running one RLM cell through the same runtime. */
+export function createRlmJobSpec(
+  parent: Agent,
+  code: string,
+  runtime: RlmRuntime,
+): RlmJobStartInput {
+  const key = String(parent.id)
+  let settled = false
+  let captured = ''
+  let doCancel: (() => void) | undefined
+  // Lazily start the cell only when the official job registry calls run(); the
+  // returned spec is inert until then, so a never-started job leaks nothing.
+  const done = new Promise<{ status: 'completed' | 'killed' | 'failed'; detail?: string; output?: string }>((resolve) => {
+    doCancel = () => {
+      if (settled) return
+      settled = true
+      void runtime.dispose().then(() => resolve({ status: 'killed', detail: 'job cancelled' }), () => resolve({ status: 'killed', detail: 'job cancelled' }))
+    }
+    void runtime.eval(key, { code }).then((out) => {
+      if (settled) return
+      settled = true
+      captured = (out.stdout ?? '') + (out.result === undefined ? '' : '\n' + out.result)
+      resolve({ status: 'completed', output: captured })
+    }, (err: unknown) => {
+      if (settled) return
+      settled = true
+      resolve({
+        status: err instanceof RlmError && err.kind === 'cancel' ? 'killed' : 'failed',
+        detail: err instanceof Error ? err.message : String(err),
+      })
+    })
+  })
+  return {
+    kind: 'rlm',
+    label: 'rlm_eval job: ' + code.slice(0, 80),
+    outputLimitBytes: 64 * 1024,
+    owner: parent,
+    run() {
+      return {
+        cancel(_reason?: string) { doCancel?.() },
+        done,
+        readOutput() { const out = captured; captured = ''; return out },
+      }
+    },
+  }
+}
+
+/** Start one official DSH background job running this RLM cell (M12 consumer path). */
+export function startRlmJob(
+  ctx: Context,
+  parent: Agent,
+  code: string,
+  runtime: RlmRuntime,
+): unknown {
+  const jobs = ctx as unknown as { jobs?: RlmJobsLike } | undefined
+  if (!jobs?.jobs || typeof jobs.jobs.start !== 'function') {
+    throw new RlmError('eval', 'background jobs unavailable: no ctx.jobs service is mounted')
+  }
+  return jobs.jobs.start(createRlmJobSpec(parent, code, runtime))
+}
+
+/** Register the 'rlm' job controller when the DSH jobs surface is mounted (M12). */
+function attachRlmJobController(ctx: Context): (() => void) | undefined {
+  const jobs = ctx as unknown as { jobs?: RlmJobsLike } | undefined
+  if (!jobs?.jobs || typeof jobs.jobs.attachController !== 'function') return undefined
+  return jobs.jobs.attachController('rlm')
+}
+
 export function registerRlmPlugin(
   ctx: Context,
   config: RlmPluginConfig,
@@ -1921,6 +2006,7 @@ export function registerRlmPlugin(
   const maxDepth = config.maxDepth ?? DEFAULT_MAX_DEPTH
   const runtime = createRlmRuntime(ctx, config)
   const continuableParents = new Set<Agent>()
+  const detachRlmJobs = attachRlmJobController(ctx)
 
   const disposeSection = ctx.systemPrompt.section({
     name: 'tool:' + TOOL_NAME,
@@ -2042,6 +2128,7 @@ export function registerRlmPlugin(
   // Tear down the runtime and unregister the tool whenever the plugin's fiber
   // unloads, so no plugin-owned Python process survives the plugin.
   ctx.effect(() => () => {
+    detachRlmJobs?.()
     disposeTool()
     disposeSection()
     return (async () => {

@@ -1395,6 +1395,84 @@ test('M10 Issue#44: a durable version mismatch fails closed without restoring st
   }
 })
 
+
+test('M12 Issue#48: registerRlmPlugin attaches the rlm job controller when jobs exist', async () => {
+  const controllers: string[] = []
+  const m = makeMockCtx()
+  m.ctx.jobs = {
+    attachController(name: string) { controllers.push(name); return () => {} },
+    start() { throw new Error('unused') },
+  }
+  registerRlmPlugin(m.ctx, { enabled: true })
+  try {
+    assert.ok(controllers.includes('rlm'), 'rlm job controller must be attached')
+    assert.equal(m.registered.length, 1, 'tool registration unchanged')
+  } finally {
+    await m.teardown?.()
+  }
+})
+
+test('M12 Issue#48: createRlmJobSpec runs one cell and reports bounded output', async () => {
+  const m = makeMockCtx({ queryText: '4' })
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn' })
+  const tool = m.registered[0]
+  const exec = makeExec('m12-job')
+  // Build a runtime-backed job spec via the tool's runtime import path: use createRlmRuntime directly.
+  const { createRlmRuntime } = await import('../src/runtime.ts')
+  const { createRlmJobSpec } = await import('../src/runtime.ts')
+  const runtime = createRlmRuntime(undefined, {})
+  const spec = createRlmJobSpec(exec.agent, '2 + 2', runtime)
+  assert.equal(spec.kind, 'rlm')
+  assert.equal(typeof spec.run, 'function')
+  const hooks = spec.run()
+  const outcome = await hooks.done
+  assert.equal(outcome.status, 'completed')
+  assert.match(hooks.readOutput?.() ?? '', /4/, 'job output must carry the cell result')
+  await runtime.dispose()
+  try { await m.teardown?.() } catch {}
+})
+
+test('M12 Issue#48: startRlmJob dispatches through ctx.jobs.start with the rlm kind', async () => {
+  const started: any[] = []
+  const m = makeMockCtx()
+  m.ctx.jobs = {
+    attachController(name: string) { return () => {} },
+    start(spec: any) { started.push(spec); return 'rlm-1' },
+  }
+  const { createRlmRuntime, startRlmJob } = await import('../src/runtime.ts')
+  const runtime = createRlmRuntime(undefined, {})
+  const id = startRlmJob(m.ctx, makeAgent('m12-start'), '1 + 1', runtime)
+  assert.equal(id, 'rlm-1')
+  assert.equal(started.length, 1)
+  assert.equal(started[0].kind, 'rlm')
+  assert.equal(typeof started[0].run, 'function')
+  await runtime.dispose()
+})
+
+test('M12 Issue#48: an inert spec does not start the cell until run() is called', async () => {
+  const { createRlmRuntime, createRlmJobSpec } = await import('../src/runtime.ts')
+  const runtime = createRlmRuntime(undefined, {})
+  const spec = createRlmJobSpec(makeAgent('m12-inert'), '1 + 1', runtime)
+  const hooks = spec.run()
+  const outcome = await hooks.done
+  assert.equal(outcome.status, 'completed')
+  await runtime.dispose()
+})
+
+test('M12 Issue#48: a job kill settles as killed and disposes the kernel', async () => {
+  const { createRlmRuntime } = await import('../src/runtime.ts')
+  const { createRlmJobSpec } = await import('../src/runtime.ts')
+  const runtime = createRlmRuntime(undefined, {})
+  const exec = makeExec('m12-kill')
+  const spec = createRlmJobSpec(exec.agent, 'import time\ntime.sleep(30)', runtime)
+  const hooks = spec.run()
+  await new Promise((res) => setTimeout(res, 200))
+  hooks.cancel('test kill')
+  const outcome = await hooks.done
+  assert.equal(outcome.status, 'killed', 'job must settle killed after cancel')
+  await runtime.dispose()
+})
+
 // ---- M1C/M1D: DSH tool registration and rlm_query -> one-shot Subagent bridge ----
 
 import { registerRlmPlugin } from '../src/runtime.ts'

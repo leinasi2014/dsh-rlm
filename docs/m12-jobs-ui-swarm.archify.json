@@ -1,0 +1,216 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "M12 RLM as DSH Job Consumer",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1240,
+      700
+    ],
+    "repository": {
+      "url": "https://github.com/leinasi2014/dsh-rlm.git",
+      "revision": "0890b242d1af1b138c4ddecba1eb4cfdb78a5994"
+    }
+  },
+  "components": [
+    {
+      "id": "jobs",
+      "type": "external",
+      "label": "DSH Jobs / UI",
+      "sublabel": "official job tools",
+      "pos": [
+        40,
+        300
+      ],
+      "size": [
+        200,
+        72
+      ]
+    },
+    {
+      "id": "producer",
+      "type": "backend",
+      "label": "RLM Job Producer",
+      "sublabel": "one per Session",
+      "pos": [
+        300,
+        300
+      ],
+      "size": [
+        200,
+        72
+      ],
+      "sources": [
+        {
+          "path": "src/runtime.ts",
+          "label": "plugin runtime"
+        }
+      ]
+    },
+    {
+      "id": "runtime",
+      "type": "backend",
+      "label": "RLM Runtime",
+      "sublabel": "runtime.eval(cell)",
+      "pos": [
+        560,
+        300
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "kernel",
+      "type": "backend",
+      "label": "Session Kernel",
+      "sublabel": "persistent Python",
+      "pos": [
+        820,
+        300
+      ],
+      "size": [
+        180,
+        72
+      ],
+      "sources": [
+        {
+          "path": "python-runtime/rlm_kernel.py",
+          "label": "kernel"
+        }
+      ]
+    },
+    {
+      "id": "jobsys",
+      "type": "security",
+      "label": "ctx.jobs",
+      "sublabel": "start/wait/read/kill",
+      "pos": [
+        820,
+        500
+      ],
+      "size": [
+        180,
+        72
+      ]
+    },
+    {
+      "id": "out",
+      "type": "database",
+      "label": "Official Job Record",
+      "sublabel": "bounded output",
+      "pos": [
+        560,
+        500
+      ],
+      "size": [
+        190,
+        72
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "dsh-rlm scope: one producer per Session; no scheduler/queue",
+      "wraps": [
+        "producer",
+        "runtime"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "DSH jobs authority: history lives in the official record",
+      "wraps": [
+        "jobs",
+        "jobsys",
+        "out"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "ctrl",
+      "from": "jobs",
+      "to": "producer",
+      "label": "start / wait / kill",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "id": "eval",
+      "from": "producer",
+      "to": "runtime",
+      "label": "runtime.eval(cell)",
+      "variant": "security",
+      "labelDy": 60
+    },
+    {
+      "id": "cell",
+      "from": "runtime",
+      "to": "kernel",
+      "label": "same Session cell",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "id": "pub",
+      "from": "runtime",
+      "to": "jobsys",
+      "label": "official job control",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top"
+    },
+    {
+      "id": "record",
+      "from": "jobsys",
+      "to": "out",
+      "label": "bounded output",
+      "variant": "security",
+      "labelAt": [
+        785,
+        586
+      ]
+    },
+    {
+      "id": "read",
+      "from": "out",
+      "to": "jobs",
+      "label": "job_read",
+      "variant": "dashed",
+      "fromSide": "left",
+      "toSide": "bottom",
+      "labelDy": 20
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Outcome",
+      "items": [
+        "RLM cell runs as an official DSH job",
+        "One producer per Session; no second loop"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Authority",
+      "items": [
+        "ctx.jobs completes admission/lifecycle",
+        "Plugin only wraps runtime.eval"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Non-goals",
+      "items": [
+        "No scheduler/queue/Workflow/Storage",
+        "Swarm gated on named consumer"
+      ]
+    }
+  ]
+}
