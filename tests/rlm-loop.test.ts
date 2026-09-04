@@ -878,6 +878,7 @@ test('M1A Issue#5: a hostile metaclass __name__ is a typed error and the kernel 
 // ---- M1B: TypeScript runtime process protocol ----
 
 import { createRlmRuntime, RlmError, type RlmEvalInput } from '../src/runtime.ts'
+import type { Context } from '@deepseek-ai/cordis'
 
 function rt(config: Record<string, unknown> = {}) {
   return createRlmRuntime(undefined, config)
@@ -1106,6 +1107,37 @@ test('M1B Issue#5: a raising __repr__ is kind=eval and the same kernel keeps its
   }
 })
 
+
+
+test('M9 Issue#42 RED: a sandbox-enabled runtime confines each kernel start exactly once', async () => {
+  const confineCalls: { argv: string[]; policy: unknown }[] = []
+  const sandbox = {
+    confine(argv: string[], policy: unknown) {
+      confineCalls.push({ argv, policy })
+      return { argv: [...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] }
+    },
+  }
+  const policyService = {
+    resolve() {
+      return { mode: 'workspace-write', workspaceRoot: process.cwd() }
+    },
+  }
+  const fakeCtx = {
+    get(name: string) {
+      if (name === 'sandbox') return sandbox
+      if (name === 'sandboxPolicy') return policyService
+      return undefined
+    },
+  } as unknown as Context
+  const runtime = createRlmRuntime(fakeCtx, {})
+  try {
+    await runtime.eval('m9-red', { code: 'x = 1' })
+    assert.equal(confineCalls.length, 1, 'expected exactly one confine call per kernel start')
+    assert.deepEqual(confineCalls[0]!.policy, { mode: 'workspace-write', workspaceRoot: process.cwd() })
+  } finally {
+    runtime.dispose()
+  }
+})
 
 // ---- M1C/M1D: DSH tool registration and rlm_query -> one-shot Subagent bridge ----
 
