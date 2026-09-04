@@ -37,7 +37,7 @@ import sys
 import threading
 from typing import Any, Optional
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 DEFAULT_MAX_STDOUT = 64 * 1024
 DEFAULT_MAX_RESULT = 64 * 1024
 DEFAULT_MAX_CONTEXT_BYTES = 64 * 1024 * 1024
@@ -45,6 +45,7 @@ DEFAULT_MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 MAX_SAFE_INTEGER = 2**53 - 1
 MAX_QUERY_TEXT = 64 * 1024
 MAX_FRAME_BYTES = 256 * 1024
+CHECKPOINT_CHUNK_BYTES = 128 * 1024
 MAX_ERROR_TEXT = 64 * 1024
 BATCH_CONCURRENCY = 4
 CELL_FILENAME = "<rlm-cell>"
@@ -213,6 +214,7 @@ class RlmKernel:
         # and may be dropped; unknown, future, or duplicate ids stay fatal
         # protocol faults (Issue #1 contract).
         self.cell_generation = 0
+        self._restore_chunks: list[str] = []
         self.cell_floor = 1
         self.cell_ceiling = 1
         self.cell_done = False
@@ -356,7 +358,22 @@ class RlmKernel:
                 self._fatal("frame is not an object")
                 return
             kind = frame.get("type")
-            if kind == "eval":
+            if kind == "restore_chunk":
+                payload = frame.get("data")
+                if not isinstance(payload, str) or len(payload) > CHECKPOINT_CHUNK_BYTES:
+                    self._fatal("invalid restore_chunk data")
+                    return
+                self._restore_chunks.append(payload)
+            elif kind == "restore_end":
+                total = frame.get("total")
+                if not isinstance(total, int) or total < 1 or total != len(self._restore_chunks):
+                    self._fatal("invalid restore_end total")
+                    return
+            elif kind == "eval":
+                if self._restore_chunks:
+                    payload = "".join(self._restore_chunks)
+                    self._restore_chunks.clear()
+                    frame["_restore_payload"] = payload
                 self.loop.call_soon_threadsafe(self.queue.put_nowait, frame)
             elif kind in ("query_result", "spawn_result", "followup_result", "error"):
                 qid = frame.get("id")
@@ -864,8 +881,12 @@ class RlmKernel:
         finally:
             seen.discard(identity)
 
-    def _checkpoint(self, snapshot_path: str, max_bytes: int) -> dict[str, Any]:
-        """Atomically replace a private checkpoint after a successful cell."""
+    def _checkpoint_payload(self, max_bytes: int) -> tuple[Optional[bytes], list[str], dict[str, Any]]:
+        """Serialize the private M5 envelope without touching the filesystem.
+
+        Returns (payload | None, skipped, meta). A None payload means the
+        checkpoint could not be published and `meta` carries the reason.
+        """
         skipped: list[str] = []
         variables: dict[str, Any] = {}
         reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "rlm_query_batched", "rlm_spawn", "rlm_followup", "context", "context_meta"}
@@ -886,9 +907,16 @@ class RlmKernel:
         try:
             payload = json.dumps(envelope, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
         except (TypeError, ValueError) as exc:
-            return {"restored": False, "checkpoint_committed": False, "skipped": skipped, "reason": "serialization failed: " + str(exc)}
+            return None, skipped, {"reason": "serialization failed: " + str(exc)}
         if len(payload) > max_bytes:
-            return {"restored": False, "checkpoint_committed": False, "skipped": skipped, "reason": "checkpoint exceeds maxSnapshotBytes"}
+            return None, skipped, {"reason": "checkpoint exceeds maxSnapshotBytes"}
+        return payload, skipped, {}
+
+    def _checkpoint(self, snapshot_path: str, max_bytes: int) -> dict[str, Any]:
+        """Atomically replace a private checkpoint after a successful cell."""
+        payload, skipped, meta = self._checkpoint_payload(max_bytes)
+        if payload is None:
+            return {"restored": False, "checkpoint_committed": False, "skipped": skipped, **meta}
         temp_path = snapshot_path + ".tmp-" + str(os.getpid())
         fd = -1
         try:
@@ -915,6 +943,52 @@ class RlmKernel:
                 pass
             except OSError:
                 pass
+
+    def _restore_checkpoint_payload(self, payload: bytes, max_bytes: int) -> None:
+        """Restore from raw checkpoint bytes (the host-private chunked path)."""
+        if len(payload) > max_bytes:
+            raise RlmSnapshotError("checkpoint exceeds maxSnapshotBytes")
+        try:
+            envelope = json.loads(payload.decode("utf-8", "strict"))
+        except BaseException as exc:
+            raise RlmSnapshotError("checkpoint is not valid UTF-8 JSON") from exc
+        if not isinstance(envelope, dict) or envelope.get("version") != 1 or not isinstance(envelope.get("variables"), dict):
+            raise RlmSnapshotError("checkpoint version or variables are invalid")
+        restored: dict[str, Any] = {}
+        reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "rlm_query_batched", "rlm_spawn", "rlm_followup", "context", "context_meta"}
+        for name, value in envelope["variables"].items():
+            if type(name) is not str or name in reserved:
+                raise RlmSnapshotError("checkpoint contains an invalid variable name")
+            try:
+                ok, detached, _reason = self._snapshot_value(value, set())
+            except BaseException as exc:
+                raise RlmSnapshotError("checkpoint contains an unsupported value") from exc
+            if not ok:
+                raise RlmSnapshotError("checkpoint contains an unsupported value")
+            restored[name] = detached
+        context = envelope.get("context")
+        restored_context: Optional[str] = None
+        restored_meta: Optional[dict[str, Any]] = None
+        if context is not None:
+            if not isinstance(context, dict) or type(context.get("text")) is not str or not isinstance(context.get("meta"), dict):
+                raise RlmSnapshotError("checkpoint context is invalid")
+            restored_context = context["text"]
+            restored_meta = dict(context["meta"])
+            if type(restored_meta.get("path")) is not str:
+                raise RlmSnapshotError("checkpoint context metadata is invalid")
+            try:
+                context_bytes = len(restored_context.encode("utf-8"))
+                canonical_context_path = os.path.realpath(restored_meta["path"])
+            except (UnicodeError, OSError, TypeError) as exc:
+                raise RlmSnapshotError("checkpoint context metadata is invalid") from exc
+            if (
+                restored_meta.get("read_bytes") != context_bytes
+                or restored_meta.get("canonical_path") != canonical_context_path
+            ):
+                raise RlmSnapshotError("checkpoint context metadata is invalid")
+        self.namespace.update(restored)
+        self.managed_context = restored_context
+        self.managed_context_meta = restored_meta
 
     def _restore_checkpoint(self, snapshot_path: str, max_bytes: int) -> None:
         try:
@@ -1038,6 +1112,8 @@ class RlmKernel:
         snapshot_path = frame.get("snapshot_path")
         max_snapshot_bytes = frame.get("max_snapshot_bytes", DEFAULT_MAX_SNAPSHOT_BYTES)
         restore_snapshot = frame.get("restore_snapshot", False)
+        snapshot_chunked = frame.get("snapshot_chunked", False)
+        cwd = frame.get("cwd")
         if (
             not isinstance(max_stdout, int)
             or not isinstance(max_result, int)
@@ -1053,20 +1129,37 @@ class RlmKernel:
         if context_path is not None and not isinstance(context_path, str):
             self._fatal("invalid context_path in eval frame: " + repr(frame))
             return
-        if type(snapshot_recovery) is not bool or type(restore_snapshot) is not bool:
+        if cwd is not None and not isinstance(cwd, str):
+            self._fatal("invalid cwd in eval frame: " + repr(frame))
+            return
+        if type(snapshot_recovery) is not bool or type(restore_snapshot) is not bool or type(snapshot_chunked) is not bool:
             self._fatal("invalid snapshot recovery flags in eval frame: " + repr(frame))
             return
-        if snapshot_recovery and (not isinstance(snapshot_path, str) or not snapshot_path):
+        if snapshot_recovery and not snapshot_chunked and (not isinstance(snapshot_path, str) or not snapshot_path):
             self._fatal("invalid snapshot_path in eval frame: " + repr(frame))
             return
+        if cwd is not None and str(cwd):
+            try:
+                os.chdir(str(cwd))
+            except OSError as exc:
+                self._send(self._error_frame(eval_id, "eval", "eval_error", exc))
+                return
+
         recovery: Optional[dict[str, Any]] = None
         if restore_snapshot:
             try:
-                self._restore_checkpoint(str(snapshot_path), max_snapshot_bytes)
+                if snapshot_chunked:
+                    raw = frame.get("_restore_payload")
+                    if not isinstance(raw, str):
+                        raise RlmSnapshotError("missing chunked restore payload")
+                    self._restore_checkpoint_payload(raw.encode("utf-8", "strict"), max_snapshot_bytes)
+                else:
+                    self._restore_checkpoint(str(snapshot_path), max_snapshot_bytes)
                 recovery = {"restored": True, "checkpoint_committed": False}
             except RlmSnapshotError as exc:
                 try:
-                    os.unlink(str(snapshot_path))
+                    if not snapshot_chunked:
+                        os.unlink(str(snapshot_path))
                 except OSError:
                     pass
                 self._send(self._error_frame(
@@ -1172,7 +1265,22 @@ class RlmKernel:
             frame_out["result"] = result
         self._end_cell()
         if snapshot_recovery:
-            checkpoint = self._checkpoint(str(snapshot_path), max_snapshot_bytes)
+            if snapshot_chunked:
+                payload, skipped, meta = self._checkpoint_payload(max_snapshot_bytes)
+                checkpoint: dict[str, Any] = {"restored": False, "checkpoint_committed": payload is not None, "skipped": skipped, **meta}
+                if payload is not None:
+                    chunks = [payload[i:i + CHECKPOINT_CHUNK_BYTES] for i in range(0, len(payload), CHECKPOINT_CHUNK_BYTES)]
+                    for seq, chunk in enumerate(chunks):
+                        self._send({
+                            "type": "checkpoint_chunk",
+                            "id": eval_id,
+                            "seq": seq,
+                            "count": len(chunks),
+                            "data": chunk.decode("utf-8", "strict"),
+                        })
+                    checkpoint["checkpoint_bytes"] = len(payload)
+            else:
+                checkpoint = self._checkpoint(str(snapshot_path), max_snapshot_bytes)
             if recovery is not None:
                 checkpoint["restored"] = True
             frame_out["recovery"] = checkpoint

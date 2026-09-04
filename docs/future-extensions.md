@@ -28,7 +28,7 @@ Every extension must preserve these boundaries:
 | Continuable spawn | Work must continue after the parent cell exits | Use the official continuable Subagent and inbox | The child continues and delivers through the official Session path |
 | Cross-host persistence | Users require the same RLM Session after plugin restart | Persist only recovery metadata and snapshot references | The Session restores, while version mismatch fails explicitly |
 | M7 Batched query | Measured sequential-query latency is a bottleneck | Add one concurrency-bounded `rlm_query_batched` | Results preserve input order and cancellation stops every child |
-| Second kernel | A container or remote kernel implementation has started | Extract the smallest `KernelDriver` interface | Local and second implementations pass the same loop |
+| Second kernel (route A) | The user requires policy-confined `rlm_eval` execution on the host | Reuse `ctx.sandbox` + `ctx.sandboxPolicy` for one same-world confined kernel (M9) | Kernel file effects follow the Session sandbox policy; M5 stays host-private |
 | Token/cost guard | A Provider exposes reliable usage and a reproducible cost problem exists | Read observed usage at query admission and reject later calls | New queries stop at the limit without inventing unobserved tokens |
 | Jobs, UI, swarm | A named consumer and end-to-end scenario exist | Consume the existing runtime without entering the Python core | The new consumer preserves `rlm_eval` and Session authority |
 
