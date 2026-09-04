@@ -194,6 +194,18 @@ queue, Workflow engine, Storage, or UI markup; swarm stays conditional on a
 named consumer and an end-to-end scenario. See
 [M12 architecture](m12-jobs-ui-swarm.md).
 
+## M13: GUI Plugin Configuration
+
+M13 registers the official DSH settings namespace `rlm` (via
+`@deepseek-ai/dsh-settings`) and ships a `dsh.client` web plugin whose
+`RlmSettingsCard` appears under **Settings > Plugins > Plugin configuration**,
+keyed by the `rlm` namespace. Runtime consumes
+`{ ...compositionDefaults, ...userSettings }`; `ConfigSchema` remains the single
+validation authority; M1–M12 stay byte-equivalent with no user settings
+(`maxDepth` schema default stays 1). See
+[M13 design](ui-configuration-design.md) (English authoritative) and the
+[Chinese mirror](ui-configuration-design.zh-CN.md).
+
 ## M8: Continuable Spawn
 
 Start M8 only after M7 is accepted on `main` and its matching trigger in

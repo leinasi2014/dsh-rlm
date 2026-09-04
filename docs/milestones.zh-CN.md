@@ -161,6 +161,16 @@ M12 注册官方 `rlm` job 控制器（`ctx.jobs.attachController`）并导出
 无第二 Agent loop、调度器、队列、Workflow 引擎、Storage 或 UI 标记；swarm 保持具名消费者 +
 端到端场景条件。见 [M12 架构](m12-jobs-ui-swarm.zh-CN.md)。
 
+## M13：GUI 插件配置
+
+M13 通过 `@deepseek-ai/dsh-settings` 注册官方 DSH settings 命名空间 `rlm`，并提供
+`dsh.client` Web 插件，其 `RlmSettingsCard` 出现在 **Settings > Plugins >
+Plugin configuration**，以 `rlm` 命名空间为 key。运行时消费
+`{ ...compositionDefaults, ...userSettings }`；`ConfigSchema` 仍是唯一校验权威；
+无用户设置时 M1–M12 保持字节级等价（`maxDepth` schema 默认值保持 1）。参见
+[M13 设计](ui-configuration-design.zh-CN.md)（中文镜像）与
+[英文权威版](ui-configuration-design.md)。
+
 ## M8：可继续 spawn
 
 仅当 M7 在 `main` 接受且 [Future extensions](future-extensions.md) 的对应 trigger 真实存在后，才开始 M8。
