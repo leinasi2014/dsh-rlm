@@ -275,6 +275,10 @@ export interface RlmPluginConfig extends RlmRuntimeConfig {
   provider?: string
   /** Absolute official DSH delegation cap for an rlm_query child branch. */
   maxDepth?: number
+  /** Enable the per-cell observed-token guard (M11). */
+  guardQueryTokens?: boolean
+  /** Observed token ceiling per cell before query admission is rejected (M11). */
+  maxQueryTokensPerCell?: number
 }
 
 /**
@@ -295,6 +299,8 @@ export const ConfigSchema: z<RlmPluginConfig> = z.object({
   durableRoot: z.string().description('Optional absolute host-owned directory for cross-restart durable checkpoint references (M10).'),
   snapshotRecovery: z.boolean().default(false).description('Restore a private bounded checkpoint after an owned kernel fault.'),
   maxDepth: z.natural().min(1).max(8).default(DEFAULT_MAX_DEPTH).description('Absolute DSH delegation-depth cap for recursive rlm_query children.'),
+  guardQueryTokens: z.boolean().default(false).description('Reject query admission when the observed token usage exceeds the per-cell ceiling (M11).'),
+  maxQueryTokensPerCell: z.natural().max(1073741824).default(0).description('Observed token ceiling per cell; 0 means no ceiling.'),
 })
 
 interface RlmEvalCommon {
@@ -1881,6 +1887,27 @@ function renderValue(value: RlmEvalValue): string {
  * DSH Subagent. The runtime is created here and torn down with the calling
  * Cordis fiber, so no plugin-owned Python process survives plugin unload.
  */
+interface TokenMeterLike {
+  measure(session: unknown, requestHeader?: unknown): { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+}
+
+/** Read-only M11 guard: consult official tokenMeter; never invent unobserved tokens. */
+function enforceQueryTokenGuard(ctx: Context, parent: Agent, config: RlmPluginConfig): void {
+  if (!config.guardQueryTokens || config.maxQueryTokensPerCell === undefined || config.maxQueryTokensPerCell <= 0) return
+  const accessor = ctx as unknown as { tokenMeter?: TokenMeterLike; get?: (key: string) => unknown }
+  const meter = accessor.tokenMeter ?? accessor.get?.('tokenMeter') as TokenMeterLike | undefined
+  if (!meter || typeof meter.measure !== 'function') return
+  const observed = meter.measure(parent.session)
+  if (!observed || typeof observed.inputTokens !== 'number') return
+  const total = observed.inputTokens
+    + (observed.cacheReadTokens ?? 0)
+    + (observed.cacheWriteTokens ?? 0)
+    + observed.outputTokens
+  if (total > config.maxQueryTokensPerCell) {
+    throw new RlmError('query', 'per-cell observed token budget exceeded: ' + total + ' > ' + config.maxQueryTokensPerCell, { phase: 'query' })
+  }
+}
+
 export function registerRlmPlugin(
   ctx: Context,
   config: RlmPluginConfig,
@@ -1964,9 +1991,12 @@ export function registerRlmPlugin(
             code: args.code,
             signal: exec.signal,
             session: parent.session,
-            onQuery: async (prompt: string, cellSignal: AbortSignal) =>
-              runQuery(ctx, provider, parent, prompt, cellSignal, maxDepth),
+            onQuery: async (prompt: string, cellSignal: AbortSignal) => {
+              enforceQueryTokenGuard(ctx, parent, { enabled: true, provider, maxDepth, guardQueryTokens: config.guardQueryTokens, maxQueryTokensPerCell: config.maxQueryTokensPerCell } as RlmPluginConfig)
+              return runQuery(ctx, provider, parent, prompt, cellSignal, maxDepth)
+            },
             onSpawn: async (prompt: string, cellSignal: AbortSignal) => {
+              enforceQueryTokenGuard(ctx, parent, { enabled: true, provider, maxDepth, guardQueryTokens: config.guardQueryTokens, maxQueryTokensPerCell: config.maxQueryTokensPerCell } as RlmPluginConfig)
               const childId = await runSpawn(ctx, provider, parent, prompt, cellSignal, maxDepth)
               continuableParents.add(parent)
               return childId
