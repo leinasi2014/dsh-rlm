@@ -1494,6 +1494,95 @@ function makeMockCtx(options: {
   return m
 }
 
+
+test('M11 Issue#46 RED: a token guard consults recorded measure on the accepted M10 base', async () => {
+  const measureCalls: unknown[] = []
+  const m = makeMockCtx({ queryText: 'ok' })
+  m.ctx.tokenMeter = { measure(session: unknown) { measureCalls.push(session); return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } } }
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', guardQueryTokens: true, maxQueryTokensPerCell: 100 })
+  const tool = m.registered[0]
+  try {
+    const out = await tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-red'))
+    assert.ok(out, 'tool executed')
+    assert.equal(measureCalls.length, 1, 'guard must record exactly one measure call per query admission')
+  } finally {
+    await m.teardown?.()
+  }
+})
+
+
+test('M11 Issue#46: over-budget observed tokens reject before child dispatch', async () => {
+  const measureCalls: unknown[] = []
+  const m = makeMockCtx({ queryText: 'ok' })
+  m.ctx.tokenMeter = { measure(session: unknown) { measureCalls.push(session); return { baseline: { kind: 'usage', tokens: 501, usage: { inputTokens: 500, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } }, totalTokens: 501 } } }
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', guardQueryTokens: true, maxQueryTokensPerCell: 100 })
+  const tool = m.registered[0]
+  try {
+    await assert.rejects(
+      tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-over')),
+      (err: unknown) => err instanceof Error && /token budget exceeded/i.test(err.message),
+    )
+    assert.equal(measureCalls.length, 1, 'guard must read the meter exactly once')
+    assert.equal(m.starts.length, 0, 'over-budget must not dispatch a child')
+  } finally {
+    await m.teardown?.()
+  }
+})
+
+test('M11 Issue#46: under-budget observed tokens allow admission and dispatch', async () => {
+  const m = makeMockCtx({ queryText: 'ok' })
+  m.ctx.tokenMeter = { measure() { return { baseline: { kind: 'usage', tokens: 11, usage: { inputTokens: 10, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } }, totalTokens: 11 } } }
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', guardQueryTokens: true, maxQueryTokensPerCell: 100 })
+  const tool = m.registered[0]
+  try {
+    const out = await tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-under'))
+    assert.ok(out, 'under-budget must admit')
+    assert.equal(m.starts.length, 1, 'exactly one child dispatched')
+  } finally {
+    await m.teardown?.()
+  }
+})
+
+test('M11 Issue#46: the official TokenMeasurement shape must reject over budget (not a no-op)', async () => {
+  const m = makeMockCtx({ queryText: 'ok' })
+  m.ctx.tokenMeter = { measure() {
+    return {
+      logRevision: 1,
+      baseline: { kind: 'usage', tokens: 120, usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+      surfaceDeltaTokens: 0,
+      totalTokens: 120,
+      surfaceTokens: 120,
+      nodes: [],
+    }
+  } }
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', guardQueryTokens: true, maxQueryTokensPerCell: 100 })
+  const tool = m.registered[0]
+  try {
+    await assert.rejects(
+      tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-authority')),
+      (err: unknown) => err instanceof Error && /token budget exceeded/i.test(err.message),
+    )
+    assert.equal(m.starts.length, 0, 'authoritative over-budget must not dispatch a child')
+  } finally {
+    await m.teardown?.()
+  }
+})
+
+test('M11 Issue#46: guard is off by default (no measurement, no rejection)', async () => {
+  const measureCalls: unknown[] = []
+  const m = makeMockCtx({ queryText: 'ok' })
+  m.ctx.tokenMeter = { measure(session: unknown) { measureCalls.push(session); return { baseline: { kind: 'usage', tokens: 19998, usage: { inputTokens: 9999, outputTokens: 9999 } }, totalTokens: 19998 } } }
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn' })
+  const tool = m.registered[0]
+  try {
+    const out = await tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-off'))
+    assert.ok(out, 'default-off guard must not reject')
+    assert.equal(measureCalls.length, 0, 'default-off guard must not call measure')
+  } finally {
+    await m.teardown?.()
+  }
+})
+
 test('M1C: rlm_eval is registered only when the plugin is enabled', () => {
   const disabled = makeMockCtx()
   registerRlmPlugin(disabled.ctx, { enabled: false })

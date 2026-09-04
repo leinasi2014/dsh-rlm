@@ -1,0 +1,205 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "M11 Per-Cell Token Guard",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1240,
+      720
+    ],
+    "repository": {
+      "url": "https://github.com/leinasi2014/dsh-rlm.git",
+      "revision": "5d734153bc322ae0ecd690c63a39def38a5036ce"
+    }
+  },
+  "components": [
+    {
+      "id": "cell",
+      "type": "backend",
+      "label": "Active Cell",
+      "sublabel": "query / spawn admission",
+      "pos": [
+        40,
+        300
+      ],
+      "size": [
+        190,
+        72
+      ],
+      "sources": [
+        {
+          "path": "python-runtime/rlm_kernel.py",
+          "label": "kernel"
+        }
+      ]
+    },
+    {
+      "id": "admit",
+      "type": "backend",
+      "label": "Admission Hook",
+      "sublabel": "host bridge, pre-dispatch",
+      "pos": [
+        300,
+        300
+      ],
+      "size": [
+        190,
+        72
+      ],
+      "sources": [
+        {
+          "path": "src/runtime.ts",
+          "label": "runtime"
+        }
+      ]
+    },
+    {
+      "id": "meter",
+      "type": "security",
+      "label": "ctx.tokenMeter",
+      "sublabel": "measure(session)",
+      "pos": [
+        560,
+        300
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "check",
+      "type": "security",
+      "label": "Budget Check",
+      "sublabel": "observed > max?",
+      "pos": [
+        820,
+        300
+      ],
+      "size": [
+        180,
+        72
+      ]
+    },
+    {
+      "id": "reject",
+      "type": "security",
+      "label": "Typed Reject",
+      "sublabel": "kind=query, no dispatch",
+      "pos": [
+        560,
+        500
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "child",
+      "type": "external",
+      "label": "Official Child",
+      "sublabel": "subagent / continuable",
+      "pos": [
+        1050,
+        300
+      ],
+      "size": [
+        170,
+        72
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "dsh-rlm scope: one read-only measurement per admission",
+      "wraps": [
+        "admit",
+        "meter",
+        "check"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "Usage authority: never invent tokens",
+      "wraps": [
+        "meter",
+        "check",
+        "reject"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "call",
+      "from": "cell",
+      "to": "admit",
+      "label": "query admission",
+      "variant": "emphasis",
+      "labelDy": 60
+    },
+    {
+      "id": "observe",
+      "from": "admit",
+      "to": "meter",
+      "label": "measure(session)",
+      "variant": "security",
+      "labelDy": 60
+    },
+    {
+      "id": "apply",
+      "from": "meter",
+      "to": "check",
+      "label": "observed usage",
+      "variant": "security",
+      "labelAt": [
+        785,
+        240
+      ]
+    },
+    {
+      "id": "deny",
+      "from": "check",
+      "to": "reject",
+      "label": "over budget",
+      "variant": "dashed"
+    },
+    {
+      "id": "allow",
+      "from": "check",
+      "to": "child",
+      "label": "within budget",
+      "variant": "emphasis",
+      "labelDy": -40
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Outcome",
+      "items": [
+        "Per-cell hard stop before child dispatch",
+        "Only observed tokens count"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Authority",
+      "items": [
+        "Official ctx.tokenMeter.measure",
+        "Typed query error on reject"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Non-goals",
+      "items": [
+        "No pricing ledger or quota persistence",
+        "No estimates / no Python counters"
+      ]
+    }
+  ]
+}
