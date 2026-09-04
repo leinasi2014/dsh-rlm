@@ -1,0 +1,200 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "M10 Cross-Host Durable Session Persistence",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1240,
+      720
+    ],
+    "repository": {
+      "url": "https://github.com/leinasi2014/dsh-rlm.git",
+      "revision": "1ed818a0e8141ce55c444d20969a0e1872af395c"
+    }
+  },
+  "components": [
+    {
+      "id": "session",
+      "type": "external",
+      "label": "Official DSH Session",
+      "sublabel": "same sessionKey",
+      "pos": [
+        40,
+        300
+      ],
+      "size": [
+        180,
+        70
+      ]
+    },
+    {
+      "id": "runtime-a",
+      "type": "backend",
+      "label": "Runtime Instance A",
+      "sublabel": "M9 checkpoint commit",
+      "pos": [
+        300,
+        300
+      ],
+      "size": [
+        200,
+        70
+      ],
+      "sources": [
+        {
+          "path": "src/runtime.ts",
+          "label": "plugin runtime"
+        }
+      ]
+    },
+    {
+      "id": "publish",
+      "type": "security",
+      "label": "Durable Publish",
+      "sublabel": "atomic temp+rename",
+      "pos": [
+        580,
+        300
+      ],
+      "size": [
+        200,
+        70
+      ]
+    },
+    {
+      "id": "root",
+      "type": "database",
+      "label": "Host Durable Root",
+      "sublabel": "checkpoint/meta files",
+      "pos": [
+        860,
+        300
+      ],
+      "size": [
+        190,
+        70
+      ]
+    },
+    {
+      "id": "runtime-b",
+      "type": "backend",
+      "label": "Runtime Instance B",
+      "sublabel": "restart / another host",
+      "pos": [
+        300,
+        510
+      ],
+      "size": [
+        200,
+        70
+      ]
+    },
+    {
+      "id": "restore",
+      "type": "security",
+      "label": "One-shot Restore",
+      "sublabel": "version check + M9",
+      "pos": [
+        580,
+        510
+      ],
+      "size": [
+        200,
+        70
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "dsh-rlm scope: host-owned reference only; no Storage Domain or service",
+      "wraps": [
+        "publish",
+        "restore"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "Never model-visible: path, session id, values, context text",
+      "wraps": [
+        "root"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "eval-a",
+      "from": "session",
+      "to": "runtime-a",
+      "label": "rlm_eval cell",
+      "variant": "emphasis"
+    },
+    {
+      "id": "commit",
+      "from": "runtime-a",
+      "to": "publish",
+      "label": "after checkpoint commit",
+      "variant": "security",
+      "labelDy": 59
+    },
+    {
+      "id": "write",
+      "from": "publish",
+      "to": "root",
+      "label": "atomic reference write",
+      "labelDy": -68
+    },
+    {
+      "id": "restart",
+      "from": "session",
+      "to": "runtime-b",
+      "label": "same session after restart",
+      "variant": "dashed",
+      "labelDy": 20
+    },
+    {
+      "id": "read",
+      "from": "runtime-b",
+      "to": "restore",
+      "label": "durable root lookup",
+      "variant": "security",
+      "labelDy": 59
+    },
+    {
+      "id": "seed",
+      "from": "root",
+      "to": "restore",
+      "label": "reference",
+      "variant": "dashed",
+      "labelDy": 30
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Outcome",
+      "items": [
+        "Bounded reference survives restart / host change",
+        "Restore via existing M9 transport only"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Authority",
+      "items": [
+        "durableRoot opt-in host-owned file boundary",
+        "Atomic publish; version mismatch fails typed"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Non-goals",
+      "items": [
+        "No Storage Domain, service, second Session store",
+        "No identity/credentials/child state persistence"
+      ]
+    }
+  ]
+}
