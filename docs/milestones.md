@@ -176,6 +176,24 @@ M10 persists only bounded host-private checkpoint references under an opt-in
 host change; version mismatch fails typed. See
 [M10 architecture](m10-cross-host-persistence.md).
 
+## M11: Per-Cell Query Token Guard
+
+M11 adds an opt-in guard around every query/spawn admission: before a child is
+admitted the plugin reads the official `ctx.tokenMeter.measure(session)`
+observation and rejects when observed usage exceeds `maxQueryTokensPerCell`,
+using `baseline.usage` only when `baseline.kind === "usage"`. It never invents
+or estimates unobserved tokens and never exposes token numbers to Python. See
+[M11 architecture](m11-token-guard.md).
+
+## M12: RLM as a DSH Job Consumer
+
+M12 registers the official `rlm` job controller (`ctx.jobs.attachController`)
+and exports `createRlmJobSpec` / `startRlmJob` so an RLM cell can run as a
+DSH-owned background job with bounded output. No second Agent loop, scheduler,
+queue, Workflow engine, Storage, or UI markup; swarm stays conditional on a
+named consumer and an end-to-end scenario. See
+[M12 architecture](m12-jobs-ui-swarm.md).
+
 ## M8: Continuable Spawn
 
 Start M8 only after M7 is accepted on `main` and its matching trigger in

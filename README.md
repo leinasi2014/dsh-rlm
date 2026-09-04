@@ -11,11 +11,8 @@ Python cells support top-level `await` and can call
 `await rlm_query(prompt)`. The host answers that call through an official
 one-shot DSH Subagent, returns visible text to Python, and lets the cell continue.
 
-> Status: M1 and the M2 reliability baseline are implemented, reviewed, and
-> clean-Profile verified. M3 Managed Context and M4 Recursive Child RLM are the
-> next ordered milestones; their architecture contracts are frozen before
-> production work. See [Project status](docs/project-status.md) and
-> [Milestones](docs/milestones.md).
+> Status: M1-M12 are implemented, reviewed, and DSV4-FVE clean-Profile verified.
+> See [Project status](docs/project-status.md) and [Milestones](docs/milestones.md).
 
 ![dsh-rlm architecture](docs/dsh-rlm-architecture.visual-check.1440x900.light.png)
 
@@ -56,24 +53,31 @@ becomes a second Agent Loop and does not receive DSH Provider or Session objects
 - plugin teardown for owned Python kernels;
 - M3 managed context: an optional `contextPath` is kernel-read as one bounded,
   strict UTF-8 regular file and published atomically as protected `context`;
-- offline tests plus a gated real clean-Profile smoke test.
+- M4 recursive child RLM: official depth-bounded child Sessions with isolated kernels;
+- M5 snapshot recovery: opt-in restore after owned kernel loss (JSON-safe globals + context);
+- M6 manual reset: Session-local FIFO reset through `rlm_eval({ reset: true })`;
+- M7 batched query: bounded ordered concurrent `rlm_query_batched` with drain-before-failure;
+- M8 continuable spawn: official continuable child Sessions with parent inbox delivery;
+- M9 sandbox-backed kernel: `kernelSandbox: auto|require|off` via `ctx.sandbox` +
+  `ctx.sandboxPolicy`, protocol v4 host-private chunked M5 checkpoint, workspace cwd;
+- M10 cross-host durable persistence: opt-in `durableRoot` atomic references with
+  new-runtime restore and typed version-mismatch failure;
+- M11 token guard: `guardQueryTokens` / `maxQueryTokensPerCell` reading the official
+  `tokenMeter.measure(...).baseline.usage` observation (never invents tokens);
+- M12 job consumer: official `ctx.jobs` `rlm` controller + `createRlmJobSpec` /
+  `startRlmJob` (no second Agent loop; swarm stays trigger-gated);
+- offline tests plus gated real clean-Profile smoke tests.
 
-## Next milestones and not implemented
+## Milestone roadmap
 
-M3 is implemented on the current development branch and awaits clean-Profile
-acceptance; M4 remains planned:
+Accepted on `main`: M1-M12 (see [Milestones](docs/milestones.md)). Remaining rows
+in [Future extensions](docs/future-extensions.md) are conditional and
+trigger-gated:
 
-- [M3 Managed Context](docs/m3-managed-context.md);
-- [M4 Recursive Child RLM](docs/m4-recursive-child-rlm.md).
-
-The following remain conditional future work:
-
-- snapshot/restore or cross-host persistence;
-- continuable/background spawn;
-- batched queries;
-- a public `RlmService` or Kernel Provider framework;
-- a Storage Domain, Workflow, Jobs, Team, or UI;
-- container or remote kernels.
+- a public `RlmService` or Kernel Provider framework (only with a second consumer);
+- container or remote kernels (route B — separate contract and trigger);
+- Jobs/UI/swarm orchestration beyond the M12 job consumer (named consumer +
+  end-to-end scenario required).
 
 Open reliability defects and conditional future work are separated in
 [Project status](docs/project-status.md). GitHub Issues are the live work authority.
@@ -97,6 +101,14 @@ never forwarded. This is credential hygiene, not a sandbox: trusted Python can
 still read host-user-readable files, access the network, start processes, and
 read on-disk credential files. See [SECURITY.md](SECURITY.md) and
 [Issue #7](https://github.com/leinasi2014/dsh-rlm/issues/7).
+
+From M9, `kernelSandbox` can confine that same trusted execution to the DSH
+Session sandbox policy: `auto` (default) uses `ctx.sandbox` + `ctx.sandboxPolicy`
+when the loaded Profile mounts them, `require` fails closed, and `off` keeps the
+legacy trusted-local spawn. Under a confined mode the kernel starts in the
+Session workspace root and its file effects follow the same read-only /
+workspace-write / danger-full-access ladder as DSH bash/fs tools; Windows ACL
+reports partial enforcement and reads/network remain same-world unconfined.
 
 ## Requirements
 
@@ -181,6 +193,11 @@ six runtime settings are optional and validated by the single `Config` schema:
 | `maxResult` | `65536` | integer `1024..262144` UTF-8 bytes of the cell result |
 | `maxQueries` | `16` | integer `1..4096` `rlm_query` calls per cell |
 | `maxContextBytes` | `67108864` | integer `1048576..1073741824` bytes of one managed UTF-8 context file |
+| `snapshotRecovery` | `false` | boolean; restore JSON-safe globals + context after owned kernel loss (M5) |
+| `kernelSandbox` | `auto` | `auto` / `require` / `off` (M9) |
+| `durableRoot` | *(unset)* | absolute host directory for cross-restart checkpoint references (M10) |
+| `guardQueryTokens` | `false` | enable the per-cell observed-token guard (M11) |
+| `maxQueryTokensPerCell` | `0` | positive integer ceiling; `0` disables (M11) |
 
 This repository has not published an npm package. The command above is a real
 local-package Profile installation, not a registry installation.

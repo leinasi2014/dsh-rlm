@@ -10,8 +10,7 @@ Python cell 支持 top-level `await`，并可调用 `await rlm_query(prompt)`。
 宿主通过官方 one-shot DSH Subagent 完成查询，把可见文本返回 Python，然后让
 当前 cell 继续执行。
 
-> 状态：M1 与 M2 可靠性基线均已实现、审查并通过干净 Profile 验证。下一步
-> 按顺序交付 M3 托管上下文和 M4 递归子 RLM；生产开发前先冻结架构契约。
+> 状态：M1-M12 均已实现、审查并通过 DSV4-FVE 干净 Profile 验证。
 > 参见[项目状态](docs/project-status.zh-CN.md)和
 > [里程碑](docs/milestones.zh-CN.md)。
 
@@ -53,23 +52,30 @@ Loop，也不会接收 DSH Provider 或 Session 对象。
 - 插件 teardown 释放所拥有的 Python kernel；
 - M3 托管上下文：可选 `contextPath` 由 kernel 读取为一个有界、严格 UTF-8 的
   常规文件，并原子发布为受保护的 `context`；
+- M4 递归子 RLM：官方深度有界子会话，内核隔离；
+- M5 快照恢复：属主内核丢失后可选恢复（JSON 安全全局 + 上下文）；
+- M6 手动重置：经 `rlm_eval({ reset: true })` 的 Session 本地 FIFO 重置；
+- M7 批量查询：有界有序并发 `rlm_query_batched`，失败前先排空已准入项；
+- M8 延续派生：官方可延续子会话 + 父收件箱投递；
+- M9 沙箱内核：`kernelSandbox: auto|require|off`，经 `ctx.sandbox` +
+  `ctx.sandboxPolicy`，协议 v4 宿主私有分块 M5 checkpoint，工作区 cwd；
+- M10 跨主机持久化：可选 `durableRoot` 原子引用，新 runtime 恢复，版本不匹配类型化失败；
+- M11 令牌护栏：`guardQueryTokens` / `maxQueryTokensPerCell` 读取官方
+  `tokenMeter.measure(...).baseline.usage` 观测（不发明令牌）；
+- M12 Job 消费者：官方 `ctx.jobs` `rlm` 控制器 + `createRlmJobSpec` / `startRlmJob`
+  （无第二 Agent loop；swarm 保持触发式）；
 - 离线测试和设门的真实干净 Profile 冒烟测试。
 
 ## 下一里程碑与未实现
 
-M3 已在当前开发分支实现，等待干净 Profile 验收；M4 仍处于计划阶段：
+## 里程碑路线
 
-- [M3 托管上下文](docs/m3-managed-context.zh-CN.md)；
-- [M4 递归子 RLM](docs/m4-recursive-child-rlm.zh-CN.md)。
+已在 `main` 上验收：M1-M12（见[里程碑](docs/milestones.zh-CN.md)）。
+[未来扩展](docs/future-extensions.zh-CN.md) 中的剩余行均为条件触发：
 
-以下仍是条件性未来工作：
-
-- snapshot/restore 或跨 Host 持久化；
-- continuable/background spawn；
-- batched query；
-- 公共 `RlmService` 或 Kernel Provider 框架；
-- Storage Domain、Workflow、Jobs、Team 或 UI；
-- container 或 remote kernel。
+- 公共 `RlmService` 或 Kernel Provider 框架（仅在出现第二个消费者时）；
+- container 或 remote kernel（B 路线——独立契约与触发）；
+- 超出 M12 Job 消费者的 Jobs/UI/swarm 编排（需具名消费者 + 端到端场景）。
 
 可靠性缺陷与条件扩展已在[项目状态](docs/project-status.zh-CN.md)中分开记录。
 GitHub Issues 是实时工作权威。
@@ -90,6 +96,12 @@ Python 子进程只接收固定的安全名白名单，而不是完整宿主环�
 变量一律不转发。这是凭据卫生，不是 sandbox：受信任的 Python 仍可读取宿主
 用户可读文件、访问网络、启动进程，也可能读取磁盘上的凭据文件。参见
 [SECURITY.md](SECURITY.md) 与 [Issue #7](https://github.com/leinasi2014/dsh-rlm/issues/7)。
+
+从 M9 起，`kernelSandbox` 可将同一可信执行约束到 DSH Session 沙箱策略：`auto`（默认）在加载的
+Profile 挂载时使用 `ctx.sandbox` + `ctx.sandboxPolicy`，`require` 失败关闭，`off` 保留旧的
+可信本地派生。约束模式下内核在 Session 工作区根目录启动，文件效果与 DSH bash/fs 工具相同
+遵循 read-only / workspace-write / danger-full-access 阶梯；Windows ACL 报告部分强制，
+读取与网络仍为同世界不约束。
 
 ## 环境要求
 
@@ -165,6 +177,11 @@ pnpm dsh plugin --profile <profile> add -w /absolute/path/to/dsh-rlm
 | `maxResult` | `65536` | 整数 `1024..262144` UTF-8 字节（cell 结果） |
 | `maxQueries` | `16` | 整数 `1..4096`（每 cell 的 `rlm_query` 次数） |
 | `maxContextBytes` | `67108864` | 整数 `1048576..1073741824`（一个托管 UTF-8 上下文文件的字节数） |
+| `snapshotRecovery` | `false` | 布尔；属主内核丢失后恢复 JSON 安全全局 + 上下文（M5） |
+| `kernelSandbox` | `auto` | `auto` / `require` / `off`（M9） |
+| `durableRoot` | （未设） | 跨重启 checkpoint 引用的宿主绝对目录（M10） |
+| `guardQueryTokens` | `false` | 启用每 cell 已观测令牌护栏（M11） |
+| `maxQueryTokensPerCell` | `0` | 正整数上限；`0` 禁用（M11） |
 
 本仓库尚未发布 npm registry 包；这里是真实本地包安装。
 
