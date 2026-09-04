@@ -161,6 +161,21 @@ one batch; successful text returns in input order.
 See [M7 architecture](m7-batched-query.md) and the
 [M7 delivery contract](m7-development-contract.md).
 
+## M9: Sandbox-Backed Kernel
+
+M9 freezes the route-A revision of the conditional second-kernel extension: the Session
+Python kernel runs under the loaded DSH sandbox policy (`ctx.sandbox` +
+`ctx.sandboxPolicy`). `kernelSandbox: auto|require|off`; protocol v4 carries
+host-private chunked M5 checkpoints. See
+[M9 architecture](m9-sandboxed-kernel.md).
+
+## M10: Cross-Host Durable Session Persistence
+
+M10 persists only bounded host-private checkpoint references under an opt-in
+`durableRoot`, so the same official Session can restore after plugin restart or
+host change; version mismatch fails typed. See
+[M10 architecture](m10-cross-host-persistence.md).
+
 ## M8: Continuable Spawn
 
 Start M8 only after M7 is accepted on `main` and its matching trigger in

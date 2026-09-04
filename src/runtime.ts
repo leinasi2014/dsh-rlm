@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -263,6 +263,8 @@ export interface RlmRuntimeConfig {
   maxContextBytes?: number
   /** Sandbox confinement for the Session Python kernel. */
   kernelSandbox?: 'auto' | 'require' | 'off'
+  /** Optional host-owned durable root for cross-restart M10 checkpoint references. */
+  durableRoot?: string
   /** Opt-in M5 recovery after an owned timeout/crash/protocol-fatal loss. */
   snapshotRecovery?: boolean
 }
@@ -290,6 +292,7 @@ export const ConfigSchema: z<RlmPluginConfig> = z.object({
   maxQueries: z.natural().min(1).max(4096).default(16).description('Max rlm_query calls per cell.'),
   maxContextBytes: z.natural().min(1048576).max(1073741824).default(67108864).description('Byte cap for one kernel-managed UTF-8 context file.'),
   kernelSandbox: z.union([z.const('auto'), z.const('require'), z.const('off')]).default('auto').description('Sandbox confinement for the Session Python kernel: auto uses DSH ctx.sandbox when available, require fails closed, off keeps trusted local spawn.'),
+  durableRoot: z.string().description('Optional absolute host-owned directory for cross-restart durable checkpoint references (M10).'),
   snapshotRecovery: z.boolean().default(false).description('Restore a private bounded checkpoint after an owned kernel fault.'),
   maxDepth: z.natural().min(1).max(8).default(DEFAULT_MAX_DEPTH).description('Absolute DSH delegation-depth cap for recursive rlm_query children.'),
 })
@@ -1338,18 +1341,70 @@ class RlmRuntimeImpl implements RlmRuntime {
   private drains = new Map<string, Promise<void>>()
   private config: RlmRuntimeConfig
   private readonly ctx: Context | undefined
+  private readonly durableRoot: string | undefined
+  private readonly durableVersion = 1
   private disposed = false
   private disposePromise: Promise<void> | undefined
   constructor(config: RlmRuntimeConfig, ctx?: Context) {
     this.config = config
     this.ctx = ctx
+    this.durableRoot = typeof config.durableRoot === 'string' && config.durableRoot.trim() !== '' ? path.resolve(config.durableRoot) : undefined
+    if (this.durableRoot) mkdirSync(this.durableRoot, { recursive: true })
     if (config.snapshotRecovery === true) {
       this.checkpointRoot = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m5-'))
     }
   }
 
+  private durablePath(sessionKey: string, suffix: string): string {
+    return path.join(this.durableRoot!, createHash('sha256').update(sessionKey).digest('hex') + suffix)
+  }
+
+  /**
+   * Atomically publish the host-private checkpoint bytes under durableRoot (M10).
+   * Keeps a sidecar meta file with the frozen schemaVersion and content sha-256.
+   */
+  private publishDurable(sessionKey: string, bytes: Buffer): void {
+    if (!this.durableRoot) return
+    const target = this.durablePath(sessionKey, '.checkpoint.json')
+    const meta = this.durablePath(sessionKey, '.meta.json')
+    const temp = target + '.tmp-' + String(process.pid)
+    writeFileSync(temp, bytes)
+    renameSync(temp, target)
+    writeFileSync(meta, JSON.stringify({ schemaVersion: this.durableVersion, bytes: bytes.length, publishedAt: Date.now(), sha256: createHash('sha256').update(bytes).digest('hex') }))
+  }
+
+  /** Read and validate a durable reference; returns bytes or a typed failure reason. */
+  private readDurable(sessionKey: string): Buffer | undefined {
+    if (!this.durableRoot) return undefined
+    const target = this.durablePath(sessionKey, '.checkpoint.json')
+    const metaPath = this.durablePath(sessionKey, '.meta.json')
+    if (!existsSync(target) || !existsSync(metaPath)) return undefined
+    try {
+      const bytes = readFileSync(target)
+      const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as { schemaVersion?: number; sha256?: string }
+      if (meta.schemaVersion !== this.durableVersion) throw new Error('durable schema version mismatch')
+      if (meta.sha256 !== createHash('sha256').update(bytes).digest('hex')) throw new Error('durable content hash mismatch')
+      return bytes
+    } catch {
+      return undefined
+    }
+  }
+
+  private dropDurable(sessionKey: string): void {
+    if (!this.durableRoot) return
+    rmSync(this.durablePath(sessionKey, '.checkpoint.json'), { force: true })
+    rmSync(this.durablePath(sessionKey, '.meta.json'), { force: true })
+  }
+
   private snapshotFor(sessionKey: string): { path: string; restore: boolean; maxBytes: number } | undefined {
     if (!this.checkpointRoot) return undefined
+    const durable = this.readDurable(sessionKey)
+    if (durable && !this.checkpoints.has(sessionKey)) {
+      // Materialize a durable reference into the host-private path so the
+      // existing M9 restore transport (chunked frames) can feed the kernel.
+      writeFileSync(this.checkpointPath(sessionKey), durable)
+      this.checkpoints.add(sessionKey)
+    }
     let reservation = this.checkpointReservations.get(sessionKey)
     if (reservation === undefined) {
       const used = [...this.checkpointReservations.values()].reduce((total, bytes) => total + bytes, 0)
@@ -1606,6 +1661,7 @@ class RlmRuntimeImpl implements RlmRuntime {
           if (this.kernels.get(sessionKey) === kernel) this.kernels.delete(sessionKey)
         }
         this.dropCheckpoint(sessionKey)
+        this.dropDurable(sessionKey)
         this.settleEntry(entry, { stdout: '', result: 'RLM state reset', truncated: false })
         return
       }
@@ -1629,6 +1685,10 @@ class RlmRuntimeImpl implements RlmRuntime {
       const out = await kernel.evalCell(entry.input, entry.deadline)
       if (out.recovery?.checkpointCommitted) {
         this.checkpoints.add(sessionKey)
+        if (this.durableRoot && this.checkpointRoot) {
+          const p = this.checkpointPath(sessionKey)
+          if (existsSync(p)) this.publishDurable(sessionKey, readFileSync(p))
+        }
       }
       this.settleEntry(entry, out)
     } catch (err) {

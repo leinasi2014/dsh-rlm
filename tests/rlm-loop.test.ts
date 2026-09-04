@@ -1322,6 +1322,79 @@ test('M9 Issue#42: confined M5 never writes the checkpoint into the sandbox work
   }
 })
 
+
+test('M10 Issue#44 RED: a durableRoot is not consulted on the accepted M9 base', async () => {
+  const durable = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m10-red-'))
+  const runtime = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 3_000 })
+  try {
+    await runtime.eval('m10-red', { code: 'x = 7' })
+    const files = readdirSync(durable).filter((f) => f.endsWith('.checkpoint.json'))
+    assert.equal(files.length, 1, 'a committed checkpoint must publish one durable reference')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+
+test('M10 Issue#44: a new runtime with the same durableRoot restores the same Session after a timeout', async () => {
+  const durable = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m10-'))
+  const runtime = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 3_000 })
+  try {
+    await runtime.eval('m10-sess', { code: 'keep = 99' })
+    await assert.rejects(
+      runtime.eval('m10-sess', { code: 'import time\ntime.sleep(30)' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'timeout',
+    )
+  } finally {
+    await runtime.dispose()
+  }
+  const runtimeB = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 10_000 })
+  try {
+    const restored = await runtimeB.eval('m10-sess', { code: 'keep + 1' })
+    assert.equal(restored.result, '100')
+    assert.equal(restored.recovery?.restored, true)
+  } finally {
+    await runtimeB.dispose()
+  }
+})
+
+test('M10 Issue#44: reset deletes the durable reference for that Session only', async () => {
+  const durable = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m10-reset-'))
+  const runtime = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 3_000 })
+  try {
+    await runtime.eval('m10-a', { code: 'va = 1' })
+    await runtime.eval('m10-b', { code: 'vb = 2' })
+    assert.equal(readdirSync(durable).filter((f) => f.endsWith('.checkpoint.json')).length, 2, 'two sessions must publish two durable refs')
+    await runtime.eval('m10-a', { reset: true })
+    const files = readdirSync(durable).filter((f) => f.endsWith('.checkpoint.json'))
+    assert.equal(files.length, 1, 'only the reset Session reference must be removed')
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('M10 Issue#44: a durable version mismatch fails closed without restoring stale state', async () => {
+  const durable = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m10-ver-'))
+  const runtime = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 3_000 })
+  try {
+    await runtime.eval('m10-ver', { code: 'x = 1' })
+  } finally {
+    await runtime.dispose()
+  }
+  const metaFile = path.join(durable, readdirSync(durable).find((f) => f.endsWith('.meta.json'))!)
+  const meta = JSON.parse(readFileSync(metaFile, 'utf8'))
+  meta.schemaVersion = 999
+  writeFileSync(metaFile, JSON.stringify(meta))
+  const runtimeB = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true })
+  try {
+    const out = await runtimeB.eval('m10-ver', { code: 'y = 2' })
+    // Mismatch must not restore; a fresh kernel namespaces x as absent.
+    assert.equal(out.recovery?.restored, false)
+  } finally {
+    await runtimeB.dispose()
+  }
+})
+
 // ---- M1C/M1D: DSH tool registration and rlm_query -> one-shot Subagent bridge ----
 
 import { registerRlmPlugin } from '../src/runtime.ts'

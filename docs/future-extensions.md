@@ -26,7 +26,7 @@ Every extension must preserve these boundaries:
 | Capability | Trigger | Minimal addition | Acceptance outcome |
 |---|---|---|---|
 | Continuable spawn | Work must continue after the parent cell exits | Use the official continuable Subagent and inbox | The child continues and delivers through the official Session path |
-| Cross-host persistence | Users require the same RLM Session after plugin restart | Persist only recovery metadata and snapshot references | The Session restores, while version mismatch fails explicitly |
+| Cross-host persistence | The user requires the same RLM Session after plugin restart or host change | Persist only bounded host-private checkpoint references under `durableRoot` (M10) | The Session restores through the existing bridge; version mismatch fails typed |
 | M7 Batched query | Measured sequential-query latency is a bottleneck | Add one concurrency-bounded `rlm_query_batched` | Results preserve input order and cancellation stops every child |
 | Second kernel (route A) | The user requires policy-confined `rlm_eval` execution on the host | Reuse `ctx.sandbox` + `ctx.sandboxPolicy` for one same-world confined kernel (M9) | Kernel file effects follow the Session sandbox policy; M5 stays host-private |
 | Token/cost guard | A Provider exposes reliable usage and a reproducible cost problem exists | Read observed usage at query admission and reject later calls | New queries stop at the limit without inventing unobserved tokens |
