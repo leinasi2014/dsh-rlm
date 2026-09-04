@@ -20,5 +20,9 @@
 15. [M6 Manual Reset](m6-manual-reset.md): Session-local FIFO reset through the existing `rlm_eval` route.
 16. [M7 Batched Query](m7-batched-query.md): bounded ordered concurrent `rlm_query_batched`.
 17. [M8 Continuable Spawn](m8-continuable-spawn.md): official continuable child Sessions with parent inbox delivery.
+18. [M9 Sandbox-Backed Kernel](m9-sandboxed-kernel.md): policy-confined kernel via `ctx.sandbox`, host-private chunked M5 checkpoint (protocol v4).
+19. [M10 Cross-Host Durable Persistence](m10-cross-host-persistence.md): opt-in `durableRoot` references with versioned restore.
+20. [M11 Token Guard](m11-token-guard.md): per-cell observed-token guard on official `tokenMeter`.
+21. [M12 Job Consumer](m12-jobs-ui-swarm.md): official `ctx.jobs` `rlm` controller; swarm stays trigger-gated.
 
 Each authoritative English document has a `.zh-CN.md` Chinese counterpart.

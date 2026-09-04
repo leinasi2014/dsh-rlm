@@ -134,6 +134,33 @@ active；成功文本按输入顺序返回。
 见 [M7 架构](m7-batched-query.zh-CN.md) 与
 [M7 交付契约](m7-development-contract.zh-CN.md)。
 
+## M9：沙箱内核
+
+M9 冻结第二内核条件扩展的 A 路线：Session Python 内核在加载的 DSH 沙箱策略
+（`ctx.sandbox` + `ctx.sandboxPolicy`）下运行。`kernelSandbox: auto|require|off`；
+协议 v4 以宿主私有分块帧承载 M5 checkpoint。见
+[M9 架构](m9-sandboxed-kernel.zh-CN.md)。
+
+## M10：跨主机持久会话持久化
+
+M10 只在可选 `durableRoot` 下持久化有界宿主私有 checkpoint 引用，使同一官方
+Session 可在插件重启或换机后恢复；版本不匹配类型化失败。见
+[M10 架构](m10-cross-host-persistence.zh-CN.md)。
+
+## M11：每 cell 查询令牌护栏
+
+M11 在每次查询/派生准入前读取官方 `ctx.tokenMeter.measure(session)` 观测，当已观测
+用量超过 `maxQueryTokensPerCell` 时拒绝；只在使用 `baseline.kind === "usage"` 的
+`baseline.usage` 时计数，绝不发明或估算未观测令牌，也绝不向 Python 暴露令牌数字。见
+[M11 架构](m11-token-guard.zh-CN.md)。
+
+## M12：RLM 作为 DSH Job 消费者
+
+M12 注册官方 `rlm` job 控制器（`ctx.jobs.attachController`）并导出
+`createRlmJobSpec` / `startRlmJob`，使 RLM cell 可作为 DSH 拥有的后台 job 运行并有界输出。
+无第二 Agent loop、调度器、队列、Workflow 引擎、Storage 或 UI 标记；swarm 保持具名消费者 +
+端到端场景条件。见 [M12 架构](m12-jobs-ui-swarm.zh-CN.md)。
+
 ## M8：可继续 spawn
 
 仅当 M7 在 `main` 接受且 [Future extensions](future-extensions.md) 的对应 trigger 真实存在后，才开始 M8。
