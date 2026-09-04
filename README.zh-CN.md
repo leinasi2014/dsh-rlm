@@ -185,6 +185,118 @@ pnpm dsh plugin --profile <profile> add -w /absolute/path/to/dsh-rlm
 
 本仓库尚未发布 npm registry 包；这里是真实本地包安装。
 
+## M9-M12 操作指南
+
+以下配置在一个 Profile 中启用所有里程碑；所有键均为可选，未注明时即 schema 默认值。
+
+```yaml
+- insert:
+    - id: rlm
+      name: dsh-rlm
+      config:
+        enabled: true
+        provider: spawn
+        kernelSandbox: auto        # M9：auto | require | off
+        snapshotRecovery: true     # M5/M10：属主内核丢失后 checkpoint
+        durableRoot: /absolute/host/durable  # M10：仅引用，宿主持有
+        guardQueryTokens: true     # M11：每 cell 已观测令牌护栏
+        maxQueryTokensPerCell: 1000000   # M11：已观测上限，0 = 关闭
+        timeout: 30000
+```
+
+### M9：沙箱内核
+
+`kernelSandbox` 决定 Session Python 进程的启动方式：
+
+- `auto`（默认）：加载的 Profile 挂载 `ctx.sandbox` 与 `ctx.sandboxPolicy`
+  时按 Session 策略约束内核（base 默认 `workspace-write`）；否则保留旧的可信
+  派生。它绝不静默绕过坏掉的沙箱——runner 失败即失败关闭。
+- `require`：官方沙箱服务缺失或不可用时，在任何 Python 启动前失败。
+- `off`：可信本地派生，与 M1-M8 完全一致。
+
+约束模式下的可观察行为：
+
+- 内核以 `cwd` = Session 工作区根目录启动，Python 相对路径解析落在工作区内。
+- 文件效果与 DSH bash/fs 工具同一阶梯：`workspace-write` 下工作区内写成功、
+  工作区外写被拒（Windows 请用封闭 ACL 目标验证）、`read-only` 拒绝写、
+  `danger-full-access` 绕过约束。
+- M5 checkpoint 以有界分块协议帧（协议 v4）传输并保持宿主私有；内核不写沙箱可见的
+  checkpoint。
+- Windows 使用 ACL 受限令牌 runner，报告 `partial` 强制（Everyone/硬链接边界仍存在）；
+  读取与网络保持同世界不约束。
+
+在 cell 中验证：
+
+```python
+import os
+open('inside_ws.txt', 'w').write('ok')   # workspace-write 下成功
+os.getcwd()                              # == Session 工作区根目录
+```
+
+### M10：跨主机持久化
+
+配置 `snapshotRecovery: true` 与绝对 `durableRoot` 后，每次提交 checkpoint 时宿主原子发布引用对：
+
+```
+<durableRoot>/<sha256(sessionId)>.checkpoint.json
+<durableRoot>/<sha256(sessionId)>.meta.json
+```
+
+- 引用有界（每 Session <= 8 MiB，根 <= 64 MiB），不含 Session id、值或上下文文本。
+- 新 runtime 实例（插件重启、同根另一主机）可通过既有 M9 传输恢复同一 Session。
+- `rlm_eval({ reset: true })` 只删除该 Session 引用；插件卸载保留引用。
+- 版本或内容哈希不匹配时以类型化 `snapshot` 错误失败关闭，Session 从新开始——绝不猜测状态。
+- 把 `durableRoot` 视为宿主私有：不提交、不镜像、不指向模型可见路径。
+
+### M11：每 cell 令牌护栏
+
+启用 `guardQueryTokens: true` 与正整数 `maxQueryTokensPerCell` 后，每次
+`rlm_query` / `rlm_spawn` 准入前先读取官方 `ctx.tokenMeter.measure(parent.session)` 观测：
+
+- 仅 `TokenMeasurement.baseline.usage` 计入（当 `baseline.kind === "usage"`）；
+  `estimated` / `none` 基线视为未观测，不阻塞。
+- 绝不发明、估算或外推令牌；Python 永不见令牌数字；护栏不写 Session 日志。
+- 超预算在子代理派发前以类型化 `query` 错误（phase `query`）拒绝。
+  `maxQueryTokensPerCell: 0`（默认）关闭护栏。
+- 注意：`measure(session)` 是会话级压力，因此该上限实际是会话级上限，而非严格 per-cell。
+
+### M12：RLM 作为 DSH job 消费者
+
+当加载的 Profile 挂载 `ctx.jobs`（DSH `jobs-local` + `tool-jobs`）时，插件惰性挂载官方
+`rlm` job 控制器；没有它的 Profile 正常加载，只是没有 job 表面。
+
+宿主消费者希望把 RLM cell 作为 DSH 拥有的后台 job 运行：
+
+```ts
+import { createRlmRuntime, startRlmJob } from 'dsh-rlm'
+const runtime = createRlmRuntime(ctx, { enabled: true })
+const jobId = startRlmJob(ctx, parent, 'value = 41', runtime)
+// 通过官方 DSH job 工具观察/读取：jobs -> job_read -> job_kill。
+```
+
+- `createRlmJobSpec` 返回惰性 spec；只有官方 registry 调用 `run()`
+  （`ctx.jobs.start`）时才启动 cell。从未 start 的 job 不泄漏内核/工作。
+- `cancel` 映射到按 Session 内核 dispose；job 以 `killed` 结算；`readOutput`
+  返回有界 stdout/result。
+- 无第二 Agent loop、调度器、队列、Workflow 引擎、Storage 或 UI 标记；swarm 保持
+  具名消费者 + 端到端场景条件。
+
+### 实时验证前的边界检查
+
+- Profile 冒烟前必须先 `pnpm build`：`package.json` 的 `main` 加载
+  `lib/index.mjs` 而非 `src`。
+- Cordis 对直接读取的服务要求 `inject`；插件通过非严格 `ctx.get` 读取
+  `jobs` / `sandbox` / `sandboxPolicy` / `tokenMeter`，因此缺少任一服务的
+  Profile 仍可加载。
+- 各里程碑实时验收：
+
+```bash
+RLM_LIVE_SMOKE=1 DSH_HOME=/path/to/configured/dsh-home \
+  RLM_LIVE_PROVIDER=dsv4f-local RLM_LIVE_MODEL=DeepSeek-V4-Flash-Vision-Exp \
+  node --test --test-name-pattern "M9 Issue#42|M10 Issue#44|M11 Issue#46|M12 Issue#48" \
+  tests/profile-smoke.test.ts
+```
+
 ## 示例
 
 调用 Agent 可以带一个绝对 `contextPath`，并运行如下 cell：

@@ -202,6 +202,137 @@ six runtime settings are optional and validated by the single `Config` schema:
 This repository has not published an npm package. The command above is a real
 local-package Profile installation, not a registry installation.
 
+## M9-M12 operational guide
+
+The plugin configuration below enables every milestone in one Profile. All keys
+are optional; the values are the schema defaults unless noted.
+
+```yaml
+- insert:
+    - id: rlm
+      name: dsh-rlm
+      config:
+        enabled: true
+        provider: spawn
+        kernelSandbox: auto        # M9: auto | require | off
+        snapshotRecovery: true     # M5/M10: checkpoint after owned kernel loss
+        durableRoot: /absolute/host/durable  # M10: references only; host-owned
+        guardQueryTokens: true     # M11: per-cell observed-token guard
+        maxQueryTokensPerCell: 1000000   # M11: observed-token ceiling, 0 = off
+        timeout: 30000
+```
+
+### M9: sandbox-backed kernel
+
+`kernelSandbox` governs how the Session Python process is launched:
+
+- `auto` (default): if the loaded Profile mounts `ctx.sandbox` and
+  `ctx.sandboxPolicy`, the kernel runs confined under the Session policy
+  (base default `workspace-write`); otherwise it keeps the legacy trusted
+  spawn. It never silently bypasses a broken sandbox — a runner failure fails
+  closed.
+- `require`: fail before any Python starts when the official sandbox services
+  are missing or unusable.
+- `off`: trusted local spawn, exactly M1-M8 behavior.
+
+Observable behavior under a confined mode:
+
+- The kernel starts with `cwd` = the Session workspace root, so relative
+  Python paths resolve inside the workspace.
+- File effects follow the same ladder as DSH bash/fs tools: writes inside the
+  workspace succeed, writes outside are denied under `workspace-write`
+  (test with a closed-ACL target on Windows), `read-only` denies writes, and
+  `danger-full-access` bypasses confinement.
+- M5 checkpoints move through bounded chunked protocol frames (protocol v4)
+  and stay host-private; the kernel never writes a sandbox-visible checkpoint.
+- Windows uses the ACL restricted-token runner, which reports `partial`
+  enforcement (Everyone/hard-link boundaries remain); reads and network stay
+  same-world unconfined.
+
+Verify from a cell:
+
+```python
+import os
+open('inside_ws.txt', 'w').write('ok')   # succeeds under workspace-write
+os.getcwd()                              # == Session workspace root
+```
+
+### M10: cross-host durable persistence
+
+With `snapshotRecovery: true` and an absolute `durableRoot`, after each
+committed checkpoint the host atomically publishes a reference pair:
+
+```
+<durableRoot>/<sha256(sessionId)>.checkpoint.json
+<durableRoot>/<sha256(sessionId)>.meta.json
+```
+
+- The reference is bounded (<= 8 MiB per Session, <= 64 MiB root) and contains
+  no Session id, no values, and no context text.
+- A new runtime instance (plugin restart, another host with the same root) can
+  restore the same Session through the existing M9 transport.
+- `rlm_eval({ reset: true })` deletes that Session reference only; plugin
+  unload retains it.
+- Version or content-hash mismatch fails closed with a typed `snapshot` error
+  and starts the Session fresh — it never guesses state.
+- Treat `durableRoot` as host-private: never commit it, mirror it, or point a
+  model-visible path at it.
+
+### M11: per-cell token guard
+
+With `guardQueryTokens: true` and a positive `maxQueryTokensPerCell`, every
+`rlm_query` / `rlm_spawn` admission first reads the official
+`ctx.tokenMeter.measure(parent.session)` observation:
+
+- Only `TokenMeasurement.baseline.usage` counts (when
+  `baseline.kind === "usage"`); `estimated` / `none` baselines are
+  treated as unobserved and do not block.
+- No tokens are invented, estimated, or extrapolated; Python never sees token
+  numbers; the guard writes nothing to the Session log.
+- Over budget rejects before child dispatch with a typed `query` error
+  (phase `query`). `maxQueryTokensPerCell: 0` (default) disables the guard.
+- Note: `measure(session)` is session-wide pressure, so the ceiling is an
+  effective Session-wide cap rather than a strictly per-cell one.
+
+### M12: RLM as a DSH job consumer
+
+The plugin lazily attaches the official `rlm` job controller when the loaded
+Profile mounts `ctx.jobs` (DSH `jobs-local` + `tool-jobs`); a Profile
+without it loads normally and simply has no job surface.
+
+For a host-side consumer that wants an RLM cell as a DSH-owned background job:
+
+```ts
+import { createRlmRuntime, startRlmJob } from 'dsh-rlm'
+const runtime = createRlmRuntime(ctx, { enabled: true })
+const jobId = startRlmJob(ctx, parent, 'value = 41', runtime)
+// Watch/read through the official DSH job tools: jobs -> job_read -> job_kill.
+```
+
+- `createRlmJobSpec` returns an inert spec; the cell starts only when the
+  official registry calls `run()` (`ctx.jobs.start`). A never-started job
+  leaks no kernel/work.
+- `cancel` maps to the per-Session kernel dispose; the job settles as
+  `killed`; `readOutput` returns bounded stdout/result.
+- No second Agent loop, scheduler, queue, Workflow engine, Storage, or UI
+  markup; swarm stays conditional on a named consumer + end-to-end scenario.
+
+### Boundary checks before live verification
+
+- `pnpm build` must run before Profile smokes: `package.json` `main`
+  loads `lib/index.mjs`, not `src`.
+- Cordis requires `inject` for directly read services; the plugin reads
+  `jobs` / `sandbox` / `sandboxPolicy` / `tokenMeter` via non-strict
+  `ctx.get`, so a Profile missing any of them still loads.
+- Live acceptance per milestone:
+
+```bash
+RLM_LIVE_SMOKE=1 DSH_HOME=/path/to/configured/dsh-home \
+  RLM_LIVE_PROVIDER=dsv4f-local RLM_LIVE_MODEL=DeepSeek-V4-Flash-Vision-Exp \
+  node --test --test-name-pattern "M9 Issue#42|M10 Issue#44|M11 Issue#46|M12 Issue#48" \
+  tests/profile-smoke.test.ts
+```
+
 ## Example
 
 The Agent can call `rlm_eval` with an absolute `contextPath` and a cell such as:

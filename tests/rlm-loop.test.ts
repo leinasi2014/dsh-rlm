@@ -1432,6 +1432,14 @@ test('M12 Issue#48: createRlmJobSpec runs one cell and reports bounded output', 
   try { await m.teardown?.() } catch {}
 })
 
+test('M12 Issue#48: the public package entry re-exports the M12 host-consumer API', () => {
+  const source = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8')
+  for (const name of ['createRlmRuntime', 'createRlmJobSpec', 'startRlmJob', 'TOOL_NAME']) {
+    assert.match(source, new RegExp('\\b' + name + '\\b'), 'index.ts must re-export ' + name)
+  }
+  assert.match(source, /export \{/, 'index.ts must contain an export block')
+})
+
 test('M12 Issue#48: startRlmJob dispatches through ctx.jobs.start with the rlm kind', async () => {
   const started: any[] = []
   const m = makeMockCtx()
