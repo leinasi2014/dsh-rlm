@@ -1392,6 +1392,11 @@ class RlmRuntimeImpl implements RlmRuntime {
       return undefined
     }
     const policy = policyService.resolve(session === undefined ? {} : { session })
+    if (policy.mode === 'danger-full-access') {
+      // The upstream consumer contract bypasses confine() entirely for the
+      // unrestricted mode: the sandbox policy type carries only confined modes.
+      return undefined
+    }
     let confined: SandboxConfined
     try {
       confined = provider.confine([this.config.python ?? 'python', KERNEL_PATH], policy)

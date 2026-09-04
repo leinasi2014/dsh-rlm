@@ -49,7 +49,8 @@ const LIVE_MODEL = process.env.RLM_LIVE_MODEL ?? 'DeepSeek-V4-Flash-Vision-Exp'
 
 /** Node launcher shared by every dsh invocation (source execution). */
 function runDsh(args: string[], env: Record<string, string>, cwd: string, timeoutMs = 10000) {
-  const res = spawnSync('node', ['--import', 'tsx/esm', BIN, ...args], {
+  const tsxUrl = 'file:///' + REPO_ROOT.replace(/\\/g, '/') + '/node_modules/tsx/dist/esm/index.mjs'
+  const res = spawnSync('node', ['--import', tsxUrl, BIN, ...args], {
     cwd,
     env: { ...process.env, ...env },
     encoding: 'utf8',
@@ -270,9 +271,11 @@ test('M4 Issue#25: fresh isolated DSH Profile completes a depth-three RLM branch
   const ambientSettingsBytes = fs.readFileSync(ambientSettingsPath)
   const ambientCredsPath = path.join(ambientHome, '.credentials.yaml')
   const ambientCredsBytes = fs.existsSync(ambientCredsPath) ? fs.readFileSync(ambientCredsPath) : null
-  fs.writeFileSync(path.join(home, 'settings.yaml'), replaceAgentDefaultModel(ambientSettingsBytes.toString('utf8'), LIVE_PROVIDER, LIVE_MODEL))
+  const copiedSettings = replaceAgentDefaultModel(ambientSettingsBytes.toString('utf8'), LIVE_PROVIDER, LIVE_MODEL)
+    .replace(/defaultPreset: danger-full-access/, 'defaultPreset: workspace-write')
+  fs.writeFileSync(path.join(home, 'settings.yaml'), copiedSettings)
   if (ambientCredsBytes !== null) fs.writeFileSync(path.join(home, '.credentials.yaml'), ambientCredsBytes)
-  const env = { DSH_HOME: home }
+  const env = { DSH_HOME: home, DSH_PERMISSION_MODE: 'workspace-write' }
 
   const leafPrompt = 'Reply exactly M4_LEAF_OK. Do not call tools.'
   const depth2Prompt = [
@@ -913,3 +916,105 @@ test('M2 Issue#18: isolated smoke deterministically pins agent-default-model to 
   assert.deepEqual(toolCallArguments(officialCall, 'rlm_eval'), [{}])
   assert.deepEqual(toolCallArguments(mentionJsonl, 'rlm_eval'), [])
 })
+
+test('M9 Issue#42: a fresh installed Profile confines the kernel to the Session workspace', { timeout: 15 * 60_000 }, async (t) => {
+  if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the M9 sandbox acceptance'); return }
+  const ambientHome = process.env.DSH_HOME
+  if (!ambientHome || !fs.existsSync(path.join(ambientHome, 'settings.yaml'))) {
+    t.skip('DSH_HOME with settings.yaml is required; it supplies the configured provider and credential refs')
+    return
+  }
+  assert.ok(fs.existsSync(BIN), 'DSH harness bin.ts not found at ' + REPO_ROOT)
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m9-spawn-'))
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m9-ws-'))
+  const profileDir = path.join(home, 'profiles', PROFILE)
+  fs.mkdirSync(path.join(home, 'profiles'), { recursive: true })
+  const ambientSettingsPath = path.join(ambientHome, 'settings.yaml')
+  const ambientSettingsBytes = fs.readFileSync(ambientSettingsPath)
+  const ambientCredsPath = path.join(ambientHome, '.credentials.yaml')
+  const ambientCredsBytes = fs.existsSync(ambientCredsPath) ? fs.readFileSync(ambientCredsPath) : null
+  const copiedSettings = replaceAgentDefaultModel(ambientSettingsBytes.toString('utf8'), LIVE_PROVIDER, LIVE_MODEL)
+    .replace(/defaultPreset: danger-full-access/, 'defaultPreset: workspace-write')
+  fs.writeFileSync(path.join(home, 'settings.yaml'), copiedSettings)
+  if (ambientCredsBytes !== null) fs.writeFileSync(path.join(home, '.credentials.yaml'), ambientCredsBytes)
+  const env = { DSH_HOME: home, DSH_PERMISSION_MODE: 'workspace-write' }
+  const cell1 = [
+    "import os",
+    "p = os.path.join(os.getcwd(), 'm9_marker.txt')",
+    "open(p, 'w').write('M9_WRITE_OK')",
+    "denied = 'allowed'",
+    "try:",
+    "    with open(r'C:\\Windows\\System32\\dsh-rlm-m9-denied.txt', 'w') as f: f.write('x')",
+    "except OSError:",
+    "    denied = 'denied'",
+    "os.getcwd() + '|' + denied",
+  ].join('\n')
+  const cell2 = "open('m9_marker.txt').read()"
+  const task = [
+    'You are validating M9 sandbox confinement. Call rlm_eval exactly twice, in the stated order, with the exact Python sources below and no other rlm_eval call.',
+    '',
+    'First call:',
+    cell1,
+    '',
+    'Second call after the first succeeds:',
+    cell2,
+    '',
+    'Do not use any other tool. Only if both correlated rlm_eval results succeed, reply exactly M9_CONTINUABLE_SANDBOX_OK.',
+  ].join('\n')
+  try {
+    const add = runDsh(['plugin', '--profile', PROFILE, 'add', '-w', PKG_ROOT], env, REPO_ROOT, 180_000)
+    assert.equal(add.status, 0, 'dsh plugin add failed: ' + add.stderr)
+    assert.ok(fs.existsSync(path.join(profileDir, 'node_modules', 'dsh-rlm')), 'dsh-rlm not installed into the profile')
+    const manifestPath = path.join(profileDir, 'package.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    manifest.dsh = { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'] } }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+    fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), [
+      '- insert:',
+      '    - id: rlm',
+      '      name: dsh-rlm',
+      '      config:',
+      '        enabled: true',
+      '        provider: spawn',
+      '        kernelSandbox: auto',
+      '        timeout: 60000',
+      '',
+    ].join('\n'))
+
+    const run = runDsh(['--profile', PROFILE, task], env, workspace, 12 * 60_000)
+    const outTail = run.stdout.slice(-1200)
+    assert.equal(run.status, 0, 'headless M9 journey failed before its correlated tool result: ' + outTail + ' ' + run.stderr.slice(-1200))
+    let logs = new Map<string, string>()
+    for (let attempt = 0; attempt < 25; attempt++) {
+      logs = await readSessionLogs(home)
+      const main = [...logs.values()].find((text) => JSON.parse(text.split('\n')[0]).delegationDepth === 0)
+      if (main && countToolCalls(main, 'rlm_eval') === 2) break
+      await new Promise((resolve) => setTimeout(resolve, 200))
+    }
+    const mainEntry = [...logs.entries()].find(([, text]) => JSON.parse(text.split('\n')[0]).delegationDepth === 0)
+    const main = mainEntry?.[1]
+    assert.ok(main, 'no persisted depth-0 Session log')
+    assert.equal(countToolCalls(main, 'rlm_eval'), 2, 'M9 acceptance must use exactly two ordered ordinary rlm_eval calls; log: ' + main.slice(-3000))
+    const outcomes = toolOutcomes(main, 'rlm_eval')
+    assert.equal(outcomes.length, 2, 'each exact rlm_eval call must have one correlated official result')
+    assert.deepEqual(outcomes.map((outcome) => outcome.result?.isError), [false, false], 'both cells must succeed: ' + JSON.stringify(outcomes))
+    const first = outcomes[0].result?.text ?? ''
+    assert.match(first, /\|denied$/, 'out-of-workspace write was NOT denied: ' + first)
+    const cwd = first.split('|')[0]
+    assert.equal(path.resolve(cwd), path.resolve(workspace), 'kernel cwd is not the session workspace: ' + cwd + ' vs ' + workspace)
+    assert.match(outcomes[1].result?.text ?? '', /M9_WRITE_OK/, 'relative write did not land/re-read in the workspace')
+    assert.ok(fs.existsSync(path.join(workspace, 'm9_marker.txt')), 'marker file missing in the workspace')
+    assert.equal(fs.readFileSync(path.join(workspace, 'm9_marker.txt'), 'utf8'), 'M9_WRITE_OK')
+    assert.ok(!fs.existsSync('C:\\Windows\\System32\\dsh-rlm-m9-denied.txt'), 'denied target exists (sandbox did not block)')
+    assert.match(outTail, /M9_CONTINUABLE_SANDBOX_OK/, 'headless agent did not observe both successful correlated results')
+  } finally {
+    try {
+      assert.ok(ambientSettingsBytes.equals(fs.readFileSync(ambientSettingsPath)), 'ambient settings.yaml was modified by the M9 smoke')
+      if (ambientCredsBytes !== null) assert.ok(ambientCredsBytes.equals(fs.readFileSync(ambientCredsPath)), 'ambient .credentials.yaml was modified by the M9 smoke')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+      fs.rmSync(workspace, { recursive: true, force: true })
+    }
+  }
+})
+
