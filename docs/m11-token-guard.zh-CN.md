@@ -14,8 +14,10 @@ Python 永远看不到令牌数字。
 ## 权威与 API
 
 - 权威：`@deepseek-ai/dsh-token-meter`（DSH base 已挂载）的 `TokenMeter.measure(session, header?)`
-  返回含 Provider 用量面（input、cacheRead、cacheWrite、output）的 `TokenMeasurement`；无表头/未知
-  用量视为未观测，护栏把它当作“不计入”，绝不当作零消耗证明。
+  返回 `TokenMeasurement`；Provider 用量面（input、cacheRead、cacheWrite、output）位于
+  `TokenMeasurement.baseline.usage`（类型 `TokenUsage`），仅当 `baseline.kind === `usage`` 时有效。
+  `estimated`/`none` 基线视为未观测；护栏把未观测当作“不计入”，绝不当作零消耗证明。护栏不会从
+  顶层测量字段读取 Provider 用量面（不存在）。
 - 新配置（全部可选，默认关闭）：`maxQueryTokensPerCell?: number` 在 cell 已观测用量超过预算时
   硬停；`guardQueryTokens?: boolean` 启用护栏（默认 false）。
 - 护栏运行于宿主桥接层，每个 helper 准入恰好一次，且在创建子代理之前排序（拒绝则不派发）。
