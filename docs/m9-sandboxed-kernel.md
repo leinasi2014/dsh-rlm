@@ -1,107 +1,130 @@
-# M9 Sandbox-Backed Kernel Architecture
+# M9 Sandbox-Backed Kernel Architecture (Successor)
 
 > English (authoritative) | [简体中文](m9-sandboxed-kernel.zh-CN.md) | [Interactive diagram](m9-sandboxed-kernel.html)
 
 ## Outcome
 
-M9 replaces the bare host spawn of a Session Python kernel with a spawn that runs
-under the DSH process sandbox, reusing the official `ctx.sandbox` backends
-(bwrap / Landlock on Linux, Seatbelt on macOS, ACL restricted-token on Windows)
-and the per-session policy from `ctx.sandboxPolicy`. This is the selected route
-**A** revision of the conditional second-kernel extension: the kernel stays one
-same-world process per Session, but its file effects now follow the same
+M9 (route A, revised after independent review) runs the Session Python kernel
+inside the DSH process sandbox instead of a bare host spawn. It reuses
+`ctx.sandbox` (bwrap / Landlock / Seatbelt / Windows ACL restricted-token) and
+the per-session policy from `ctx.sandboxPolicy`. The kernel stays one
+same-world process per Session; its file effects follow the same
 `read-only` / `workspace-write` / `danger-full-access` ladder as every other
 confined DSH capability. No container, microVM, remote executor, or public
 `KernelDriver` interface is introduced.
 
-A new `kernelSandbox` plugin option selects the behavior:
+New observable behavior, ratified as intentional M9 change:
 
-- `auto` (default): confine the kernel when the loaded runtime exposes the
-  official sandbox services and a backend is usable; otherwise keep the accepted
-  unconfined argv and surface `sandbox: none` once.
-- `require`: fail with a typed error before any Python starts when the sandbox
-  is unavailable; unconfined execution is never silently allowed.
-- `off`: preserve the accepted M1-M8 behavior exactly (trusted local execution).
+- `kernelSandbox` option: `auto` (default), `require`, `off`.
+- In base-backed profiles (which always mount sandbox + sandboxPolicy),
+  `auto` confines the kernel by default; this is a deliberate change from
+  the accepted M1-M8 trusted-local behavior and is recorded as such.
+- The confined kernel starts with the session workspace root as its working
+  directory, so relative Python paths resolve inside the workspace.
+- Under confinement, the M5 checkpoint stays host-private: bytes go over
+  bounded chunked protocol frames and the host atomically writes its own
+  private temp file. The kernel never writes a sandbox-visible checkpoint.
+- `read-only` still supports M5 because checkpointing no longer needs a
+  writable file path.
 
 ## Authority and API
 
-The executable authority is the exact loaded DSH Profile runtime, checked
-against the installed `@deepseek-ai/dsh-sandbox*` types and the fresh official
-upstream checkout. Relevant upstream facts:
+The executable authority is the exact loaded DSH Profile runtime. The plugin
+obtains the services lazily with `ctx.get("sandbox")` and
+`ctx.get("sandboxPolicy")`; they are NOT added to the `inject` list, which is
+a required-service list. `@deepseek-ai/dsh-sandbox` and
+`@deepseek-ai/dsh-sandbox-policy` are compile-time type authorities only.
 
-- `ctx.sandbox.confine(argv, policy)` (`@deepseek-ai/dsh-sandbox` seam,
-  `@deepseek-ai/dsh-sandbox-local` backend) returns `ConfinedArgv` containing
-  the wrapped argv plus `enforcement` (`full` / `partial`),
-  `denialSignatures`, and `runnerFailureRules`. The consumer spawns that argv;
-  everything the launched process spawns remains confined. If no backend is
-  usable it throws `SandboxUnavailableError` - a command never runs unconfined.
-- `ctx.sandboxPolicy.resolve({ session })` (`@deepseek-ai/dsh-sandbox-policy`)
-  returns `{ mode, workspaceRoot, sessionId? }`. The deployment default mode
-  (base default `workspace-write`; fail-safe `read-only`) plus the session
-  immutable `cwd` as the workspace root, with a session `sandbox/mode`
-  override folded from the Session log so it survives restart.
-- `danger-full-access` bypasses confinement and returns the caller argv
-  unchanged, which is exactly the accepted behavior.
+- `ctx.sandbox.confine(argv, policy)` returns `ConfinedArgv`
+  (`argv`, `enforcement` - `full` / `partial`, `denialSignatures`,
+  `runnerFailureRules`). `SandboxUnavailableError` is thrown only when no
+  runner chain is usable; on win32 the sole candidate is selected without a
+  probe, so an unusable runner surfaces as a post-spawn runner failure that
+  must be classified with `runnerFailureRules`, never as a denial.
+- `ctx.sandboxPolicy.resolve({ session })` returns
+  `{ mode, workspaceRoot, sessionId? }`: explicit approved mode, then the
+  folded session `sandbox/mode` event, then the deployment default
+  (base: `workspace-write`; fail-safe `read-only`). `workspaceRoot` is the
+  session immutable `cwd`.
+- `danger-full-access` returns the original argv unchanged = legacy
+  unconfined path; M9 treats it as confined=false for publication semantics.
 
-The plugin adds `sandbox` and `sandboxPolicy` as optional service injections
-and resolves the policy from the same Session that owns the kernel. The M2
-fixed environment allowlist is unchanged; Windows already allowlists
-`TEMP`/`TMP`, which the ACL runner rewrites for confined children.
+Kernel cwd contract (does not depend on runner inheritance): the host
+spawns the confined argv with `cwd: resolved.workspaceRoot` and also sends
+`workspaceRoot` in the init frame; the kernel changes its own working
+directory before the first cell. Relative writes therefore land inside the
+workspace under bwrap, Seastbelt, Landlock, and the Windows ACL runner alike.
+
+M5 transport contract: protocol bump to v4 adds bounded chunked frames for
+checkpoint publication and restore. Kernel emits chunks (each
+<= MAX_FRAME_BYTES) with sequence numbers and a final SHA-256; the host
+assembles, verifies, and atomically writes the host-private temp file
+(temp + rename). Recovery reverses it: the host reads its private file and
+sends chunks to the new kernel. `off` and `danger-full-access` keep the
+legacy file-path mechanism unchanged.
 
 ## State and failure semantics
 
-1. The first `rlm_eval` in a Session resolves the current policy once and calls
-   `confine` once; the returned argv is what the runtime spawns. Timeout,
-   cancellation, protocol frames, disposal, and process-tree kill semantics are
-   unchanged because the wrapped argv still yields one child process.
-2. **Birth-mode pinning.** The sandbox profile is fixed at spawn (mounts, ACL
-   token). A later session-wide mode switch does not re-confine a running
-   kernel; it takes effect on the next kernel (M6 reset). A switch intended to
-   stiffen a running kernel is an explicit limitation: advise reset.
-3. `require` plus an unusable backend fails closed before child admission or
-   subagent dispatch. `auto` plus an unusable backend falls back to the legacy
-   spawn and reports `sandbox: none` on kernel start; it never invents
-   confinement that is not enforced.
-4. `partial` enforcement (Windows ACL rung, older Landlock ABIs) is surfaced per
-   kernel start and never presented as full isolation.
-5. Runtime denials surface as ordinary Python `OSError` (EROFS / EACCES /
-   EPERM) and therefore as typed cell errors; `denialSignatures` are used only
-   for host diagnostics and never change cell semantics.
-6. M3 context loading is a read-only operation and remains allowed in every
-   mode. M5 checkpoint files and publication remain host-side and stay outside
-   the kernel confinement. M5 recovery starts a new kernel, which re-resolves
-   the current policy; M6 reset likewise. M7 batches and M8 continuable
-   children are host-side and unaffected.
+1. First `rlm_eval` resolves the policy once, calls `confine` exactly once,
+   spawns the returned argv, and the kernel confirms its cwd before ready.
+   Birth-mode pinning: a later session mode switch applies to the next
+   kernel (M6 reset), never to a running one.
+2. `require`: an unusable chain (`SandboxUnavailableError`) or a classified
+   runner failure before any frame is a typed failure; the kernel is never
+   admitted, no child work is admitted, and unconfined fallback is forbidden.
+3. `auto`: same fail-closed behavior on runner failure (a broken sandbox is
+   never silently bypassed); it falls back to the legacy unconfined path only
+   when the sandbox services are absent from the composition.
+4. `off`: exact legacy path, no policy resolution and no confine call.
+5. `partial` enforcement (Windows ACL rung, older Landlock ABIs) is surfaced
+   at kernel start and never presented as full isolation; Windows writes to
+   Everyone-granted or hard-link-aliased targets remain possible.
+6. Runtime denials surface as ordinary Python `OSError` (EROFS / EACCES /
+   EPERM) and therefore as typed cell errors; `denialSignatures` are used
+   only for host diagnostics.
+7. M3 context reading is allowed in every mode. M6 reset re-resolves and
+   re-confines. M7 batches and M8 continuable children are host-side.
+8. When confined, a POSIX kernel env pins `TMPDIR` to `/tmp` (bwrap/Landlock
+   temp root) so `tempfile` stays writable; the Windows ACL runner already
+   rewrites `TMP`/`TEMP`. The M2 allowlist itself is unchanged.
+9. Process cleanup: the PID the host sees may be the runner; the existing
+   tree-kill path must terminate runner plus descendants (bwrap
+   `--die-with-parent`, ACL child termination) — ownership stays one
+   Session, and dispose/docs state it as acceptance.
 
 ## Limits and non-goals
 
-M9 is same-world confinement only: the host kernel and filesystem are shared,
-reads and network are not confined, and Windows does not hide host process
-visibility (partial). It adds no container/remote executor, microVM, provider
-abstraction, custom runner, per-call escalation of a live kernel, resource
-limits (CPU/memory), network egress control, or public `KernelDriver`
-interface. A container/remote kernel remains a separate conditional extension
-(route B) and starts only from its own architecture contract and diagram.
+Same-world confinement only: host kernel and filesystem are shared; reads and
+network are not confined; Windows does not hide host process visibility
+(partial). No container/microVM/remote executor (route B stays a separate
+conditional extension with its own contract), no public `KernelDriver`
+interface, no provider abstraction, no custom runner, no per-call escalation
+of a live kernel, no CPU/memory limits, no network egress control. M5
+checkpoint remains bounded (<= 8 MiB), in-process-lifetime only (no
+host-restart promise).
 
-## TDD acceptance contract
+## TDD acceptance contract (successor)
 
-1. **RED:** the accepted M8 runtime spawns the kernel argv without consulting any
-   sandbox service (an injected sandbox stub observes zero confine calls).
-2. **GREEN:** with the official services mounted, the runtime resolves the owning
-   Session policy, calls `confine` exactly once per kernel start, and spawns
-   the returned argv; the spawned process facts prove confinement.
-3. **GREEN:** `require` with no usable backend fails typed before spawn with no
-   kernel and no child admission; `auto` falls back and surfaces `none`;
-   `off` keeps the legacy path byte-for-byte.
-4. **Behavior:** under resolved `workspace-write`, a cell write under
-   `workspaceRoot` succeeds and a write outside it fails with `OSError`;
-   `read-only` denies writes; `danger-full-access` remains unconfined.
-5. **Lifecycle:** reset and recovery re-resolve and re-confine; dispose kills only
-   the owned confined tree; M2 serialization/limits and M5/M6/M7/M8 boundaries
-   remain green; sandbox metadata is non-secret and never carries policy text
-   into Python.
-6. **Clean Profile:** a disposable installed Profile (base/headless bundle, this
-   host backend) proves a confined kernel end to end: in-workspace write OK,
-   out-of-workspace write denied under `workspace-write`, typed error, and the
-   Session log records the bounded result. Prefer DSV4-FVE; during outage record
-   the GLM fallback and re-run DSV4-FVE after recovery.
+1. **RED (test-only):** with a constructible `ctx` stub exposing recording
+   `sandbox` + `sandboxPolicy` services, the accepted M8 runtime consults
+   them zero times; the assertion of exactly-one `confine` call per kernel
+   start fails for the intended absence reason, with no production edits.
+2. **GREEN:** runtime resolves policy once, calls `confine` exactly once per
+   kernel start, spawns the returned argv with `cwd = workspaceRoot`, and the
+   kernel proves `os.getcwd() == workspaceRoot` before the first cell.
+3. **Behavior:** under `workspace-write`, a relative write inside `workspaceRoot`
+   succeeds and a write outside (workspace root or closed-ACL target on
+   Windows) fails with `OSError`; `read-only` denies writes;
+   `danger-full-access` bypasses; `require` fails typed on runner failure;
+   `auto` fails closed on runner failure and falls back only when services
+   are absent; `off` is byte-for-byte legacy.
+4. **M5 under confinement:** chunked checkpoint publication restores the same
+   supported state; the host file lives in host-private temp; values and
+   context text never appear in protocol-visible or model-visible data;
+   `read-only` still publishes without any file write by the kernel.
+5. **Lifecycle:** reset and recovery re-resolve; dispose kills the owned tree;
+   M2 serialization/limits and M4/M6/M7/M8 boundaries stay green.
+6. **Protocol:** v4 version negotiation; mismatch fails explicitly (M3 gate).
+7. **Clean Profile:** a disposable installed profile proves confined kernel,
+   workspace cwd, relative-write rules, and M5 restore end to end. Prefer
+   DSV4-FVE; during outage record the GLM fallback and re-run after recovery.
