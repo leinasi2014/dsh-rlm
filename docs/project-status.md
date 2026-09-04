@@ -23,16 +23,16 @@ holds Session-local globals, and asks the host for child calls.
 
 ## Publication baseline
 
-- Accepted milestone ladder: M1 through M8 on `main`.
+- Accepted milestone ladder: M1 through M12 on `main` (M9 sandbox-backed kernel, M10 cross-host durable persistence, M11 token guard, M12 job consumer).
 - Status date: 2026-09-04
 - Pinned references: `ref/rlm` and `ref/prime-agent`, used as design evidence,
   not literal compatibility targets
-- DSH source-freshness evidence for M8: official `master` at
-  `76fda729799fe9b3848dbe2c211d4b231032b81e` (ahead=0 behind=0) with the loaded
-  Profile runtime exercising the official continuable Subagent adapter
-- Current stage: M1-M7 are accepted baselines; M8 Continuable Spawn (Issue #39)
-  is accepted on `main` with final DSV4-FVE clean-Profile evidence. Conditional
-  future extensions remain trigger-gated.
+- DSH source-freshness evidence: official `master` at
+  `76fda729799fe9b3848dbe2c211d4b231032b81e` (ahead=0 behind=0); M9-M12 were
+  verified against the same isolated fresh checkout. Each milestone had a
+  DSV4-FVE (DeepSeek-V4-Flash-Vision-Exp) clean-Profile live smoke PASS.
+- Current stage: M1-M12 accepted on `main`. Conditional future extensions
+  remain trigger-gated.
 
 ## Delivered
 
