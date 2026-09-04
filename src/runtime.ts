@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -17,7 +17,7 @@ const KERNEL_PATH = path.resolve(
   'python-runtime',
   'rlm_kernel.py',
 )
-const PROTOCOL_VERSION = 3
+const PROTOCOL_VERSION = 4
 const DEFAULT_TIMEOUT = 30_000
 const DEFAULT_MAX_STDOUT = 64 * 1024
 const DEFAULT_MAX_RESULT = 64 * 1024
@@ -27,6 +27,7 @@ const DEFAULT_MAX_DEPTH = 1
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 const MAX_SNAPSHOT_ROOT_BYTES = 64 * 1024 * 1024
 const MAX_FRAME_BYTES = 256 * 1024
+const CHECKPOINT_CHUNK_BYTES = 128 * 1024
 const MAX_STDERR_BYTES = 64 * 1024
 const MAX_QUERY_RESULT_BYTES = 64 * 1024
 const STDERR_TRUNCATED_MARKER = ' [stderr truncated]'
@@ -455,6 +456,7 @@ class Kernel {
   private readonly snapshotPath: string | undefined
   private readonly launch: KernelLaunch | undefined
   private restoreSnapshot: boolean
+  private pendingChunks = new Map<number, { count: number; data: string[] }>()
   private readonly maxSnapshotBytes: number
   private retainCheckpoint = true
   /** Kernel capability token -> official child id. Never sent back to Python. */
@@ -606,6 +608,24 @@ class Kernel {
       case 'followup':
         this.onFollowup(frame)
         return
+      case 'checkpoint_chunk': {
+        const id = frame.id
+        const seq = frame.seq
+        const count = frame.count
+        const data = frame.data
+        if (typeof id !== 'number' || typeof seq !== 'number' || typeof count !== 'number' || typeof data !== 'string') {
+          this.handleExit(new RlmError('protocol', 'malformed checkpoint_chunk frame'))
+          return
+        }
+        const acc = this.pendingChunks.get(id) ?? { count, data: [] }
+        if (acc.count !== count) {
+          this.handleExit(new RlmError('protocol', 'checkpoint_chunk count mismatch'))
+          return
+        }
+        acc.data[seq] = data
+        this.pendingChunks.set(id, acc)
+        return
+      }
       case 'result':
         this.onResult(frame)
         return
@@ -851,6 +871,25 @@ class Kernel {
       truncated: frame.truncated === true,
     }
     if (typeof frame.result === 'string') out.result = frame.result
+    const chunks = this.pendingChunks.get(frame.id)
+    if (chunks && typeof frame.recovery === 'object' && frame.recovery !== null && !Array.isArray(frame.recovery)
+        && (frame.recovery as Record<string, unknown>).checkpoint_committed === true) {
+      const joined = chunks.data.join('')
+      const buffer = Buffer.from(joined, 'utf8')
+      try {
+        if (!this.snapshotPath) {
+          throw new Error('snapshot path is undefined')
+        }
+        const temp = this.snapshotPath + '.tmp-' + String(process.pid)
+        writeFileSync(temp, buffer)
+        renameSync(temp, this.snapshotPath)
+      } catch {
+        const rec = frame.recovery as Record<string, unknown>
+        rec.checkpoint_committed = false
+        rec.reason = 'host checkpoint write failed'
+      }
+      this.pendingChunks.delete(frame.id)
+    }
     if (frame.recovery && typeof frame.recovery === 'object' && !Array.isArray(frame.recovery)) {
       const recovery = frame.recovery as Record<string, unknown>
       out.recovery = {
@@ -1012,6 +1051,19 @@ class Kernel {
     })
   }
 
+  private sendRestoreChunks(): void {
+    if (!this.snapshotPath || !existsSync(this.snapshotPath)) {
+      throw new RlmError('snapshot', 'checkpoint file is missing before restore')
+    }
+    const payload = readFileSync(this.snapshotPath)
+    const total = Math.max(1, Math.ceil(payload.length / CHECKPOINT_CHUNK_BYTES))
+    for (let seq = 0; seq < total; seq++) {
+      const chunk = payload.subarray(seq * CHECKPOINT_CHUNK_BYTES, Math.min(payload.length, (seq + 1) * CHECKPOINT_CHUNK_BYTES))
+      this.write({ type: 'restore_chunk', seq, total, id: 0, data: chunk.toString('utf8') })
+    }
+    this.write({ type: 'restore_end', total })
+  }
+
   async evalCell(input: RlmCodeEvalInput, deadline?: number): Promise<RlmEvalOutput> {
     await this.ready
     if (this.exited || this.disposed) {
@@ -1042,16 +1094,19 @@ class Kernel {
       max_context_bytes: this.config.maxContextBytes,
     }
     if (this.launch) evalFrame.cwd = this.launch.cwd
+    const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch !== undefined
     if (this.config.snapshotRecovery && this.snapshotPath) {
       evalFrame.snapshot_recovery = true
-      evalFrame.snapshot_path = this.snapshotPath
       evalFrame.max_snapshot_bytes = this.maxSnapshotBytes
+      if (chunked) evalFrame.snapshot_chunked = true
+      else evalFrame.snapshot_path = this.snapshotPath
       if (this.restoreSnapshot) {
         // Recovery is a one-shot bootstrap action. Consume before writing so a
         // typed restore failure leaves this fresh kernel clean on its next
         // eval instead of replaying a stale/malformed checkpoint forever.
         this.restoreSnapshot = false
         evalFrame.restore_snapshot = true
+        if (chunked) this.sendRestoreChunks()
       }
     }
     if (input.contextPath !== undefined) evalFrame.context_path = input.contextPath

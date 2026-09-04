@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -84,7 +84,7 @@ class Kernel {
 async function ready(k: Kernel): Promise<void> {
   const frame = await k.next()
   assert.equal(frame.type, 'ready')
-  assert.equal(frame.version, 3)
+  assert.equal(frame.version, 4)
 }
 
 test('M1A: persistent globals and top-level await across cells', async () => {
@@ -1268,6 +1268,60 @@ test('M9 Issue#42: a classified sandbox runner failure is a typed sandbox error'
   }
 })
 
+
+test('M9 Issue#42: a confined M5 kernel restores a host-private chunked checkpoint', async () => {
+  const ws = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m9-m5-'))
+  let confineCount = 0
+  const sandbox = {
+    confine(argv: readonly string[]) { confineCount += 1; return { argv: [...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] } },
+  }
+  const fakeCtx = {
+    get(name: string) {
+      if (name === 'sandbox') return sandbox
+      if (name === 'sandboxPolicy') return { resolve() { return { mode: 'workspace-write', workspaceRoot: ws } } }
+      return undefined
+    },
+  } as unknown as Context
+  const runtime = createRlmRuntime(fakeCtx, { snapshotRecovery: true, timeout: 3_000 })
+  try {
+    await runtime.eval('m9-m5', { code: 'keep = 41' })
+    // Force a timeout so the kernel is evicted and M5 recovery starts a fresh one.
+    await assert.rejects(
+      runtime.eval('m9-m5', { code: 'import time\ntime.sleep(30)' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'timeout',
+    )
+    const restored = await runtime.eval('m9-m5', { code: 'keep + 1' })
+    assert.equal(restored.result, '42')
+    assert.equal(restored.recovery?.restored, true)
+    assert.equal(confineCount, 2, 'the recovery kernel must also be confined')
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('M9 Issue#42: confined M5 never writes the checkpoint into the sandbox workspace', async () => {
+  const ws = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m9-m5-priv-'))
+  const sandbox = {
+    confine(argv: readonly string[]) { return { argv: [...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] } },
+  }
+  const fakeCtx = {
+    get(name: string) {
+      if (name === 'sandbox') return sandbox
+      if (name === 'sandboxPolicy') return { resolve() { return { mode: 'workspace-write', workspaceRoot: ws } } }
+      return undefined
+    },
+  } as unknown as Context
+  const runtime = createRlmRuntime(fakeCtx, { snapshotRecovery: true, timeout: 10_000 })
+  try {
+    const out = await runtime.eval('m9-m5-priv', { code: 'x = 7' })
+    assert.equal(out.recovery?.checkpointCommitted, true)
+    const leaked = readdirSync(ws)
+    assert.deepEqual(leaked, [], 'checkpoint must not be written into the sandbox-visible workspace')
+  } finally {
+    await runtime.dispose()
+  }
+})
+
 // ---- M1C/M1D: DSH tool registration and rlm_query -> one-shot Subagent bridge ----
 
 import { registerRlmPlugin } from '../src/runtime.ts'
@@ -2116,7 +2170,7 @@ test('M2 Issue#1 successor: startup and cell share one total deadline', async ()
       `import time
 time.sleep(0.5)
 import sys, json
-sys.stdout.write(json.dumps({"type": "ready", "version": 3}) + "\\n")
+sys.stdout.write(json.dumps({"type": "ready", "version": 4}) + "\\n")
 sys.stdout.flush()`,
       async (pidFile) => {
         const start = Date.now()
