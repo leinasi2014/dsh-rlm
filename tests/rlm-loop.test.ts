@@ -1139,6 +1139,135 @@ test('M9 Issue#42 RED: a sandbox-enabled runtime confines each kernel start exac
   }
 })
 
+
+test('M9 Issue#42: a confined kernel starts in the sandbox workspace root and relative writes land there', async () => {
+  const ws = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m9-ws-'))
+  let policy: { mode: string; workspaceRoot: string } | undefined
+  let confineCount = 0
+  const sandbox = {
+    confine(argv: readonly string[], p: { mode: string; workspaceRoot: string }) {
+      confineCount += 1
+      policy = p
+      return { argv: [...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] }
+    },
+  }
+  const policyService = { resolve() { return { mode: 'workspace-write', workspaceRoot: ws } } }
+  const fakeCtx = {
+    get(name: string) {
+      if (name === 'sandbox') return sandbox
+      if (name === 'sandboxPolicy') return policyService
+      return undefined
+    },
+  } as unknown as Context
+  const runtime = createRlmRuntime(fakeCtx, {})
+  try {
+    const cwdOut = await runtime.eval('m9-cwd', { code: 'import os\nos.getcwd()' })
+    assert.equal(cwdOut.result, ws)
+    const writeOut = await runtime.eval('m9-cwd', { code: "open('rel.txt', 'w').write('ok')\n'written'" })
+    assert.equal(writeOut.result, 'written')
+    assert.equal(readFileSync(path.join(ws, 'rel.txt'), 'utf8'), 'ok')
+    assert.equal(confineCount, 1, 'one kernel start must call confine exactly once')
+    assert.deepEqual(policy, { mode: 'workspace-write', workspaceRoot: ws })
+  } finally {
+    await runtime.dispose()
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try { rmSync(ws, { recursive: true, force: true }); break } catch { await new Promise((res) => setTimeout(res, 100)) }
+    }
+  }
+})
+
+test('M9 Issue#42: require fails closed when the sandbox services are absent', async () => {
+  const runtime = createRlmRuntime(undefined, { kernelSandbox: 'require' })
+  try {
+    await assert.rejects(
+      runtime.eval('m9-require', { code: '1' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'sandbox',
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M9 Issue#42: auto keeps the legacy trusted spawn when services are absent', async () => {
+  const runtime = createRlmRuntime(undefined, {})
+  try {
+    const out = await runtime.eval('m9-auto-absent', { code: '2 + 2' })
+    assert.equal(out.result, '4')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M9 Issue#42: off never consults a present sandbox service', async () => {
+  let confineCount = 0
+  const sandbox = {
+    confine(argv: readonly string[]) { confineCount += 1; return { argv: [...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] } },
+  }
+  const fakeCtx = {
+    get(name: string) {
+      if (name === 'sandbox') return sandbox
+      if (name === 'sandboxPolicy') return { resolve() { return { mode: 'workspace-write', workspaceRoot: process.cwd() } } }
+      return undefined
+    },
+  } as unknown as Context
+  const runtime = createRlmRuntime(fakeCtx, { kernelSandbox: 'off' })
+  try {
+    const out = await runtime.eval('m9-off', { code: '6 * 7' })
+    assert.equal(out.result, '42')
+    assert.equal(confineCount, 0, 'off must not consult the sandbox service')
+  } finally {
+    runtime.dispose()
+  }
+})
+
+test('M9 Issue#42: a present but unusable sandbox fails closed for auto and require', async () => {
+  for (const kernelSandbox of ['auto', 'require'] as const) {
+    const sandbox = {
+      confine() { throw new Error('chain unavailable') },
+    }
+    const fakeCtx = {
+      get(name: string) {
+        if (name === 'sandbox') return sandbox
+        if (name === 'sandboxPolicy') return { resolve() { return { mode: 'workspace-write', workspaceRoot: process.cwd() } } }
+        return undefined
+      },
+    } as unknown as Context
+    const runtime = createRlmRuntime(fakeCtx, { kernelSandbox })
+    try {
+      await assert.rejects(
+        runtime.eval('m9-unusable-' + kernelSandbox, { code: '1' }),
+        (err: unknown) => err instanceof RlmError && err.kind === 'sandbox',
+      )
+    } finally {
+      runtime.dispose()
+    }
+  }
+})
+
+test('M9 Issue#42: a classified sandbox runner failure is a typed sandbox error', async () => {
+  const sandbox = {
+    confine(argv: readonly string[]) {
+      return { argv: ['dsh-rlm-no-such-runner'], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] }
+    },
+  }
+  const fakeCtx = {
+    get(name: string) {
+      if (name === 'sandbox') return sandbox
+      if (name === 'sandboxPolicy') return { resolve() { return { mode: 'workspace-write', workspaceRoot: process.cwd() } } }
+      return undefined
+    },
+  } as unknown as Context
+  const runtime = createRlmRuntime(fakeCtx, {})
+  try {
+    await assert.rejects(
+      runtime.eval('m9-runner-fail', { code: '1' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'sandbox',
+    )
+  } finally {
+    runtime.dispose()
+  }
+})
+
 // ---- M1C/M1D: DSH tool registration and rlm_query -> one-shot Subagent bridge ----
 
 import { registerRlmPlugin } from '../src/runtime.ts'

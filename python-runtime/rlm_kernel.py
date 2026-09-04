@@ -1038,6 +1038,7 @@ class RlmKernel:
         snapshot_path = frame.get("snapshot_path")
         max_snapshot_bytes = frame.get("max_snapshot_bytes", DEFAULT_MAX_SNAPSHOT_BYTES)
         restore_snapshot = frame.get("restore_snapshot", False)
+        cwd = frame.get("cwd")
         if (
             not isinstance(max_stdout, int)
             or not isinstance(max_result, int)
@@ -1053,12 +1054,22 @@ class RlmKernel:
         if context_path is not None and not isinstance(context_path, str):
             self._fatal("invalid context_path in eval frame: " + repr(frame))
             return
+        if cwd is not None and not isinstance(cwd, str):
+            self._fatal("invalid cwd in eval frame: " + repr(frame))
+            return
         if type(snapshot_recovery) is not bool or type(restore_snapshot) is not bool:
             self._fatal("invalid snapshot recovery flags in eval frame: " + repr(frame))
             return
         if snapshot_recovery and (not isinstance(snapshot_path, str) or not snapshot_path):
             self._fatal("invalid snapshot_path in eval frame: " + repr(frame))
             return
+        if cwd is not None and str(cwd):
+            try:
+                os.chdir(str(cwd))
+            except OSError as exc:
+                self._send(self._error_frame(eval_id, "eval", "eval_error", exc))
+                return
+
         recovery: Optional[dict[str, Any]] = None
         if restore_snapshot:
             try:

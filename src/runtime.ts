@@ -40,6 +40,35 @@ const QUERY_ERROR_TRUNCATED_MARKER = ' [query error truncated]'
  */
 const DELIVER_SUBAGENT_PROMPT = Symbol.for('dsh.subagent.deliverPrompt')
 
+interface SandboxPolicy {
+  mode: 'read-only' | 'workspace-write' | 'danger-full-access'
+  workspaceRoot: string
+}
+
+interface SandboxConfined {
+  argv: readonly string[]
+  enforcement: 'full' | 'partial'
+  denialSignatures: readonly string[]
+  runnerFailureRules: readonly unknown[]
+}
+
+interface SandboxPolicyService {
+  resolve(request?: { session?: unknown }): SandboxPolicy
+}
+
+interface SandboxProvider {
+  confine(argv: readonly string[], policy: SandboxPolicy): SandboxConfined
+}
+
+interface KernelLaunch {
+  argv: string[]
+  cwd: string
+  mode: SandboxPolicy['mode']
+  enforcement: string
+  denialSignatures: readonly string[]
+  runnerFailureRules: readonly unknown[]
+}
+
 interface HostPromptDeliverer {
   [DELIVER_SUBAGENT_PROMPT](parent: Agent, childId: unknown, content: unknown[], source: unknown, signal: AbortSignal, delivery: 'queue' | 'steer'): Promise<unknown>
 }
@@ -231,6 +260,8 @@ export interface RlmRuntimeConfig {
   maxQueries?: number
   /** Byte cap for one kernel-managed UTF-8 context file. */
   maxContextBytes?: number
+  /** Sandbox confinement for the Session Python kernel. */
+  kernelSandbox?: 'auto' | 'require' | 'off'
   /** Opt-in M5 recovery after an owned timeout/crash/protocol-fatal loss. */
   snapshotRecovery?: boolean
 }
@@ -257,6 +288,7 @@ export const ConfigSchema: z<RlmPluginConfig> = z.object({
   maxResult: z.natural().min(1024).max(262144).default(65536).description('Byte cap for a cell last-expression result.'),
   maxQueries: z.natural().min(1).max(4096).default(16).description('Max rlm_query calls per cell.'),
   maxContextBytes: z.natural().min(1048576).max(1073741824).default(67108864).description('Byte cap for one kernel-managed UTF-8 context file.'),
+  kernelSandbox: z.union([z.const('auto'), z.const('require'), z.const('off')]).default('auto').description('Sandbox confinement for the Session Python kernel: auto uses DSH ctx.sandbox when available, require fails closed, off keeps trusted local spawn.'),
   snapshotRecovery: z.boolean().default(false).description('Restore a private bounded checkpoint after an owned kernel fault.'),
   maxDepth: z.natural().min(1).max(8).default(DEFAULT_MAX_DEPTH).description('Absolute DSH delegation-depth cap for recursive rlm_query children.'),
 })
@@ -275,6 +307,8 @@ export interface RlmCodeEvalInput extends RlmEvalCommon {
   code: string
   /** Optional absolute UTF-8 regular file loaded by the session kernel. */
   contextPath?: string
+  /** Internal: the official Session used to resolve the sandbox policy for this kernel. */
+  session?: unknown
   /** Overrides the runtime's total timeout budget for this call (startup + cell). */
   timeout?: number
   /**
@@ -326,6 +360,7 @@ export type RlmErrorKind =
   | 'query' // an rlm_query call failed
   | 'context' // a managed context source was rejected atomically
   | 'snapshot' // a private M5 checkpoint failed closed
+  | 'sandbox' // the DSH sandbox could not confine the kernel
   | 'protocol' // the kernel violated the protocol and was terminated
 
 export class RlmError extends Error {
@@ -418,6 +453,7 @@ class Kernel {
   private evicted = false
   private disposedPromise: Promise<void> | undefined
   private readonly snapshotPath: string | undefined
+  private readonly launch: KernelLaunch | undefined
   private restoreSnapshot: boolean
   private readonly maxSnapshotBytes: number
   private retainCheckpoint = true
@@ -425,7 +461,7 @@ class Kernel {
   private continuableChildren = new Map<string, string>()
   onExit: ((k: Kernel) => void) | null = null
 
-  constructor(key: string, config: RlmRuntimeConfig, snapshot?: { path: string; restore: boolean; maxBytes: number }) {
+  constructor(key: string, config: RlmRuntimeConfig, snapshot?: { path: string; restore: boolean; maxBytes: number }, launch?: KernelLaunch) {
     this.key = key
     this.config = {
       python: config.python ?? 'python',
@@ -437,6 +473,7 @@ class Kernel {
       snapshotRecovery: config.snapshotRecovery ?? false,
     }
     this.snapshotPath = snapshot?.path
+    this.launch = launch
     this.restoreSnapshot = snapshot?.restore === true
     this.maxSnapshotBytes = snapshot?.maxBytes ?? 0
     this.ready = new Promise<void>((resolve, reject) => {
@@ -452,12 +489,20 @@ class Kernel {
       windowsHide: true,
       env: collectKernelEnv(process.env, process.platform),
     }
+    if (this.launch) {
+      opts.cwd = this.launch.cwd
+      if (process.platform !== 'win32') opts.env!.TMPDIR = '/tmp'
+    }
     if (process.platform !== 'win32') opts.detached = true
     let child: ChildProcess
     try {
-      child = spawn(this.config.python, [KERNEL_PATH], opts)
+      child = this.launch
+        ? spawn(this.launch.argv[0]!, this.launch.argv.slice(1), opts)
+        : spawn(this.config.python, [KERNEL_PATH], opts)
     } catch (err) {
-      this.rejectReady(new RlmError('spawn', String(err)))
+      this.rejectReady(this.launch
+        ? new RlmError('sandbox', 'sandboxed kernel launch failed: ' + String(err))
+        : new RlmError('spawn', String(err)))
       return
     }
     this.child = child
@@ -480,12 +525,16 @@ class Kernel {
       }
     })
     child.on('error', (err) => {
-      this.handleExit(new RlmError('spawn', String(err)))
+      this.handleExit(this.launch && !this.readyDone
+        ? new RlmError('sandbox', 'sandbox runner failed: ' + String(err))
+        : new RlmError('spawn', String(err)))
     })
     child.on('close', () => {
       let detail = this.stderr.trim()
       if (this.stderrTruncated) detail += STDERR_TRUNCATED_MARKER
-      this.handleExit(new RlmError('closed', 'kernel exited', { detailed: detail }))
+      this.handleExit(this.launch && !this.readyDone
+        ? new RlmError('sandbox', 'sandbox runner exited before the kernel became ready', { detailed: detail })
+        : new RlmError('closed', 'kernel exited', { detailed: detail }))
     })
   }
 
@@ -992,6 +1041,7 @@ class Kernel {
       max_result: this.config.maxResult,
       max_context_bytes: this.config.maxContextBytes,
     }
+    if (this.launch) evalFrame.cwd = this.launch.cwd
     if (this.config.snapshotRecovery && this.snapshotPath) {
       evalFrame.snapshot_recovery = true
       evalFrame.snapshot_path = this.snapshotPath
@@ -1232,10 +1282,12 @@ class RlmRuntimeImpl implements RlmRuntime {
   private queues = new Map<string, QueuedEval[]>()
   private drains = new Map<string, Promise<void>>()
   private config: RlmRuntimeConfig
+  private readonly ctx: Context | undefined
   private disposed = false
   private disposePromise: Promise<void> | undefined
-  constructor(config: RlmRuntimeConfig) {
+  constructor(config: RlmRuntimeConfig, ctx?: Context) {
     this.config = config
+    this.ctx = ctx
     if (config.snapshotRecovery === true) {
       this.checkpointRoot = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m5-'))
     }
@@ -1262,6 +1314,44 @@ class RlmRuntimeImpl implements RlmRuntime {
     if (this.checkpointRoot) rmSync(this.checkpointPath(sessionKey), { force: true })
   }
 
+  private readService<T>(name: string): T | undefined {
+    const accessor = this.ctx as unknown as { get?: (key: string) => unknown } | undefined
+    return accessor?.get?.(name) as T | undefined
+  }
+
+  /**
+   * Resolve exactly one kernel launch per Session kernel start (M9).
+   * 'off' keeps the legacy trusted spawn. 'auto' falls back to legacy only
+   * when the DSH sandbox services are absent; 'require' fails closed. A
+   * present sandbox that cannot confine always fails closed for both.
+   */
+  private resolveKernelLaunch(session?: unknown): KernelLaunch | undefined {
+    const mode = this.config.kernelSandbox ?? 'auto'
+    if (mode === 'off') return undefined
+    const provider = this.readService<SandboxProvider>('sandbox')
+    const policyService = this.readService<SandboxPolicyService>('sandboxPolicy')
+    if (!provider || !policyService) {
+      if (mode === 'require') {
+        throw new RlmError('sandbox', 'kernelSandbox=require but no DSH sandbox services are available')
+      }
+      return undefined
+    }
+    const policy = policyService.resolve(session === undefined ? {} : { session })
+    let confined: SandboxConfined
+    try {
+      confined = provider.confine([this.config.python ?? 'python', KERNEL_PATH], policy)
+    } catch (err) {
+      throw new RlmError('sandbox', 'DSH sandbox cannot confine the kernel: ' + String(err))
+    }
+    return {
+      argv: [...confined.argv],
+      cwd: policy.workspaceRoot,
+      mode: policy.mode,
+      enforcement: confined.enforcement,
+      denialSignatures: [...confined.denialSignatures],
+      runnerFailureRules: [...confined.runnerFailureRules],
+    }
+  }
   async eval(sessionKey: string, input: RlmEvalInput): Promise<RlmEvalOutput> {
     // A pre-aborted signal never starts a session kernel and never queues work.
     if (input.signal?.aborted) {
@@ -1463,7 +1553,8 @@ class RlmRuntimeImpl implements RlmRuntime {
       // old kernel before the next dequeue, so an entry can never reuse a dead one.
       let kernel = this.kernels.get(sessionKey)
       if (!kernel) {
-        kernel = new Kernel(sessionKey, this.config, this.snapshotFor(sessionKey))
+        const launch = this.resolveKernelLaunch((entry.input as { session?: unknown }).session)
+        kernel = new Kernel(sessionKey, this.config, this.snapshotFor(sessionKey), launch)
         kernel.onExit = (exited) => {
           if (this.kernels.get(sessionKey) === kernel) this.kernels.delete(sessionKey)
           if (!exited.keepsCheckpoint || !this.checkpoints.has(sessionKey)) this.dropCheckpoint(sessionKey)
@@ -1522,10 +1613,10 @@ class RlmRuntimeImpl implements RlmRuntime {
  * one kernel and one globals namespace.
  */
 export function createRlmRuntime(
-  _ctx: Context | undefined,
+  ctx: Context | undefined,
   config: RlmRuntimeConfig,
 ): RlmRuntime {
-  return new RlmRuntimeImpl(config)
+  return new RlmRuntimeImpl(config, ctx)
 }
 
 // ---- M1C/M1D: DSH tool registration and rlm_query -> one-shot Subagent bridge ----
@@ -1752,6 +1843,7 @@ export function registerRlmPlugin(
           input = {
             code: args.code,
             signal: exec.signal,
+            session: parent.session,
             onQuery: async (prompt: string, cellSignal: AbortSignal) =>
               runQuery(ctx, provider, parent, prompt, cellSignal, maxDepth),
             onSpawn: async (prompt: string, cellSignal: AbortSignal) => {
