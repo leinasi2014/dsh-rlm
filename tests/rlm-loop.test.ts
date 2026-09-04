@@ -1494,6 +1494,22 @@ function makeMockCtx(options: {
   return m
 }
 
+
+test('M11 Issue#46 RED: a token guard consults recorded measure on the accepted M10 base', async () => {
+  const measureCalls: unknown[] = []
+  const m = makeMockCtx({ queryText: 'ok' })
+  m.ctx.tokenMeter = { measure(session: unknown) { measureCalls.push(session); return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } } }
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', guardQueryTokens: true, maxQueryTokensPerCell: 100 })
+  const tool = m.registered[0]
+  try {
+    const out = await tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-red'))
+    assert.ok(out, 'tool executed')
+    assert.equal(measureCalls.length, 1, 'guard must record exactly one measure call per query admission')
+  } finally {
+    await m.teardown?.()
+  }
+})
+
 test('M1C: rlm_eval is registered only when the plugin is enabled', () => {
   const disabled = makeMockCtx()
   registerRlmPlugin(disabled.ctx, { enabled: false })
