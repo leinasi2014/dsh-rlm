@@ -39,7 +39,7 @@ the fields the card renders:
 | `durableRoot` | text (path) | none | M10 host-private durable root |
 | `guardQueryTokens` | toggle | `false` | M11 observed-token guard |
 | `maxQueryTokensPerCell` | number | `0` | M11 ceiling; 0 = off |
-| `maxDepth` | number | `8` | M4 delegation-depth cap |
+| `maxDepth` | number | `1` | M4 delegation-depth cap (schema default; DSH absolute cap is 8) |
 
 ### B. Required-to-configure (validated, no safe runtime default)
 

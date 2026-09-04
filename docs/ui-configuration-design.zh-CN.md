@@ -34,7 +34,7 @@ DSH 所有的 settings 命名空间；Host 运行时消费与今天 `cordis.patc
 | `durableRoot` | 文本（路径） | 无 | M10 宿主机私有持久根 |
 | `guardQueryTokens` | 开关 | `false` | M11 观测 token 护栏 |
 | `maxQueryTokensPerCell` | 数字 | `0` | M11 上限；0 = 关闭 |
-| `maxDepth` | 数字 | `8` | M4 委派深度上限 |
+| `maxDepth` | 数字 | `1` | M4 委派深度上限（schema 默认值；DSH 绝对上限为 8） |
 
 ### B. 必须配置（校验，无安全运行时默认值）
 
