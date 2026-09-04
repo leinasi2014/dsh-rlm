@@ -1983,18 +1983,32 @@ export function startRlmJob(
   code: string,
   runtime: RlmRuntime,
 ): unknown {
-  const jobs = ctx as unknown as { jobs?: RlmJobsLike } | undefined
-  if (!jobs?.jobs || typeof jobs.jobs.start !== 'function') {
+  const jobs = readJobsService(ctx)
+  if (!jobs || typeof jobs.start !== 'function') {
     throw new RlmError('eval', 'background jobs unavailable: no ctx.jobs service is mounted')
   }
-  return jobs.jobs.start(createRlmJobSpec(parent, code, runtime))
+  return jobs.start(createRlmJobSpec(parent, code, runtime))
 }
 
 /** Register the 'rlm' job controller when the DSH jobs surface is mounted (M12). */
+function readJobsService(ctx: Context): RlmJobsLike | undefined {
+  // Non-strict lazy read first: cordis throws on undeclared property access,
+  // so a missing jobs service must never break a jobs-less profile.
+  const accessor = ctx as unknown as { get?: (key: string, strict?: boolean) => unknown; jobs?: RlmJobsLike } | undefined
+  let jobs: RlmJobsLike | undefined
+  if (typeof accessor?.get === 'function') {
+    try { jobs = accessor.get('jobs', false) as RlmJobsLike | undefined } catch { jobs = undefined }
+  }
+  if (!jobs) {
+    try { jobs = accessor?.jobs } catch { jobs = undefined }
+  }
+  return jobs && typeof jobs.attachController === 'function' ? jobs : undefined
+}
+
 function attachRlmJobController(ctx: Context): (() => void) | undefined {
-  const jobs = ctx as unknown as { jobs?: RlmJobsLike } | undefined
-  if (!jobs?.jobs || typeof jobs.jobs.attachController !== 'function') return undefined
-  return jobs.jobs.attachController('rlm')
+  const jobs = readJobsService(ctx)
+  if (!jobs) return undefined
+  return jobs.attachController('rlm')
 }
 
 export function registerRlmPlugin(

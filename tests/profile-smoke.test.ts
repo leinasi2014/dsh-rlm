@@ -1189,3 +1189,69 @@ test('M11 Issue#46: a fresh installed Profile lets a query through under the obs
   }
 })
 
+test('M12 Issue#48: a fresh installed Profile loads with the rlm job surface attached', { timeout: 15 * 60_000 }, async (t) => {
+  if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the M12 job-surface acceptance'); return }
+  const ambientHome = process.env.DSH_HOME
+  if (!ambientHome || !fs.existsSync(path.join(ambientHome, 'settings.yaml'))) {
+    t.skip('DSH_HOME with settings.yaml is required; it supplies the configured provider and credential refs')
+    return
+  }
+  assert.ok(fs.existsSync(BIN), 'DSH harness bin.ts not found at ' + REPO_ROOT)
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m12-spawn-'))
+  const profileDir = path.join(home, 'profiles', PROFILE)
+  fs.mkdirSync(path.join(home, 'profiles'), { recursive: true })
+  const ambientSettingsPath = path.join(ambientHome, 'settings.yaml')
+  const ambientSettingsBytes = fs.readFileSync(ambientSettingsPath)
+  const ambientCredsPath = path.join(ambientHome, '.credentials.yaml')
+  const ambientCredsBytes = fs.existsSync(ambientCredsPath) ? fs.readFileSync(ambientCredsPath) : null
+  const copiedSettings = replaceAgentDefaultModel(ambientSettingsBytes.toString('utf8'), LIVE_PROVIDER, LIVE_MODEL)
+    .replace(/defaultPreset: danger-full-access/, 'defaultPreset: workspace-write')
+  fs.writeFileSync(path.join(home, 'settings.yaml'), copiedSettings)
+  if (ambientCredsBytes !== null) fs.writeFileSync(path.join(home, '.credentials.yaml'), ambientCredsBytes)
+  const env = { DSH_HOME: home, DSH_PERMISSION_MODE: 'workspace-write' }
+  const task = [
+    'You are validating M12 job surface. Call rlm_eval exactly once with exactly this Python source:',
+    "'42 + 1'",
+    '',
+    'Then, WITHOUT starting a job, check the official jobs tool (list) and reply exactly M12_PROFILE_OK when the rlm_eval result succeeded.',
+  ].join('\n')
+  try {
+    const add = runDsh(['plugin', '--profile', PROFILE, 'add', '-w', PKG_ROOT], env, REPO_ROOT, 180_000)
+    assert.equal(add.status, 0, 'dsh plugin add failed: ' + add.stderr)
+    assert.ok(fs.existsSync(path.join(profileDir, 'node_modules', 'dsh-rlm')), 'dsh-rlm not installed into the profile')
+    const manifestPath = path.join(profileDir, 'package.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    manifest.dsh = { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'] } }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+    fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), [
+      '- insert:',
+      '    - id: rlm',
+      '      name: dsh-rlm',
+      '      config:',
+      '        enabled: true',
+      '        provider: spawn',
+      '        kernelSandbox: auto',
+      '        timeout: 60000',
+      '',
+    ].join('\n'))
+
+    const run = runDsh(['--profile', PROFILE, task], env, home, 12 * 60_000)
+    const outTail = run.stdout.slice(-1200)
+    assert.equal(run.status, 0, 'M12 headless journey failed: ' + outTail + ' ' + run.stderr.slice(-600))
+    assert.match(outTail, /M12_PROFILE_OK/, 'headless agent did not confirm M12_PROFILE_OK: ' + outTail.slice(-200))
+    const logs = await readSessionLogs(home)
+    const main = [...logs.values()].find((text) => JSON.parse(text.split('\n')[0]).delegationDepth === 0)
+    assert.ok(main, 'no main Session log after M12 journey')
+    const outcomes = toolOutcomes(main, 'rlm_eval')
+    assert.equal(outcomes.length, 1, 'M12 must have one rlm_eval outcome')
+    assert.equal(outcomes[0].result?.isError, false, 'rlm_eval must succeed in the M12 profile')
+  } finally {
+    try {
+      assert.ok(ambientSettingsBytes.equals(fs.readFileSync(ambientSettingsPath)), 'ambient settings.yaml was modified by the M12 smoke')
+      if (ambientCredsBytes !== null) assert.ok(ambientCredsBytes.equals(fs.readFileSync(ambientCredsPath)), 'ambient .credentials.yaml was modified by the M12 smoke')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+    }
+  }
+})
+
