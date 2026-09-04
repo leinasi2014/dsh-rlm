@@ -1,0 +1,210 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "dsh-rlm GUI Plugin Configuration",
+    "locale": "en",
+    "quality_profile": "showcase",
+    "viewBox": [
+      1140,
+      560
+    ],
+    "repository": {
+      "url": "https://github.com/leinasi2014/dsh-rlm.git",
+      "revision": "b054d4a5685a4f3969e0741be129e9d4546b4378"
+    }
+  },
+  "components": [
+    {
+      "id": "settings",
+      "type": "external",
+      "label": "DSH Settings UI",
+      "sublabel": "Settings > Plugins > Plugin configuration",
+      "pos": [
+        40,
+        90
+      ],
+      "size": [
+        210,
+        72
+      ]
+    },
+    {
+      "id": "card",
+      "type": "frontend",
+      "label": "RlmSettingsCard",
+      "sublabel": "staged Draft + override + restart",
+      "pos": [
+        300,
+        90
+      ],
+      "size": [
+        210,
+        72
+      ]
+    },
+    {
+      "id": "slot",
+      "type": "messagebus",
+      "label": "settings.plugin.item",
+      "sublabel": "keyed by rlm namespace",
+      "pos": [
+        560,
+        90
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "scope",
+      "type": "backend",
+      "label": "settingsScope.bind(rlm)",
+      "sublabel": "user layer over composition",
+      "pos": [
+        820,
+        90
+      ],
+      "size": [
+        190,
+        72
+      ]
+    },
+    {
+      "id": "host",
+      "type": "backend",
+      "label": "dsh-rlm Host",
+      "sublabel": "ConfigSchema + settings namespace merge",
+      "pos": [
+        820,
+        340
+      ],
+      "size": [
+        190,
+        72
+      ],
+      "sources": [
+        {
+          "path": "src/runtime.ts",
+          "label": "host runtime"
+        }
+      ]
+    },
+    {
+      "id": "runtime",
+      "type": "backend",
+      "label": "RLM Runtime",
+      "sublabel": "normalized config -> kernel/bridge",
+      "pos": [
+        560,
+        340
+      ],
+      "size": [
+        190,
+        72
+      ]
+    }
+  ],
+  "boundaries": [
+    {
+      "kind": "region",
+      "label": "CLI + UI share one authority: user layer > composition layer > schema default",
+      "wraps": [
+        "scope",
+        "host",
+        "runtime"
+      ]
+    },
+    {
+      "kind": "security-group",
+      "label": "DSH-owned surface: no duplicate schema, no second storage",
+      "wraps": [
+        "card",
+        "slot",
+        "scope"
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "edit",
+      "from": "settings",
+      "to": "card",
+      "label": "configure",
+      "variant": "emphasis"
+    },
+    {
+      "id": "register",
+      "from": "card",
+      "to": "slot",
+      "label": "register card",
+      "variant": "security",
+      "labelAt": [
+        535,
+        180
+      ]
+    },
+    {
+      "id": "dispatch",
+      "from": "slot",
+      "to": "scope",
+      "label": "key = rlm namespace",
+      "variant": "security",
+      "labelAt": [
+        785,
+        180
+      ]
+    },
+    {
+      "id": "save",
+      "from": "scope",
+      "to": "host",
+      "label": "staged write (revision fenced)",
+      "variant": "dashed",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelAt": [
+        915,
+        180
+      ]
+    },
+    {
+      "id": "merge",
+      "from": "host",
+      "to": "runtime",
+      "label": "normalized config",
+      "variant": "emphasis",
+      "labelAt": [
+        785,
+        440
+      ]
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "Outcome",
+      "items": [
+        "DSH-native plugin settings card",
+        "CLI (cordis) and UI one authority"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "Authority",
+      "items": [
+        "Official settingsNamespace + settings.plugin.item",
+        "ConfigSchema stays single validator"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "Non-goals",
+      "items": [
+        "No kernel/protocol constants exposed",
+        "No second storage or settings UI system"
+      ]
+    }
+  ]
+}
