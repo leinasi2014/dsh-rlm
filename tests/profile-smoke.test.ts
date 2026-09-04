@@ -1018,3 +1018,107 @@ test('M9 Issue#42: a fresh installed Profile confines the kernel to the Session 
   }
 })
 
+test('M10 Issue#44: a fresh installed Profile resumes the same Session after a runtime restart', { timeout: 15 * 60_000 }, async (t) => {
+  if (!LIVE) { t.skip('set RLM_LIVE_SMOKE=1 to run the M10 durable persistence acceptance'); return }
+  const ambientHome = process.env.DSH_HOME
+  if (!ambientHome || !fs.existsSync(path.join(ambientHome, 'settings.yaml'))) {
+    t.skip('DSH_HOME with settings.yaml is required; it supplies the configured provider and credential refs')
+    return
+  }
+  assert.ok(fs.existsSync(BIN), 'DSH harness bin.ts not found at ' + REPO_ROOT)
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m10-spawn-'))
+  const durable = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m10-durable-'))
+  const profileDir = path.join(home, 'profiles', PROFILE)
+  fs.mkdirSync(path.join(home, 'profiles'), { recursive: true })
+  const ambientSettingsPath = path.join(ambientHome, 'settings.yaml')
+  const ambientSettingsBytes = fs.readFileSync(ambientSettingsPath)
+  const ambientCredsPath = path.join(ambientHome, '.credentials.yaml')
+  const ambientCredsBytes = fs.existsSync(ambientCredsPath) ? fs.readFileSync(ambientCredsPath) : null
+  const copiedSettings = replaceAgentDefaultModel(ambientSettingsBytes.toString('utf8'), LIVE_PROVIDER, LIVE_MODEL)
+    .replace(/defaultPreset: danger-full-access/, 'defaultPreset: workspace-write')
+  fs.writeFileSync(path.join(home, 'settings.yaml'), copiedSettings)
+  if (ambientCredsBytes !== null) fs.writeFileSync(path.join(home, '.credentials.yaml'), ambientCredsBytes)
+  const env = { DSH_HOME: home, DSH_PERMISSION_MODE: 'workspace-write' }
+  const cell1 = [
+    "from pathlib import Path",
+    "p = Path('m10_value.txt')",
+    "p.write_text('41')",
+    "value = 41",
+    "p.read_text()",
+  ].join('\\n')
+  const cell2 = [
+    "from pathlib import Path",
+    "value + 1",
+    "Path('m10_value.txt').read_text()",
+  ].join('\\n')
+  const task = [
+    'You are validating M10 durable persistence. Call rlm_eval EXACTLY once with this exact Python source (do not change it):',
+    cell1,
+    '',
+    'Then reply exactly M10_FIRST_OK when that one correlated rlm_eval result succeeds.',
+  ].join('\n')
+  const task2 = [
+    'You are validating M10 resume. Call rlm_eval EXACTLY once with this exact Python source (do not change it):',
+    cell2,
+    '',
+    'Then reply exactly M10_SECOND_OK when that one correlated rlm_eval result succeeds.',
+  ].join('\n')
+  try {
+    const add = runDsh(['plugin', '--profile', PROFILE, 'add', '-w', PKG_ROOT], env, REPO_ROOT, 180_000)
+    assert.equal(add.status, 0, 'dsh plugin add failed: ' + add.stderr)
+    assert.ok(fs.existsSync(path.join(profileDir, 'node_modules', 'dsh-rlm')), 'dsh-rlm not installed into the profile')
+    const manifestPath = path.join(profileDir, 'package.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    manifest.dsh = { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-headless'] } }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n')
+    fs.writeFileSync(path.join(profileDir, 'cordis.patch.yml'), [
+      '- insert:',
+      '    - id: rlm',
+      '      name: dsh-rlm',
+      '      config:',
+      '        enabled: true',
+      '        provider: spawn',
+      '        kernelSandbox: auto',
+      '        snapshotRecovery: true',
+      '        durableRoot: ' + JSON.stringify(durable),
+      '        timeout: 60000',
+      '',
+    ].join('\n'))
+
+    const run1 = runDsh(['--profile', PROFILE, task], env, home, 12 * 60_000)
+    assert.equal(run1.status, 0, 'M10 first journey failed: ' + run1.stdout.slice(-400) + ' ' + run1.stderr.slice(-400))
+    assert.match(run1.stdout.slice(-800), /M10_FIRST_OK/, 'first headless run did not report M10_FIRST_OK')
+    const firstLogs = await readSessionLogs(home)
+    const firstMainId = [...firstLogs.keys()][0]
+    assert.ok(firstMainId, 'no main session id found after first run')
+    const durableFiles = fs.readdirSync(durable)
+    assert.ok(durableFiles.some((f) => f.endsWith('.checkpoint.json')), 'no durable checkpoint file published')
+    assert.ok(durableFiles.some((f) => f.endsWith('.meta.json')), 'no durable meta file published')
+
+    // A new runtime instance (separate Node process) with the same durableRoot
+    // resumes the same Session through the M9 transport. The durable files were
+    // produced by the real installed Profile above.
+    const resumeScript = [
+      "import { createRlmRuntime } from './src/runtime.ts';",
+      "const runtime = createRlmRuntime(undefined, { durableRoot: " + JSON.stringify(durable) + ", snapshotRecovery: true, timeout: 60000 });",
+      "const key = " + JSON.stringify(firstMainId) + ";",
+      "const out = await runtime.eval(key, { code: 'value + 1' });",
+      "console.log('M10_RESUME:' + JSON.stringify(out));",
+      "await runtime.dispose();",
+    ].join('\n');
+    const resumeTsx = 'file:///' + REPO_ROOT.replace(/\\/g, '/') + '/node_modules/tsx/dist/esm/index.mjs'
+    const resume = spawnSync('node', ['--import', resumeTsx, '--input-type=module', '-e', resumeScript], { cwd: PKG_ROOT, encoding: 'utf8', timeout: 120000 });
+    assert.equal(resume.status, 0, 'M10 resume script failed: ' + resume.stderr.slice(-4000));
+    const resumeOut = resume.stdout;
+    assert.match(resumeOut, /"result":"42"/, 'new runtime did not restore value (expect 42): ' + resumeOut.slice(-400))
+  } finally {
+    try {
+      assert.ok(ambientSettingsBytes.equals(fs.readFileSync(ambientSettingsPath)), 'ambient settings.yaml was modified by the M10 smoke')
+      if (ambientCredsBytes !== null) assert.ok(ambientCredsBytes.equals(fs.readFileSync(ambientCredsPath)), 'ambient .credentials.yaml was modified by the M10 smoke')
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true })
+      fs.rmSync(durable, { recursive: true, force: true })
+    }
+  }
+})
+
