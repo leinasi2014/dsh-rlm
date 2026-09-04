@@ -1514,7 +1514,7 @@ test('M11 Issue#46 RED: a token guard consults recorded measure on the accepted 
 test('M11 Issue#46: over-budget observed tokens reject before child dispatch', async () => {
   const measureCalls: unknown[] = []
   const m = makeMockCtx({ queryText: 'ok' })
-  m.ctx.tokenMeter = { measure(session: unknown) { measureCalls.push(session); return { inputTokens: 500, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } } }
+  m.ctx.tokenMeter = { measure(session: unknown) { measureCalls.push(session); return { baseline: { kind: 'usage', tokens: 501, usage: { inputTokens: 500, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } }, totalTokens: 501 } } }
   registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', guardQueryTokens: true, maxQueryTokensPerCell: 100 })
   const tool = m.registered[0]
   try {
@@ -1531,7 +1531,7 @@ test('M11 Issue#46: over-budget observed tokens reject before child dispatch', a
 
 test('M11 Issue#46: under-budget observed tokens allow admission and dispatch', async () => {
   const m = makeMockCtx({ queryText: 'ok' })
-  m.ctx.tokenMeter = { measure() { return { inputTokens: 10, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } } }
+  m.ctx.tokenMeter = { measure() { return { baseline: { kind: 'usage', tokens: 11, usage: { inputTokens: 10, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } }, totalTokens: 11 } } }
   registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', guardQueryTokens: true, maxQueryTokensPerCell: 100 })
   const tool = m.registered[0]
   try {
@@ -1543,10 +1543,35 @@ test('M11 Issue#46: under-budget observed tokens allow admission and dispatch', 
   }
 })
 
+test('M11 Issue#46: the official TokenMeasurement shape must reject over budget (not a no-op)', async () => {
+  const m = makeMockCtx({ queryText: 'ok' })
+  m.ctx.tokenMeter = { measure() {
+    return {
+      logRevision: 1,
+      baseline: { kind: 'usage', tokens: 120, usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+      surfaceDeltaTokens: 0,
+      totalTokens: 120,
+      surfaceTokens: 120,
+      nodes: [],
+    }
+  } }
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', guardQueryTokens: true, maxQueryTokensPerCell: 100 })
+  const tool = m.registered[0]
+  try {
+    await assert.rejects(
+      tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-authority')),
+      (err: unknown) => err instanceof Error && /token budget exceeded/i.test(err.message),
+    )
+    assert.equal(m.starts.length, 0, 'authoritative over-budget must not dispatch a child')
+  } finally {
+    await m.teardown?.()
+  }
+})
+
 test('M11 Issue#46: guard is off by default (no measurement, no rejection)', async () => {
   const measureCalls: unknown[] = []
   const m = makeMockCtx({ queryText: 'ok' })
-  m.ctx.tokenMeter = { measure(session: unknown) { measureCalls.push(session); return { inputTokens: 9999, outputTokens: 9999 } } }
+  m.ctx.tokenMeter = { measure(session: unknown) { measureCalls.push(session); return { baseline: { kind: 'usage', tokens: 19998, usage: { inputTokens: 9999, outputTokens: 9999 } }, totalTokens: 19998 } } }
   registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn' })
   const tool = m.registered[0]
   try {

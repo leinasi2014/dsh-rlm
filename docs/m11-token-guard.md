@@ -16,9 +16,11 @@ and `dsh-token-meter` remain the usage authority. Python never sees token number
 ## Authority and API
 
 - Authority: `@deepseek-ai/dsh-token-meter` (mounted by DSH base) `TokenMeter.measure(session, header?)`
-  returns `TokenMeasurement` with provider usage surfaces (input, cacheRead, cacheWrite,
-  output) when the provider reported them. Headerless/unknown usage surfaces as unobserved;
-  the guard treats unobserved as not-counted, never as zero-spend proof.
+  returns a `TokenMeasurement`; provider usage surfaces (input, cacheRead, cacheWrite, output)
+  live in `TokenMeasurement.baseline.usage` (type `TokenUsage`) only when
+  `baseline.kind === 'usage'`. `estimated` / `none` baselines are unobserved; the guard
+  treats unobserved as not-counted, never as zero-spend proof. The guard never reads a
+  provider surface from a top-level measurement field (there is none).
 - New config (all optional, default off):
   - `maxQueryTokensPerCell?: number` — hard stop at admission when observed cell usage
     exceeds the budget.

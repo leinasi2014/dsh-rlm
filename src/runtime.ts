@@ -1888,7 +1888,10 @@ function renderValue(value: RlmEvalValue): string {
  * Cordis fiber, so no plugin-owned Python process survives plugin unload.
  */
 interface TokenMeterLike {
-  measure(session: unknown, requestHeader?: unknown): { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+  measure(session: unknown, requestHeader?: unknown): {
+    baseline?: { kind: 'none' | 'estimated' | 'usage'; tokens: number; usage?: { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number } }
+    totalTokens?: number
+  }
 }
 
 /** Read-only M11 guard: consult official tokenMeter; never invent unobserved tokens. */
@@ -1898,11 +1901,12 @@ function enforceQueryTokenGuard(ctx: Context, parent: Agent, config: RlmPluginCo
   const meter = accessor.tokenMeter ?? accessor.get?.('tokenMeter') as TokenMeterLike | undefined
   if (!meter || typeof meter.measure !== 'function') return
   const observed = meter.measure(parent.session)
-  if (!observed || typeof observed.inputTokens !== 'number') return
-  const total = observed.inputTokens
-    + (observed.cacheReadTokens ?? 0)
-    + (observed.cacheWriteTokens ?? 0)
-    + observed.outputTokens
+  const usage = observed?.baseline?.kind === 'usage' ? observed.baseline.usage : undefined
+  if (!usage || typeof usage.inputTokens !== 'number' || typeof usage.outputTokens !== 'number') return
+  const total = usage.inputTokens
+    + (usage.cacheReadTokens ?? 0)
+    + (usage.cacheWriteTokens ?? 0)
+    + usage.outputTokens
   if (total > config.maxQueryTokensPerCell) {
     throw new RlmError('query', 'per-cell observed token budget exceeded: ' + total + ' > ' + config.maxQueryTokensPerCell, { phase: 'query' })
   }
