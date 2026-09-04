@@ -11,7 +11,7 @@ Python cells support top-level `await` and can call
 `await rlm_query(prompt)`. The host answers that call through an official
 one-shot DSH Subagent, returns visible text to Python, and lets the cell continue.
 
-> Status: M1-M12 are implemented, reviewed, and DSV4-FVE clean-Profile verified.
+> Status: M1-M13 are implemented, reviewed, and DSV4-FVE clean-Profile verified.
 > See [Project status](docs/project-status.md) and [Milestones](docs/milestones.md).
 
 ![dsh-rlm architecture](docs/dsh-rlm-architecture.visual-check.1440x900.light.png)
@@ -64,19 +64,20 @@ becomes a second Agent Loop and does not receive DSH Provider or Session objects
   new-runtime restore and typed version-mismatch failure;
 - M11 token guard: `guardQueryTokens` / `maxQueryTokensPerCell` reading the official
   `tokenMeter.measure(...).baseline.usage` observation (never invents tokens);
+- M13 GUI plugin configuration: official `rlm` settings namespace + `RlmSettingsCard` under Settings > Plugins (en/zh, staged draft, restart-applied);
 - M12 job consumer: official `ctx.jobs` `rlm` controller + `createRlmJobSpec` /
   `startRlmJob` (no second Agent loop; swarm stays trigger-gated);
 - offline tests plus gated real clean-Profile smoke tests.
 
 ## Milestone roadmap
 
-Accepted on `main`: M1-M12 (see [Milestones](docs/milestones.md)). Remaining rows
+Accepted on `main`: M1-M13 (see [Milestones](docs/milestones.md)). Remaining rows
 in [Future extensions](docs/future-extensions.md) are conditional and
 trigger-gated:
 
 - a public `RlmService` or Kernel Provider framework (only with a second consumer);
 - container or remote kernels (route B — separate contract and trigger);
-- Jobs/UI/swarm orchestration beyond the M12 job consumer (named consumer +
+- Swarm orchestration beyond the M12 job consumer (named consumer +
   end-to-end scenario required).
 
 Open reliability defects and conditional future work are separated in
@@ -332,6 +333,19 @@ RLM_LIVE_SMOKE=1 DSH_HOME=/path/to/configured/dsh-home \
   node --test --test-name-pattern "M9 Issue#42|M10 Issue#44|M11 Issue#46|M12 Issue#48" \
   tests/profile-smoke.test.ts
 ```
+
+### M13: Settings UI (Settings > Plugins)
+
+- In the DSH Web UI open **Settings > Plugins > Plugin configuration**; `dsh-rlm`
+  shows its own card (tabs Core / Bounded I/O / Recovery & Sandbox / Guard) with
+  the 14 user-configurable fields, staged draft, per-field override badges,
+  reset-to-composition, and Save/Saving/Saved/Failed states.
+- Saves apply on restart (`applies: restart`) — restart DSH to apply, exactly
+  like the `dsh-agent-swarm` Team card.
+- CLI and UI share one authority: runtime reads
+  `{ ...compositionDefaults, ...userSettings }`; `cordis.patch.yml` stays the
+  composition layer, so the same normalized config is consumed either way.
+- i18n: `en` fallback plus `zh` under the `rlm.settings` locale namespace.
 
 ## Example
 

@@ -10,7 +10,7 @@ Python cell 支持 top-level `await`，并可调用 `await rlm_query(prompt)`。
 宿主通过官方 one-shot DSH Subagent 完成查询，把可见文本返回 Python，然后让
 当前 cell 继续执行。
 
-> 状态：M1-M12 均已实现、审查并通过 DSV4-FVE 干净 Profile 验证。
+> 状态：M1-M13 均已实现、审查并通过 DSV4-FVE 干净 Profile 验证。
 > 参见[项目状态](docs/project-status.zh-CN.md)和
 > [里程碑](docs/milestones.zh-CN.md)。
 
@@ -62,6 +62,7 @@ Loop，也不会接收 DSH Provider 或 Session 对象。
 - M10 跨主机持久化：可选 `durableRoot` 原子引用，新 runtime 恢复，版本不匹配类型化失败；
 - M11 令牌护栏：`guardQueryTokens` / `maxQueryTokensPerCell` 读取官方
   `tokenMeter.measure(...).baseline.usage` 观测（不发明令牌）；
+- M13 GUI 插件配置：官方 `rlm` settings 命名空间 + Settings > Plugins 中的 `RlmSettingsCard`（en/zh、staged 草稿、重启生效）；
 - M12 Job 消费者：官方 `ctx.jobs` `rlm` 控制器 + `createRlmJobSpec` / `startRlmJob`
   （无第二 Agent loop；swarm 保持触发式）；
 - 离线测试和设门的真实干净 Profile 冒烟测试。
@@ -70,12 +71,12 @@ Loop，也不会接收 DSH Provider 或 Session 对象。
 
 ## 里程碑路线
 
-已在 `main` 上验收：M1-M12（见[里程碑](docs/milestones.zh-CN.md)）。
+已在 `main` 上验收：M1-M13（见[里程碑](docs/milestones.zh-CN.md)）。
 [未来扩展](docs/future-extensions.zh-CN.md) 中的剩余行均为条件触发：
 
 - 公共 `RlmService` 或 Kernel Provider 框架（仅在出现第二个消费者时）；
 - container 或 remote kernel（B 路线——独立契约与触发）；
-- 超出 M12 Job 消费者的 Jobs/UI/swarm 编排（需具名消费者 + 端到端场景）。
+- 超出 M12 Job 消费者的 swarm 编排（需具名消费者 + 端到端场景）。
 
 可靠性缺陷与条件扩展已在[项目状态](docs/project-status.zh-CN.md)中分开记录。
 GitHub Issues 是实时工作权威。
@@ -296,6 +297,18 @@ RLM_LIVE_SMOKE=1 DSH_HOME=/path/to/configured/dsh-home \
   node --test --test-name-pattern "M9 Issue#42|M10 Issue#44|M11 Issue#46|M12 Issue#48" \
   tests/profile-smoke.test.ts
 ```
+
+### M13：设置 UI（Settings > Plugins）
+
+- 在 DSH Web UI 打开 **Settings > Plugins > Plugin configuration**，`dsh-rlm`
+  显示自己的卡片（Core / Bounded I/O / Recovery & Sandbox / Guard 四个 Tab）：
+  14 个用户可配置字段、staged 草稿、每字段 override 徽标、reset-to-composition、
+  Save/Saving/Saved/Failed 状态。
+- 保存于重启后生效（`applies: restart`），与 `dsh-agent-swarm` Team 卡片一致，
+  需重启 DSH。
+- CLI 与 UI 共享同一权威：运行时读取 `{ ...compositionDefaults, ...userSettings }`；
+  `cordis.patch.yml` 仍是 composition 层，两种方式得到同一份规范化配置。
+- i18n：`en` 回退 + `zh`，命名空间 `rlm.settings`。
 
 ## 示例
 

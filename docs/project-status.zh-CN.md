@@ -22,11 +22,11 @@ Host；Python kernel 只执行代码、维护 Session 内 globals，并通过宿
 
 ## 发布基线
 
-- 已接受 M1/M2 基线：`260484d7d92e43fcb99c54ab987436d494501845`
-- 状态日期：2026-09-03
+- 已接受里程碑阶梯：M1–M13 已在 `main`（M9 沙箱内核、M10 跨主机持久、M11 token 护栏、M12 job 消费者、M13 GUI 插件配置）。
+- 状态日期：2026-09-04
 - 固定参考：`ref/rlm` 与 `ref/prime-agent`，只作为设计证据，不作为逐字兼容目标
-- 当前阶段：M1/M2 已通过本地、审查、CI、远端 main 回读及真实干净 Profile
-  门禁；M3 架构/契约正在集成
+- DSH 源码新鲜度证据：官方 `master` 于 `d347e703908d0406b7a7ef80e3a0e594d86b2215`（ahead=0 behind=0；已安装 `@deepseek-ai/*@0.1.1-rc.2` 仍是可执行兼容权威）。M9–M13 均以全新隔离 checkout 验证，每里程碑 DSV4-FVE 干净 Profile 实时冒烟 PASS；M13 另证明了 settings 命名空间用户层在运行时生效。M8 仍受环境限制：本地 0.1.1-rc.2 host 未暴露官方 continuable inbox 适配器。
+- 当前阶段：M1–M13 已在 `main` 验收，条件性未来扩展保持触发式门控。
 
 ## 已完成
 

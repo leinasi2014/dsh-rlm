@@ -23,15 +23,19 @@ holds Session-local globals, and asks the host for child calls.
 
 ## Publication baseline
 
-- Accepted milestone ladder: M1 through M12 on `main` (M9 sandbox-backed kernel, M10 cross-host durable persistence, M11 token guard, M12 job consumer).
+- Accepted milestone ladder: M1 through M13 on `main` (M9 sandbox-backed kernel, M10 cross-host durable persistence, M11 token guard, M12 job consumer, M13 GUI plugin configuration).
 - Status date: 2026-09-04
 - Pinned references: `ref/rlm` and `ref/prime-agent`, used as design evidence,
   not literal compatibility targets
 - DSH source-freshness evidence: official `master` at
-  `76fda729799fe9b3848dbe2c211d4b231032b81e` (ahead=0 behind=0); M9-M12 were
-  verified against the same isolated fresh checkout. Each milestone had a
-  DSV4-FVE (DeepSeek-V4-Flash-Vision-Exp) clean-Profile live smoke PASS.
-- Current stage: M1-M12 accepted on `main`. Conditional future extensions
+  `d347e703908d0406b7a7ef80e3a0e594d86b2215` (ahead=0 behind=0; the installed
+  `@deepseek-ai/*@0.1.1-rc.2` runtime remains the executable compatibility
+  authority). M9-M13 were verified against fresh isolated checkouts. Each
+  milestone had a DSV4-FVE (DeepSeek-V4-Flash-Vision-Exp) clean-Profile live
+  smoke PASS; M13 additionally proved the settings namespace user layer is
+  enforced at runtime. M8 remains environment-limited: the local 0.1.1-rc.2
+  host does not expose the official continuable inbox adapter.
+- Current stage: M1-M13 accepted on `main`. Conditional future extensions
   remain trigger-gated.
 
 ## Delivered
