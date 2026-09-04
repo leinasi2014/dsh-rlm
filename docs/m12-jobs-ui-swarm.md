@@ -20,9 +20,12 @@ create swarm orchestration.
 
 - Authority: official `ctx.jobs` service (`start/wait/read/kill/list`), mounted by DSH base;
   the plugin registers one `attachController` producer for the Session it owns.
-- The producer wraps the existing RLM runtime: a job spec holds the Session key and the
-  next cell code; `run()` awaits `runtime.eval(sessionKey, cell)` and streams bounded
-  stdout/result into the job output; `kill` maps to the existing per-Session kernel dispose.
+- The producer wraps the existing RLM runtime: `createRlmJobSpec` returns an INERT spec,
+  and `run()` (called by the official job registry) lazily awaits
+  `runtime.eval(sessionKey, cell)`, streaming bounded stdout/result into the job output;
+  `kill` maps to the existing per-Session kernel dispose. `startRlmJob(ctx, parent, code,
+  runtime)` is the consumer-path helper that calls `ctx.jobs.start` with that spec; a
+  spec that is never started leaks no kernel/work.
 - No plugin queue/scheduler: DSH decides job admission/lifecycle; the plugin only answers
   `start/wait/read/kill` against its own Session kernel.
 

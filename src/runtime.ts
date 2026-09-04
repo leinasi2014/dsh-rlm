@@ -1937,14 +1937,23 @@ export function createRlmJobSpec(
 ): RlmJobStartInput {
   const key = String(parent.id)
   let settled = false
-  let requestCancel = (_reason?: string): void => { settled = true }
   let captured = ''
+  let doCancel: (() => void) | undefined
+  // Lazily start the cell only when the official job registry calls run(); the
+  // returned spec is inert until then, so a never-started job leaks nothing.
   const done = new Promise<{ status: 'completed' | 'killed' | 'failed'; detail?: string; output?: string }>((resolve) => {
-    void runtime.eval(key, { code }).then((out) => {
-      captured = (out.stdout ?? '') + (out.result === undefined ? '' : '\n' + out.result)
+    doCancel = () => {
+      if (settled) return
       settled = true
+      void runtime.dispose().then(() => resolve({ status: 'killed', detail: 'job cancelled' }), () => resolve({ status: 'killed', detail: 'job cancelled' }))
+    }
+    void runtime.eval(key, { code }).then((out) => {
+      if (settled) return
+      settled = true
+      captured = (out.stdout ?? '') + (out.result === undefined ? '' : '\n' + out.result)
       resolve({ status: 'completed', output: captured })
     }, (err: unknown) => {
+      if (settled) return
       settled = true
       resolve({
         status: err instanceof RlmError && err.kind === 'cancel' ? 'killed' : 'failed',
@@ -1959,12 +1968,26 @@ export function createRlmJobSpec(
     owner: parent,
     run() {
       return {
-        cancel(reason?: string) { if (!settled) requestCancel(reason); void runtime.dispose() },
+        cancel(_reason?: string) { doCancel?.() },
         done,
         readOutput() { const out = captured; captured = ''; return out },
       }
     },
   }
+}
+
+/** Start one official DSH background job running this RLM cell (M12 consumer path). */
+export function startRlmJob(
+  ctx: Context,
+  parent: Agent,
+  code: string,
+  runtime: RlmRuntime,
+): unknown {
+  const jobs = ctx as unknown as { jobs?: RlmJobsLike } | undefined
+  if (!jobs?.jobs || typeof jobs.jobs.start !== 'function') {
+    throw new RlmError('eval', 'background jobs unavailable: no ctx.jobs service is mounted')
+  }
+  return jobs.jobs.start(createRlmJobSpec(parent, code, runtime))
 }
 
 /** Register the 'rlm' job controller when the DSH jobs surface is mounted (M12). */

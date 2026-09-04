@@ -1432,6 +1432,33 @@ test('M12 Issue#48: createRlmJobSpec runs one cell and reports bounded output', 
   try { await m.teardown?.() } catch {}
 })
 
+test('M12 Issue#48: startRlmJob dispatches through ctx.jobs.start with the rlm kind', async () => {
+  const started: any[] = []
+  const m = makeMockCtx()
+  m.ctx.jobs = {
+    attachController(name: string) { return () => {} },
+    start(spec: any) { started.push(spec); return 'rlm-1' },
+  }
+  const { createRlmRuntime, startRlmJob } = await import('../src/runtime.ts')
+  const runtime = createRlmRuntime(undefined, {})
+  const id = startRlmJob(m.ctx, makeAgent('m12-start'), '1 + 1', runtime)
+  assert.equal(id, 'rlm-1')
+  assert.equal(started.length, 1)
+  assert.equal(started[0].kind, 'rlm')
+  assert.equal(typeof started[0].run, 'function')
+  await runtime.dispose()
+})
+
+test('M12 Issue#48: an inert spec does not start the cell until run() is called', async () => {
+  const { createRlmRuntime, createRlmJobSpec } = await import('../src/runtime.ts')
+  const runtime = createRlmRuntime(undefined, {})
+  const spec = createRlmJobSpec(makeAgent('m12-inert'), '1 + 1', runtime)
+  const hooks = spec.run()
+  const outcome = await hooks.done
+  assert.equal(outcome.status, 'completed')
+  await runtime.dispose()
+})
+
 test('M12 Issue#48: a job kill settles as killed and disposes the kernel', async () => {
   const { createRlmRuntime } = await import('../src/runtime.ts')
   const { createRlmJobSpec } = await import('../src/runtime.ts')

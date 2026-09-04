@@ -16,9 +16,10 @@ Storage Domain 或 UI。DSH 工具 `jobs`/`job_read`/`job_kill` 仍为 UI/控制
 
 - 权威：官方 `ctx.jobs`（`start/wait/read/kill/list`），由 DSH base 挂载；插件为它拥有的 Session
   注册一个 `attachController` producer。
-- producer 包装既有 RLM runtime：job spec 持有 Session key 与下一 cell 代码；`run()` 等待
-  `runtime.eval(sessionKey, cell)` 并把有界 stdout/result 流入 job 输出；`kill` 映射到既有按
-  Session 内核 dispose。
+- producer 包装既有 RLM runtime：`createRlmJobSpec` 返回**惰性** spec；`run()`（由官方 job registry
+  调用）才懒启动 `runtime.eval(sessionKey, cell)`，把有界 stdout/result 流入 job 输出；`kill` 映射到既有
+  Session 内核 dispose。`startRlmJob(ctx, parent, code, runtime)` 是消费者路径 helper，调用
+  `ctx.jobs.start` 传入该 spec；从未 start 的 spec 不泄漏任何内核/工作。
 - 无插件队列/调度器：DSH 决定 job 准入/生命周期；插件只就自身 Session 内核回答
   `start/wait/read/kill`。
 
