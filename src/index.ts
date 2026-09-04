@@ -13,7 +13,7 @@ import {
   type RlmRuntime,
   type RlmEvalOutput,
 } from './runtime.js'
-import { RLM_SETTINGS_NAMESPACE, resolveRlmConfig } from './settings.js'
+import { RLM_SETTINGS_NAMESPACE, awaitRlmSettings, mountRlmSettings } from './settings.js'
 
 export const name = 'rlm'
 export const inject = ['tools', 'subagents', 'systemPrompt']
@@ -29,9 +29,19 @@ export const Config: z<Config> = ConfigSchema
  * byte-for-byte backward compatible (M1-M12) when no user settings exist.
  */
 export function apply(ctx: Context, config: Config): void {
-  const resolved = resolveRlmConfig(ctx, config, ConfigSchema)
-  if (resolved.enabled !== true) return
-  registerRlmPlugin(ctx, resolved)
+  // Defer to activation: the Settings provider fiber may not be active during
+  // this entry's own init phase, and a synchronous resolve would freeze the
+  // runtime on composition defaults (stale after a user-layer save). Mounting
+  // through the live binding inside `ctx.effect` reads
+  // { ...compositionDefaults, ...userSettings } at mount time.
+  ctx.effect(async () => {
+    const binding = mountRlmSettings(ctx, config, ConfigSchema)
+    await awaitRlmSettings(ctx)
+    const resolved = binding.effective()
+    if (resolved.enabled !== true) return () => undefined
+    registerRlmPlugin(ctx, resolved)
+    return () => undefined
+  }, 'rlm: mount with merged settings')
 }
 
 export { RLM_SETTINGS_NAMESPACE }

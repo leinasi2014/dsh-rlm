@@ -63,7 +63,7 @@
     "check:memory": "node scripts/check-development-memory.mjs --all",
     "check:memory:staged": "node scripts/check-development-memory.mjs --staged",
     "check:upstream": "node scripts/check-dsh-upstream.mjs",
-    "test": "node --test --test-concurrency=1 tests/development-memory-gate.test.ts tests/upstream-authority-gate.test.ts tests/rlm-loop.test.ts tests/profile-smoke.test.ts",
+    "test": "node --test --test-concurrency=1 tests/development-memory-gate.test.ts tests/upstream-authority-gate.test.ts tests/rlm-loop.test.ts tests/profile-smoke.test.ts tests/rlm-settings.test.ts tests/rlm-client-settings.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "peerDependencies": {

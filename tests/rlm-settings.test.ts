@@ -7,6 +7,7 @@ import {
   RLM_SETTINGS_NAMESPACE,
   assertRlmConfig,
   mergeRlmConfig,
+  mountRlmSettings,
   registerRlmSettings,
   resolveRlmConfig,
 } from '../src/settings.ts'
@@ -126,6 +127,31 @@ test('registerRlmSettings: invalid staged value blocks the save and reset return
     await ctx.settings.replace(RLM_SETTINGS_NAMESPACE, {})
     const reset = ctx.settings.get(RLM_SETTINGS_NAMESPACE) as RlmPluginConfig
     assert.equal(reset.maxDepth, 2)
+    await settingsFiber.dispose()
+  } finally {
+    await ctx.fiber.dispose()
+  }
+})
+
+
+/**
+ * M13 successor RED (load order): the plugin may apply before the Settings
+ * service fiber activates, but the runtime must still mount with the merged
+ * user layer once Settings becomes available. `mountRlmSettings` returns a
+ * live binding: `effective()` always reflects { ...compositionDefaults,
+ * ...userSettings }, never a stale early snapshot.
+ */
+test('mountRlmSettings effective() reflects the user layer when Settings mounts after the plugin', async () => {
+  const ctx = new Context()
+  ctx.provide('subagents', fakeSubagents())
+  try {
+    const binding = mountRlmSettings(ctx, { enabled: true, maxQueries: 16, maxDepth: 2 }, ConfigSchema)
+    assert.equal(binding.effective().maxQueries, 16)
+    assert.equal(binding.scope(), undefined)
+    const settingsFiber = await mountSettings(ctx, { rlm: { maxQueries: 1 } })
+    await settingsFiber.await()
+    assert.equal(binding.effective().maxQueries, 1)
+    assert.ok(binding.scope(), 'expected the rlm scope to be registered once Settings mounts')
     await settingsFiber.dispose()
   } finally {
     await ctx.fiber.dispose()

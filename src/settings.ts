@@ -170,3 +170,62 @@ export function resolveRlmConfig(
   })
   return resolved
 }
+
+/** Live settings binding for the apply path (successor RED: load-order fix). */
+export interface RlmSettingsBinding {
+  scope(): SettingsScope<RlmPluginConfig> | undefined
+  effective(): RlmPluginConfig
+}
+
+/** Live settings binding for the apply path. */
+/**
+ * Bind the `rlm` namespace for the whole plugin lifetime. If Settings is
+ * already active the scope registers now; otherwise an injection registers it
+ * the moment the Settings provider becomes available (the plugin may apply
+ * before the Settings fiber activates). `effective()` reads the live scope, so
+ * it always returns { ...compositionDefaults, ...userSettings } and never a
+ * stale early snapshot.
+ */
+export function mountRlmSettings(
+  ctx: Context,
+  config: RlmPluginConfig,
+  schema: z<RlmPluginConfig>,
+): RlmSettingsBinding {
+  let scope = registerRlmSettingsIfPresent(ctx, config, schema)
+  ctx.inject(['settings'], (settingsCtx: Context) => {
+    if (scope === undefined || settingsCtx.settings.get(RLM_SETTINGS_NAMESPACE) === undefined) {
+      scope = registerRlmSettings(settingsCtx, config, schema)
+    }
+  })
+  return {
+    scope: () => scope,
+    effective: () => (scope?.get() as RlmPluginConfig | undefined) ?? schema(config),
+  }
+}
+
+/** Register now when the Settings service is already active, else `undefined`. */
+function registerRlmSettingsIfPresent(
+  ctx: Context,
+  config: RlmPluginConfig,
+  schema: z<RlmPluginConfig>,
+): SettingsScope<RlmPluginConfig> | undefined {
+  const settings = (ctx as unknown as { get?: (key: string) => unknown }).get?.('settings')
+  return settings === undefined ? undefined : registerRlmSettings(ctx, config, schema)
+}
+
+
+/**
+ * Resolve once the Settings provider is active (or immediately when it already
+ * is). Cordis activates sibling entries concurrently, so the plugin must await
+ * this before snapshotting `effective()`; base compositions always mount a
+ * settings provider.
+ */
+export function awaitRlmSettings(ctx: Context): Promise<void> {
+  return new Promise((resolve) => {
+    if ((ctx as unknown as { get?: (key: string) => unknown }).get?.('settings') !== undefined) {
+      resolve()
+      return
+    }
+    ctx.inject(['settings'], () => resolve())
+  })
+}
