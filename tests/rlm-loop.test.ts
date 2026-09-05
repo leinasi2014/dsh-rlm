@@ -4234,9 +4234,15 @@ test('M2 Issue#7: synthetic credential/proxy sentinels are visible in Host but a
 })
 
 test('M2 Issue#7: unknown locale-looking LC_RLM_SECRET_7 is absent while safe startup variables remain usable', async () => {
-  const standard = [
-    'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_COLLATE', 'LC_MESSAGES', 'LC_MONETARY', 'LC_NUMERIC', 'LC_TIME',
-  ]
+  // Issue #7 platform contract: the kernel env allowlist is platform-specific.
+  // Windows forwards only legal Windows startup variables (no LANG/LC_*); POSIX
+  // forwards only the explicit, case-exact locale names (no LC_* wildcard). The
+  // test checks the platform's OWN allowlist so it is deterministic whether or not
+  // the host happens to carry LANG/LC_*, while still asserting a planted
+  // LC_RLM_SECRET_7 is never forwarded. Production filtering is NOT relaxed.
+  const standard = process.platform === 'win32'
+    ? ['PATH', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'SYSTEMDRIVE', 'USERPROFILE', 'TEMP', 'TMP']
+    : ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES', 'LC_COLLATE', 'LC_MONETARY', 'LC_NUMERIC', 'LC_TIME', 'LC_PAPER', 'LC_NAME', 'LC_ADDRESS', 'LC_TELEPHONE', 'LC_MEASUREMENT', 'LC_IDENTIFICATION']
   await withHostEnvMap({ LC_RLM_SECRET_7: 'not-a-real-secret' }, async () => {
     const runtime = rt()
     try {
