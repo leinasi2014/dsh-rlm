@@ -4234,9 +4234,15 @@ test('M2 Issue#7: synthetic credential/proxy sentinels are visible in Host but a
 })
 
 test('M2 Issue#7: unknown locale-looking LC_RLM_SECRET_7 is absent while safe startup variables remain usable', async () => {
-  const standard = [
-    'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_COLLATE', 'LC_MESSAGES', 'LC_MONETARY', 'LC_NUMERIC', 'LC_TIME',
-  ]
+  // Issue #7 platform contract: the kernel env allowlist is platform-specific.
+  // Windows forwards only legal Windows startup variables (no LANG/LC_*); POSIX
+  // forwards only the explicit, case-exact locale names (no LC_* wildcard). The
+  // test checks the platform's OWN allowlist so it is deterministic whether or not
+  // the host happens to carry LANG/LC_*, while still asserting a planted
+  // LC_RLM_SECRET_7 is never forwarded. Production filtering is NOT relaxed.
+  const standard = process.platform === 'win32'
+    ? ['PATH', 'SystemRoot', 'WINDIR', 'COMSPEC', 'PATHEXT', 'SYSTEMDRIVE', 'USERPROFILE', 'TEMP', 'TMP']
+    : ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'LC_CTYPE', 'LC_MESSAGES', 'LC_COLLATE', 'LC_MONETARY', 'LC_NUMERIC', 'LC_TIME', 'LC_PAPER', 'LC_NAME', 'LC_ADDRESS', 'LC_TELEPHONE', 'LC_MEASUREMENT', 'LC_IDENTIFICATION']
   await withHostEnvMap({ LC_RLM_SECRET_7: 'not-a-real-secret' }, async () => {
     const runtime = rt()
     try {
@@ -4420,6 +4426,28 @@ test('M3 Issue#24: invalid sources are typed and atomic, and cell mutation canno
       const preserved = await runtime.eval('m3-atomic', { code: 'context' })
       assert.equal(preserved.result, 'trusted context')
     }
+  } finally {
+    await runtime.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// Windows CRLF blocking defect (clean dsh+rlm+swarm dogfood): the kernel's
+// `_read_context` must read a UTF-8 context file as RAW BYTES, preserving
+// CRLF (and thus matching `os.fstat(fd).st_size` for the byte-limit check).
+// LF and non-Windows behavior are unchanged; safe-file + atomic-context limits
+// are retained. Regression targets the real kernel/service boundary.
+test('M3 context: a CRLF UTF-8 contextPath loads raw bytes (Windows O_BINARY, CRLF preserved)', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-crlf-'))
+  const contextPath = path.join(dir, 'context-crlf.txt')
+  const contents = 'managed context\r\nsecond line\r\n'
+  writeFileSync(contextPath, contents, 'utf8')
+  const runtime = rt({ maxContextBytes: 1024 * 1024 })
+  try {
+    const first = await runtime.eval('m3-crlf', { code: 'context', contextPath })
+    assert.equal(first.result, contents)
+    const meta = await runtime.eval('m3-crlf', { code: 'context_meta["bytes"]' })
+    assert.equal(meta.result, String(Buffer.byteLength(contents, 'utf8')))
   } finally {
     await runtime.dispose()
     rmSync(dir, { recursive: true, force: true })
