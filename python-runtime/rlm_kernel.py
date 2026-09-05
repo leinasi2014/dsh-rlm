@@ -766,6 +766,13 @@ class RlmKernel:
                 flags |= os.O_NONBLOCK
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
+            # Windows CRT text-mode read translates CRLF->LF, so `os.read` length
+            # would differ from `os.fstat(fd).st_size` and the strict
+            # `len(payload) != before.st_size` check below would reject a valid
+            # UTF-8 CRLF context file. Open raw (O_BINARY) on platforms that
+            # expose it; POSIX is always binary and is unchanged.
+            if hasattr(os, "O_BINARY"):
+                flags |= os.O_BINARY
             fd = os.open(canonical_path, flags)
             before = os.fstat(fd)
             if not stat.S_ISREG(before.st_mode):

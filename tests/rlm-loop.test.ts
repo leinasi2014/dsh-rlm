@@ -4426,6 +4426,28 @@ test('M3 Issue#24: invalid sources are typed and atomic, and cell mutation canno
   }
 })
 
+// Windows CRLF blocking defect (clean dsh+rlm+swarm dogfood): the kernel's
+// `_read_context` must read a UTF-8 context file as RAW BYTES, preserving
+// CRLF (and thus matching `os.fstat(fd).st_size` for the byte-limit check).
+// LF and non-Windows behavior are unchanged; safe-file + atomic-context limits
+// are retained. Regression targets the real kernel/service boundary.
+test('M3 context: a CRLF UTF-8 contextPath loads raw bytes (Windows O_BINARY, CRLF preserved)', async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-crlf-'))
+  const contextPath = path.join(dir, 'context-crlf.txt')
+  const contents = 'managed context\r\nsecond line\r\n'
+  writeFileSync(contextPath, contents, 'utf8')
+  const runtime = rt({ maxContextBytes: 1024 * 1024 })
+  try {
+    const first = await runtime.eval('m3-crlf', { code: 'context', contextPath })
+    assert.equal(first.result, contents)
+    const meta = await runtime.eval('m3-crlf', { code: 'context_meta["bytes"]' })
+    assert.equal(meta.result, String(Buffer.byteLength(contents, 'utf8')))
+  } finally {
+    await runtime.dispose()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('M3 Issue#24: tool forwards contextPath and reports source-limit rejection without replacing prior context', async () => {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m3-tool-'))
   const contextPath = path.join(dir, 'context.txt')
