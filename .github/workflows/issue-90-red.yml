@@ -1,0 +1,29 @@
+name: issue-90-red
+
+on:
+  push:
+    branches: [codex/issue-90-cell-tasks]
+
+permissions:
+  contents: read
+
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - name: Run Issue #90 RED regression
+        run: node --test --test-concurrency=1 tests/rlm-cell-task-lifecycle.test.ts
