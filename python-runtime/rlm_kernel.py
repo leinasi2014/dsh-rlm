@@ -989,8 +989,13 @@ class RlmKernel:
             except (UnicodeError, OSError, TypeError) as exc:
                 raise RlmSnapshotError("checkpoint context metadata is invalid") from exc
             if (
-                restored_meta.get("read_bytes") != context_bytes
-                or restored_meta.get("canonical_path") != canonical_context_path
+                restored_meta.get("kind") != "file"
+                or type(restored_meta.get("path")) is not str
+                or not os.path.isabs(restored_meta["path"])
+                or type(restored_meta.get("bytes")) is not int
+                or restored_meta["bytes"] < 0
+                or restored_meta["bytes"] != context_bytes
+                or canonical_context_path != restored_meta["path"]
             ):
                 raise RlmSnapshotError("checkpoint context metadata is invalid")
         self.namespace.update(restored)
