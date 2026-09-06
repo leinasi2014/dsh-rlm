@@ -53,6 +53,7 @@ MAX_CHECKPOINT_CHUNK_BASE64_CHARS = ((CHECKPOINT_CHUNK_BYTES + 2) // 3) * 4
 MAX_ERROR_TEXT = 64 * 1024
 BATCH_CONCURRENCY = 4
 CELL_FILENAME = "<rlm-cell>"
+TASK_DRAIN_TIMEOUT = 1.0
 
 
 class _CellOwner:
@@ -233,6 +234,9 @@ class RlmKernel:
         self.seen_response_ids: set[int] = set()
         self.query_truncated = False
         self.failed: Optional[str] = None
+        # Detached asyncio tasks owned by the retired cell, cancelled at the
+        # cell terminal and drained by the bounded cleanup barrier (Issue #90).
+        self._retired_task_drain: list[asyncio.Task] = []
         # Context is kernel-owned persistent state. User cells get a fresh
         # metadata copy at each boundary but never a mutable handle to this
         # authority, so a failed load or cell mutation cannot corrupt it.
@@ -614,9 +618,12 @@ class RlmKernel:
         """A cell reached its terminal frame: no query of it may continue.
 
         Retire the cell's owner token (so any detached task of this cell can
-        never open a query again) and cancel every still-pending query issued
+        never open a query again), cancel every still-pending query issued
         by this cell so a late host response can never wake an orphan
-        continuation into the next cell or into the raw protocol pipe.
+        continuation into the next cell or into the raw protocol pipe, and
+        cancel every asyncio task this cell detached into the persistent
+        event loop (Issue #90) so a retired cell cannot mutate the live
+        namespace after its terminal frame.
         """
         self.cell_done = True
         owner = self._current_owner
@@ -626,6 +633,50 @@ class RlmKernel:
             if qowner is owner and not future.done():
                 self._spawn_handles.pop(qid, None)
                 future.cancel()
+        self._retired_task_drain = self._cancel_owned_tasks(owner)
+
+    @staticmethod
+    def _task_owner(task: asyncio.Task) -> Optional[_CellOwner]:
+        # Task.get_context() exists on Python 3.11+; on older interpreters the
+        # barrier degrades to no-cancel (identical to pre-Issue#90 behavior).
+        get_context = getattr(task, "get_context", None)
+        if get_context is None:
+            return None
+        return get_context().get(_current_cell)
+
+    def _cancel_owned_tasks(self, owner: Optional[_CellOwner]) -> list[asyncio.Task]:
+        """Cancel every not-yet-done task whose creation context carries this
+        cell's owner token. Kernel-owned tasks (the frame reader) carry no
+        token, and the current task is never cancelled."""
+        current = asyncio.current_task()
+        owned: list[asyncio.Task] = []
+        for task in list(asyncio.all_tasks(self.loop)):
+            if task is current or task.done() or task.cancelled():
+                continue
+            if self._task_owner(task) is owner:
+                task.cancel()
+                owned.append(task)
+        return owned
+
+    async def _drain_cell_tasks(self) -> None:
+        """Bounded cleanup barrier: wait for the retired cell's cancelled
+        tasks (Issue #90), discarding any late output so it never reaches the
+        protocol pipe. A task that refuses cancellation makes the barrier
+        expire; the host can still dispose the kernel for hard termination."""
+        tasks = self._retired_task_drain
+        self._retired_task_drain = []
+        if not tasks:
+            return
+        old_stdout = sys.stdout
+        sys.stdout = _BoundedStdout(0)
+        try:
+            try:
+                async with asyncio.timeout(TASK_DRAIN_TIMEOUT):
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            except TimeoutError:
+                pass
+        finally:
+            sys.stdout = old_stdout
 
     # ---- query bridge ----
 
@@ -1300,12 +1351,14 @@ class RlmKernel:
                 body_code, expr_code = self._compile_cell(code)
             except SyntaxError as e:
                 self._end_cell()
+                await self._drain_cell_tasks()
                 self._send(self._error_frame(eval_id, "eval", "syntax_error", e))
                 return
             except ValueError as e:
                 # Defensive: an AST/compile failure must fail the cell, never the
                 # whole kernel; report it as a typed error and keep serving eval.
                 self._end_cell()
+                await self._drain_cell_tasks()
                 self._send(self._error_frame(eval_id, "eval", "compile_error", e))
                 return
 
@@ -1330,6 +1383,7 @@ class RlmKernel:
                     result, result_cut = self._cut(rendered, max_result)
         except RlmQueryError as e:
             self._end_cell()
+            await self._drain_cell_tasks()
             self._send(
                 self._error_frame(
                     eval_id, "query", "query_error", e, name="RlmQueryError"
@@ -1338,6 +1392,7 @@ class RlmKernel:
             return
         except BaseException as e:
             self._end_cell()
+            await self._drain_cell_tasks()
             self._send(self._error_frame(eval_id, "eval", "runtime_error", e))
             return
         finally:
@@ -1355,6 +1410,7 @@ class RlmKernel:
         if result is not None:
             frame_out["result"] = result
         self._end_cell()
+        await self._drain_cell_tasks()
         if snapshot_recovery:
             if snapshot_chunked:
                 payload, skipped, meta = self._checkpoint_payload(max_snapshot_bytes)

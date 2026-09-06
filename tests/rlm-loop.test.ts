@@ -313,6 +313,71 @@ test('M7 Issue#36 successor: asyncio.wait_for cancellation drains admitted queri
   }
 })
 
+test('Issue#90: a detached task of a retired cell is cancelled before the next cell', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: [
+        'import asyncio',
+        'async def late():',
+        '    await asyncio.sleep(0.05)',
+        '    globals()["shared"] = "mutated after cell return"',
+        'asyncio.create_task(late())',
+        'shared = "visible at terminal result"',
+        'shared',
+      ].join('\n'),
+    })
+    const first = await k.next()
+    assert.equal(first.type, 'result')
+    assert.equal(first.result, 'visible at terminal result')
+    // The retired cell's detached task must be cancelled + drained: even a
+    // later cell that waits longer than the task's sleep must not observe it.
+    k.send({
+      type: 'eval',
+      id: 2,
+      code: [
+        'import time',
+        'time.sleep(0.2)',
+        'shared',
+      ].join('\n'),
+    })
+    const second = await k.next()
+    assert.equal(second.type, 'result')
+    assert.equal(second.result, 'visible at terminal result')
+  } finally {
+    await k.close()
+  }
+})
+
+test('Issue#90: kernel-owned frames still flow while a cell spawns and reaps its own tasks', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: [
+        'import asyncio',
+        'async def child():',
+        '    await asyncio.sleep(0.01)',
+        '    return 40',
+        'task = asyncio.create_task(child())',
+        'await task',
+        'outcome = task.result() + 2',
+        'outcome',
+      ].join('\n'),
+    })
+    const result = await k.next()
+    assert.equal(result.type, 'result')
+    assert.equal(result.result, '42')
+  } finally {
+    await k.close()
+  }
+})
+
 test('M7 Issue#36: reverse-completion failures drain and surface the lowest input index', async () => {
   const k = new Kernel()
   try {
