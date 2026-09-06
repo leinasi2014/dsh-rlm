@@ -1,0 +1,475 @@
+from pathlib import Path
+
+
+def replace_once(text: str, old: str, new: str, label: str) -> str:
+    count = text.count(old)
+    if count != 1:
+        raise SystemExit(f"{label}: expected one match, found {count}")
+    return text.replace(old, new, 1)
+
+
+def replace_between(text: str, start: str, end: str, body: str, label: str) -> str:
+    first = text.find(start)
+    if first < 0 or text.find(start, first + 1) >= 0:
+        raise SystemExit(f"{label}: start marker is missing or non-unique")
+    last = text.find(end, first + len(start))
+    if last < 0:
+        raise SystemExit(f"{label}: end marker missing")
+    return text[:first] + body + text[last:]
+
+
+def replace_in_region(text: str, start: str, end: str, old: str, new: str, label: str) -> str:
+    a = text.find(start)
+    b = text.find(end, a + len(start)) if a >= 0 else -1
+    if a < 0 or b < 0:
+        raise SystemExit(f"{label}: region markers missing")
+    region = text[a:b]
+    count = region.count(old)
+    if count != 1:
+        raise SystemExit(f"{label}: expected one regional match, found {count}")
+    return text[:a] + region.replace(old, new, 1) + text[b:]
+
+
+# ---------- TypeScript Host ----------
+rt_path = Path("src/runtime.ts")
+rt = rt_path.read_text(encoding="utf-8")
+rt = replace_once(rt, "const PROTOCOL_VERSION = 4", "const PROTOCOL_VERSION = 5", "host protocol version")
+rt = replace_once(
+    rt,
+    "const CHECKPOINT_CHUNK_BYTES = 128 * 1024\n",
+    """const CHECKPOINT_CHUNK_BYTES = 128 * 1024
+const MAX_CHECKPOINT_CHUNKS = Math.ceil(MAX_SNAPSHOT_BYTES / CHECKPOINT_CHUNK_BYTES)
+const MAX_CHECKPOINT_CHUNK_BASE64_CHARS = Math.ceil(CHECKPOINT_CHUNK_BYTES / 3) * 4
+const CHECKPOINT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+""",
+    "host checkpoint constants",
+)
+rt = replace_once(
+    rt,
+    "  private pendingChunks = new Map<number, { count: number; data: string[] }>()",
+    "  private pendingChunks = new Map<number, { count: number; parts: Buffer[]; bytes: number }>()",
+    "host pending chunk type",
+)
+
+checkpoint_case = """      case 'checkpoint_chunk': {
+        const p = this.pending
+        const id = frame.id
+        const seq = frame.seq
+        const count = frame.count
+        const data = frame.data
+        if (
+          !p
+          || !this.config.snapshotRecovery
+          || !this.snapshotPath
+          || !this.launch
+          || typeof id !== 'number'
+          || typeof seq !== 'number'
+          || typeof count !== 'number'
+          || !Number.isSafeInteger(id)
+          || !Number.isSafeInteger(seq)
+          || !Number.isSafeInteger(count)
+          || id !== p.id
+          || frame.encoding !== 'base64'
+          || typeof data !== 'string'
+        ) {
+          this.handleExit(new RlmError('protocol', 'malformed checkpoint_chunk frame'))
+          return
+        }
+        const maxCount = Math.min(
+          MAX_CHECKPOINT_CHUNKS,
+          Math.max(0, Math.ceil(this.maxSnapshotBytes / CHECKPOINT_CHUNK_BYTES)),
+        )
+        if (count < 1 || count > maxCount || seq < 0 || seq >= count) {
+          this.handleExit(new RlmError('protocol', 'checkpoint_chunk sequence is out of range'))
+          return
+        }
+        if (
+          data.length === 0
+          || data.length > MAX_CHECKPOINT_CHUNK_BASE64_CHARS
+          || data.length % 4 !== 0
+          || !CHECKPOINT_BASE64_RE.test(data)
+        ) {
+          this.handleExit(new RlmError('protocol', 'checkpoint_chunk base64 is invalid'))
+          return
+        }
+        const decoded = Buffer.from(data, 'base64')
+        if (
+          decoded.length < 1
+          || decoded.length > CHECKPOINT_CHUNK_BYTES
+          || decoded.toString('base64') !== data
+          || (seq < count - 1 && decoded.length !== CHECKPOINT_CHUNK_BYTES)
+        ) {
+          this.handleExit(new RlmError('protocol', 'checkpoint_chunk decoded bytes are invalid'))
+          return
+        }
+        const acc = this.pendingChunks.get(id) ?? { count, parts: [], bytes: 0 }
+        if (acc.count !== count || seq !== acc.parts.length) {
+          this.handleExit(new RlmError('protocol', 'checkpoint_chunk is duplicate, reordered, or count-mismatched'))
+          return
+        }
+        const aggregate = acc.bytes + decoded.length
+        if (aggregate > this.maxSnapshotBytes || aggregate > MAX_SNAPSHOT_BYTES) {
+          this.handleExit(new RlmError('protocol', 'checkpoint_chunk aggregate exceeds snapshot limit'))
+          return
+        }
+        acc.parts.push(decoded)
+        acc.bytes = aggregate
+        this.pendingChunks.set(id, acc)
+        return
+      }
+"""
+rt = replace_between(
+    rt,
+    "      case 'checkpoint_chunk': {",
+    "      case 'result':",
+    checkpoint_case,
+    "host checkpoint handler",
+)
+
+on_result = """  private onResult(frame: Frame): void {
+    const p = this.pending
+    if (!p || frame.id !== p.id) {
+      this.handleExit(new RlmError('protocol', 'result frame for unknown cell'))
+      return
+    }
+    const recovery = typeof frame.recovery === 'object' && frame.recovery !== null && !Array.isArray(frame.recovery)
+      ? (frame.recovery as Record<string, unknown>)
+      : undefined
+    const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch !== undefined
+    const chunks = this.pendingChunks.get(p.id)
+    const checkpointCommitted = recovery?.checkpoint_committed === true
+    let checkpointBuffer: Buffer | undefined
+
+    if (chunked && recovery === undefined) {
+      this.handleExit(new RlmError('protocol', 'chunked result is missing recovery metadata'))
+      return
+    }
+    if (!chunked && chunks !== undefined) {
+      this.handleExit(new RlmError('protocol', 'checkpoint chunks arrived for a non-chunked cell'))
+      return
+    }
+    if (chunked && checkpointCommitted) {
+      const declaredBytes = recovery?.checkpoint_bytes
+      if (
+        !chunks
+        || typeof declaredBytes !== 'number'
+        || !Number.isSafeInteger(declaredBytes)
+        || declaredBytes < 1
+        || declaredBytes > this.maxSnapshotBytes
+        || declaredBytes > MAX_SNAPSHOT_BYTES
+        || chunks.bytes !== declaredBytes
+        || chunks.parts.length !== chunks.count
+        || chunks.count !== Math.max(1, Math.ceil(declaredBytes / CHECKPOINT_CHUNK_BYTES))
+      ) {
+        this.handleExit(new RlmError('protocol', 'checkpoint chunk sequence is incomplete or byte count mismatched'))
+        return
+      }
+      checkpointBuffer = Buffer.concat(chunks.parts, chunks.bytes)
+      try {
+        const text = checkpointBuffer.toString('utf8')
+        if (!Buffer.from(text, 'utf8').equals(checkpointBuffer)) {
+          throw new Error('checkpoint is not canonical UTF-8')
+        }
+        const envelope = JSON.parse(text) as unknown
+        if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) {
+          throw new Error('checkpoint envelope is not an object')
+        }
+      } catch {
+        this.handleExit(new RlmError('protocol', 'checkpoint payload is invalid before publication'))
+        return
+      }
+    } else if (chunked && chunks !== undefined) {
+      this.handleExit(new RlmError('protocol', 'checkpoint chunks were emitted without a committed checkpoint'))
+      return
+    }
+
+    this.clearTimer(p)
+    this.detachAbort()
+    this.pending = null
+    this.settling = true
+    const out: RlmEvalOutput = {
+      stdout: String(frame.stdout ?? ''),
+      truncated: frame.truncated === true,
+    }
+    if (typeof frame.result === 'string') out.result = frame.result
+
+    if (checkpointBuffer !== undefined && recovery !== undefined) {
+      try {
+        if (!this.snapshotPath) throw new Error('snapshot path is undefined')
+        const temp = this.snapshotPath + '.tmp-' + String(process.pid)
+        writeFileSync(temp, checkpointBuffer)
+        renameSync(temp, this.snapshotPath)
+      } catch {
+        recovery.checkpoint_committed = false
+        recovery.reason = 'host checkpoint write failed'
+      }
+    }
+    this.pendingChunks.delete(p.id)
+
+    if (recovery !== undefined) {
+      out.recovery = {
+        restored: recovery.restored === true,
+        checkpointCommitted: recovery.checkpoint_committed === true,
+      }
+      if (typeof recovery.checkpoint_bytes === 'number') out.recovery.checkpointBytes = recovery.checkpoint_bytes
+      if (Array.isArray(recovery.skipped)) out.recovery.skipped = recovery.skipped.filter((x): x is string => typeof x === 'string').slice(0, 64)
+      if (typeof recovery.reason === 'string') out.recovery.reason = recovery.reason
+    }
+    if (!this.cellFinish) this.cellFinish = this.finishCell(p, out)
+  }
+
+"""
+rt = replace_between(
+    rt,
+    "  private onResult(frame: Frame): void {",
+    "  private onError(frame: Frame): void {",
+    on_result,
+    "host result publication",
+)
+
+rt = replace_in_region(
+    rt,
+    "  private onError(frame: Frame): void {",
+    "  private clearTimer(p: PendingEval): void {",
+    "    this.detachAbort()\n    this.pending = null",
+    "    this.detachAbort()\n    this.pendingChunks.delete(p.id)\n    this.pending = null",
+    "host error cleanup",
+)
+rt = replace_in_region(
+    rt,
+    "  private cancelCell(p: PendingEval, message: string): void {",
+    "  private handleExit(err: RlmError): void {",
+    "    this.detachAbort()\n    this.pending = null",
+    "    this.detachAbort()\n    this.pendingChunks.delete(p.id)\n    this.pending = null",
+    "host cancel cleanup",
+)
+rt = replace_in_region(
+    rt,
+    "  private handleExit(err: RlmError): void {",
+    "  waitReady(opts:",
+    "    this.continuableChildren.clear()\n    this.settling = true",
+    "    this.continuableChildren.clear()\n    this.pendingChunks.clear()\n    this.settling = true",
+    "host fatal cleanup",
+)
+rt = replace_in_region(
+    rt,
+    "  async evalCell(input: RlmCodeEvalInput",
+    "  private outboundFrameBytes(frame: Frame): number {",
+    "      this.detachAbort()\n      this.pending = null",
+    "      this.detachAbort()\n      this.pendingChunks.delete(p.id)\n      this.pending = null",
+    "host timeout cleanup",
+)
+rt = replace_in_region(
+    rt,
+    "  dispose(): Promise<void> {",
+    "  get keepsCheckpoint(): boolean",
+    "    this.continuableChildren.clear()\n    this.settling = true",
+    "    this.continuableChildren.clear()\n    this.pendingChunks.clear()\n    this.settling = true",
+    "host dispose cleanup",
+)
+
+restore_method = """  private buildRestoreFrames(): Frame[] {
+    if (!this.snapshotPath || !existsSync(this.snapshotPath)) {
+      throw new RlmError('snapshot', 'checkpoint file is missing before restore')
+    }
+    const payload = readFileSync(this.snapshotPath)
+    const limit = Math.min(MAX_SNAPSHOT_BYTES, this.maxSnapshotBytes)
+    if (payload.length < 1 || payload.length > limit) {
+      throw new RlmError('snapshot', 'checkpoint file exceeds the restore byte limit')
+    }
+    const total = Math.ceil(payload.length / CHECKPOINT_CHUNK_BYTES)
+    if (total < 1 || total > MAX_CHECKPOINT_CHUNKS) {
+      throw new RlmError('snapshot', 'checkpoint file has an invalid restore chunk count')
+    }
+    const frames: Frame[] = []
+    for (let seq = 0; seq < total; seq++) {
+      const chunk = payload.subarray(
+        seq * CHECKPOINT_CHUNK_BYTES,
+        Math.min(payload.length, (seq + 1) * CHECKPOINT_CHUNK_BYTES),
+      )
+      frames.push({
+        type: 'restore_chunk',
+        id: 0,
+        seq,
+        total,
+        encoding: 'base64',
+        data: chunk.toString('base64'),
+      })
+    }
+    frames.push({ type: 'restore_end', total, bytes: payload.length, encoding: 'base64' })
+    for (const frame of frames) {
+      if (this.outboundFrameBytes(frame) > MAX_FRAME_BYTES) {
+        throw new RlmError('protocol', 'host restore frame exceeds 256 KiB')
+      }
+    }
+    return frames
+  }
+
+"""
+rt = replace_between(
+    rt,
+    "  private buildRestoreFrames(): Frame[] {",
+    "  async evalCell(input: RlmCodeEvalInput",
+    restore_method,
+    "host restore builder",
+)
+rt_path.write_text(rt, encoding="utf-8")
+
+# ---------- Python kernel ----------
+py_path = Path("python-runtime/rlm_kernel.py")
+py = py_path.read_text(encoding="utf-8")
+py = replace_once(py, "import ast\nimport asyncio\n", "import ast\nimport asyncio\nimport base64\nimport binascii\n", "kernel base64 imports")
+py = replace_once(py, "PROTOCOL_VERSION = 4", "PROTOCOL_VERSION = 5", "kernel protocol version")
+py = replace_once(
+    py,
+    "CHECKPOINT_CHUNK_BYTES = 128 * 1024\n",
+    """CHECKPOINT_CHUNK_BYTES = 128 * 1024
+MAX_CHECKPOINT_CHUNKS = (DEFAULT_MAX_SNAPSHOT_BYTES + CHECKPOINT_CHUNK_BYTES - 1) // CHECKPOINT_CHUNK_BYTES
+MAX_CHECKPOINT_CHUNK_BASE64_CHARS = ((CHECKPOINT_CHUNK_BYTES + 2) // 3) * 4
+""",
+    "kernel checkpoint constants",
+)
+py = replace_once(
+    py,
+    "        self._restore_chunks: list[str] = []\n",
+    """        self._restore_chunks: list[bytes] = []
+        self._restore_total: Optional[int] = None
+        self._restore_bytes = 0
+        self._restore_complete = False
+""",
+    "kernel restore state",
+)
+
+restore_reader = """            if kind == "restore_chunk":
+                seq = frame.get("seq")
+                total = frame.get("total")
+                data = frame.get("data")
+                if (
+                    type(seq) is not int
+                    or type(total) is not int
+                    or total < 1
+                    or total > MAX_CHECKPOINT_CHUNKS
+                    or seq < 0
+                    or seq >= total
+                    or frame.get("encoding") != "base64"
+                    or not isinstance(data, str)
+                    or len(data) == 0
+                    or len(data) > MAX_CHECKPOINT_CHUNK_BASE64_CHARS
+                    or self._restore_complete
+                ):
+                    self._fatal("invalid restore_chunk frame")
+                    return
+                if self._restore_total is None:
+                    self._restore_total = total
+                elif self._restore_total != total:
+                    self._fatal("restore_chunk total mismatch")
+                    return
+                if seq != len(self._restore_chunks):
+                    self._fatal("restore_chunk is duplicate or reordered")
+                    return
+                try:
+                    encoded = data.encode("ascii", "strict")
+                    chunk = base64.b64decode(encoded, validate=True)
+                except (UnicodeEncodeError, binascii.Error, ValueError):
+                    self._fatal("restore_chunk base64 is invalid")
+                    return
+                if (
+                    len(chunk) < 1
+                    or len(chunk) > CHECKPOINT_CHUNK_BYTES
+                    or base64.b64encode(chunk).decode("ascii") != data
+                    or (seq < total - 1 and len(chunk) != CHECKPOINT_CHUNK_BYTES)
+                ):
+                    self._fatal("restore_chunk decoded bytes are invalid")
+                    return
+                aggregate = self._restore_bytes + len(chunk)
+                if aggregate > DEFAULT_MAX_SNAPSHOT_BYTES:
+                    self._fatal("restore_chunk aggregate exceeds snapshot limit")
+                    return
+                self._restore_chunks.append(chunk)
+                self._restore_bytes = aggregate
+            elif kind == "restore_end":
+                total = frame.get("total")
+                byte_count = frame.get("bytes")
+                if (
+                    type(total) is not int
+                    or type(byte_count) is not int
+                    or total < 1
+                    or total > MAX_CHECKPOINT_CHUNKS
+                    or byte_count < 1
+                    or byte_count > DEFAULT_MAX_SNAPSHOT_BYTES
+                    or frame.get("encoding") != "base64"
+                    or self._restore_complete
+                    or self._restore_total is None
+                    or total != self._restore_total
+                    or total != len(self._restore_chunks)
+                    or byte_count != self._restore_bytes
+                    or total != max(1, (byte_count + CHECKPOINT_CHUNK_BYTES - 1) // CHECKPOINT_CHUNK_BYTES)
+                ):
+                    self._fatal("invalid restore_end frame")
+                    return
+                self._restore_complete = True
+            elif kind == "eval":
+                has_restore_state = (
+                    self._restore_total is not None
+                    or bool(self._restore_chunks)
+                    or self._restore_bytes != 0
+                    or self._restore_complete
+                )
+                if has_restore_state:
+                    if not self._restore_complete:
+                        self._fatal("eval arrived with an incomplete restore sequence")
+                        return
+                    payload = b"".join(self._restore_chunks)
+                    if len(payload) != self._restore_bytes:
+                        self._fatal("restore payload byte count changed during assembly")
+                        return
+                    frame["_restore_payload"] = payload
+                    self._restore_chunks.clear()
+                    self._restore_total = None
+                    self._restore_bytes = 0
+                    self._restore_complete = False
+                self.loop.call_soon_threadsafe(self.queue.put_nowait, frame)
+"""
+py = replace_between(
+    py,
+    '            if kind == "restore_chunk":',
+    '            elif kind in ("query_result", "spawn_result", "followup_result", "error"):',
+    restore_reader,
+    "kernel restore reader",
+)
+py = replace_once(
+    py,
+    """                    raw = frame.get("_restore_payload")
+                    if not isinstance(raw, str):
+                        raise RlmSnapshotError("missing chunked restore payload")
+                    self._restore_checkpoint_payload(raw.encode("utf-8", "strict"), max_snapshot_bytes)""",
+    """                    raw = frame.get("_restore_payload")
+                    if not isinstance(raw, bytes):
+                        raise RlmSnapshotError("missing chunked restore payload")
+                    self._restore_checkpoint_payload(raw, max_snapshot_bytes)""",
+    "kernel restore payload type",
+)
+py = replace_once(
+    py,
+    """                            "count": len(chunks),
+                            "data": chunk.decode("utf-8", "strict"),""",
+    """                            "count": len(chunks),
+                            "encoding": "base64",
+                            "data": base64.b64encode(chunk).decode("ascii"),""",
+    "kernel checkpoint sender",
+)
+py_path.write_text(py, encoding="utf-8")
+
+# ---------- protocol fixture ----------
+test_path = Path("tests/rlm-loop.test.ts")
+test_text = test_path.read_text(encoding="utf-8")
+test_text = replace_once(
+    test_text,
+    "  assert.equal(frame.version, 4)",
+    "  assert.equal(frame.version, 5)",
+    "protocol ready assertion",
+)
+test_path.write_text(test_text, encoding="utf-8")
+
+Path(".github/workflows/issue-82-apply-transport-v5.yml").unlink()
+Path(__file__).unlink()
