@@ -1394,7 +1394,7 @@ test('Issue#61: chunked recovery restores managed context metadata emitted by th
       session: { id: 'issue61-context' },
       code: '(keep + 1, context, context_meta["kind"], context_meta["bytes"])',
     })
-    assert.equal(restored.result, "(42, 'context-元数据-hello', 'file', 20)")
+    assert.equal(restored.result, "(42, 'context-元数据-hello', 'file', 23)")
     assert.equal(restored.recovery?.restored, true)
   } finally {
     await runtime.dispose()
