@@ -16,26 +16,33 @@ jobs:
         with:
           ref: codex/issue-61-context-metadata-v2
           fetch-depth: 0
-      - name: Apply exact kernel metadata replacement
+      - name: Apply line-guarded kernel metadata replacement
         shell: bash
         run: |
           python - <<'PY'
           from pathlib import Path
 
           path = Path('python-runtime/rlm_kernel.py')
-          text = path.read_text(encoding='utf-8')
-          old = '''restored_meta.get("read_bytes") != context_bytes
-                or restored_meta.get("canonical_path") != canonical_context_path'''
-          new = '''restored_meta.get("kind") != "file"
-                or type(restored_meta.get("path")) is not str
-                or not os.path.isabs(restored_meta["path"])
-                or type(restored_meta.get("bytes")) is not int
-                or restored_meta["bytes"] < 0
-                or restored_meta["bytes"] != context_bytes
-                or canonical_context_path != restored_meta["path"]'''
-          if text.count(old) != 1:
-              raise SystemExit('Issue #61 metadata block changed; refusing replacement')
-          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          lines = path.read_text(encoding='utf-8').splitlines()
+          needle = 'restored_meta.get("read_bytes") != context_bytes'
+          hits = [i for i, line in enumerate(lines) if needle in line]
+          if len(hits) != 1:
+              raise SystemExit(f'Issue #61 expected exactly one read_bytes line, found {len(hits)}')
+          i = hits[0]
+          if i + 1 >= len(lines) or lines[i + 1].strip() != 'or restored_meta.get("canonical_path") != canonical_context_path':
+              raise SystemExit('Issue #61 canonical_path continuation changed; refusing replacement')
+          indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+          replacement = [
+              indent + 'restored_meta.get("kind") != "file"',
+              indent + 'or type(restored_meta.get("path")) is not str',
+              indent + 'or not os.path.isabs(restored_meta["path"])',
+              indent + 'or type(restored_meta.get("bytes")) is not int',
+              indent + 'or restored_meta["bytes"] < 0',
+              indent + 'or restored_meta["bytes"] != context_bytes',
+              indent + 'or canonical_context_path != restored_meta["path"]',
+          ]
+          lines[i:i + 2] = replacement
+          path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
           Path('.github/workflows/issue-61-apply-kernel.yml').unlink()
           PY
           git diff --check
