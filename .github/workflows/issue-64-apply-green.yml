@@ -1,0 +1,169 @@
+name: issue-64-apply-green
+
+on:
+  push:
+    branches: [codex/issue-64-restore-admission]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-64-restore-admission
+          fetch-depth: 0
+      - name: Apply guarded restore-admission patch and regression
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          runtime_path = Path('src/runtime.ts')
+          text = runtime_path.read_text(encoding='utf-8')
+          old_method = '''  private sendRestoreChunks(): void {
+            if (!this.snapshotPath || !existsSync(this.snapshotPath)) {
+              throw new RlmError('snapshot', 'checkpoint file is missing before restore')
+            }
+            const payload = readFileSync(this.snapshotPath)
+            const total = Math.max(1, Math.ceil(payload.length / CHECKPOINT_CHUNK_BYTES))
+            for (let seq = 0; seq < total; seq++) {
+              const chunk = payload.subarray(seq * CHECKPOINT_CHUNK_BYTES, Math.min(payload.length, (seq + 1) * CHECKPOINT_CHUNK_BYTES))
+              this.write({ type: 'restore_chunk', seq, total, id: 0, data: chunk.toString('utf8') })
+            }
+            this.write({ type: 'restore_end', total })
+          }
+          '''
+          new_method = '''  private buildRestoreFrames(): Frame[] {
+            if (!this.snapshotPath || !existsSync(this.snapshotPath)) {
+              throw new RlmError('snapshot', 'checkpoint file is missing before restore')
+            }
+            const payload = readFileSync(this.snapshotPath)
+            const total = Math.max(1, Math.ceil(payload.length / CHECKPOINT_CHUNK_BYTES))
+            const frames: Frame[] = []
+            for (let seq = 0; seq < total; seq++) {
+              const chunk = payload.subarray(seq * CHECKPOINT_CHUNK_BYTES, Math.min(payload.length, (seq + 1) * CHECKPOINT_CHUNK_BYTES))
+              frames.push({ type: 'restore_chunk', seq, total, id: 0, data: chunk.toString('utf8') })
+            }
+            frames.push({ type: 'restore_end', total })
+            for (const frame of frames) {
+              if (this.outboundFrameBytes(frame) > MAX_FRAME_BYTES) {
+                throw new RlmError('protocol', 'host restore frame exceeds 256 KiB')
+              }
+            }
+            return frames
+          }
+          '''
+          if text.count(old_method) != 1:
+            raise SystemExit('sendRestoreChunks block not found exactly once')
+          text = text.replace(old_method, new_method, 1)
+
+          old_restore = '''      const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch !== undefined
+              if (this.config.snapshotRecovery && this.snapshotPath) {
+                evalFrame.snapshot_recovery = true
+                evalFrame.max_snapshot_bytes = this.maxSnapshotBytes
+                if (chunked) evalFrame.snapshot_chunked = true
+                else evalFrame.snapshot_path = this.snapshotPath
+                if (this.restoreSnapshot) {
+                  // Recovery is a one-shot bootstrap action. Consume before writing so a
+                  // typed restore failure leaves this fresh kernel clean on its next
+                  // eval instead of replaying a stale/malformed checkpoint forever.
+                  this.restoreSnapshot = false
+                  evalFrame.restore_snapshot = true
+                  if (chunked) this.sendRestoreChunks()
+                }
+              }
+              if (input.contextPath !== undefined) evalFrame.context_path = input.contextPath
+              if (this.outboundFrameBytes(evalFrame) > MAX_FRAME_BYTES) {
+                throw new RlmError('protocol', 'host frame exceeds 256 KiB')
+              }
+          '''
+          new_restore = '''      const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch !== undefined
+              const restorePending = this.restoreSnapshot
+              let restoreFrames: Frame[] = []
+              if (this.config.snapshotRecovery && this.snapshotPath) {
+                evalFrame.snapshot_recovery = true
+                evalFrame.max_snapshot_bytes = this.maxSnapshotBytes
+                if (chunked) evalFrame.snapshot_chunked = true
+                else evalFrame.snapshot_path = this.snapshotPath
+                if (restorePending) {
+                  evalFrame.restore_snapshot = true
+                  if (chunked) restoreFrames = this.buildRestoreFrames()
+                }
+              }
+              if (input.contextPath !== undefined) evalFrame.context_path = input.contextPath
+              if (this.outboundFrameBytes(evalFrame) > MAX_FRAME_BYTES) {
+                throw new RlmError('protocol', 'host frame exceeds 256 KiB')
+              }
+          '''
+          if text.count(old_restore) != 1:
+            raise SystemExit('restore preflight block not found exactly once')
+          text = text.replace(old_restore, new_restore, 1)
+
+          old_send = '''    // A signal that was already aborted cancels the cell synchronously above;
+              // only send the eval frame if this cell is still pending.
+              if (this.pending !== p) return promise
+              this.write(evalFrame)
+              return promise
+          '''
+          new_send = '''    // A signal that was already aborted cancels the cell synchronously above;
+              // only commit the one-shot restore and send frames after every host-side
+              // preflight passed and this cell is still the admitted pending cell.
+              if (this.pending !== p) return promise
+              if (restorePending) {
+                this.restoreSnapshot = false
+                for (const frame of restoreFrames) this.write(frame)
+              }
+              this.write(evalFrame)
+              return promise
+          '''
+          if text.count(old_send) != 1:
+            raise SystemExit('eval send admission block not found exactly once')
+          text = text.replace(old_send, new_send, 1)
+          runtime_path.write_text(text, encoding='utf-8')
+
+          test_path = Path('tests/rlm-loop.test.ts')
+          tests = test_path.read_text(encoding='utf-8')
+          marker = "test('M10 Issue#44: reset deletes the durable reference for that Session only', async () => {"
+          pos = tests.find(marker)
+          if pos < 0:
+            raise SystemExit('test insertion marker not found')
+          if 'Issue#64: rejected oversized eval does not consume pending snapshot restore' in tests:
+            raise SystemExit('Issue #64 regression already present')
+          block = r'''test('Issue#64: rejected oversized eval does not consume pending snapshot restore', async () => {
+            const { createRlmRuntime, RlmError } = await import('../src/runtime.ts')
+            const runtime = createRlmRuntime(undefined, { snapshotRecovery: true, timeout: 8_000 })
+            try {
+              const saved = await runtime.eval('issue64-restore-admit', { code: 'keep = 41' })
+              assert.equal(saved.recovery?.checkpointCommitted, true)
+              await assert.rejects(
+                runtime.eval('issue64-restore-admit', { code: 'import os\nos._exit(13)' }),
+                (error: unknown) => error instanceof RlmError && error.kind === 'closed',
+              )
+              await assert.rejects(
+                runtime.eval('issue64-restore-admit', { code: '#' + 'x'.repeat(300_000) }),
+                (error: unknown) => error instanceof RlmError && error.kind === 'protocol',
+              )
+              const restored = await runtime.eval('issue64-restore-admit', { code: 'keep + 1' })
+              assert.equal(restored.result, '42')
+              assert.equal(restored.recovery?.restored, true)
+            } finally {
+              await runtime.dispose()
+            }
+          })
+
+          '''
+          test_path.write_text(tests[:pos] + block + tests[pos:], encoding='utf-8')
+          Path('.github/workflows/issue-64-apply-green.yml').unlink()
+          PY
+      - name: Commit exact patch and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime.ts tests/rlm-loop.test.ts .github/workflows/issue-64-apply-green.yml
+          git commit -m "fix(issue-64): consume snapshot restore only after eval admission"
+          git push origin HEAD:codex/issue-64-restore-admission
