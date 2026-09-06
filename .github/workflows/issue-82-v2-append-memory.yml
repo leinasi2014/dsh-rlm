@@ -1,0 +1,75 @@
+name: issue-82-v2-append-memory
+
+on:
+  push:
+    branches: [codex/issue-82-checkpoint-transport-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  append:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-82-checkpoint-transport-v2
+          fetch-depth: 0
+      - name: Append development-memory record byte-safely
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          record = {
+              "schemaVersion": 1,
+              "recordId": "mem-20260906-issue82-chatgpt-transport-v5-v2",
+              "recordedAt": "2026-09-06T15:17:00+08:00",
+              "agent": {
+                  "name": "chatgpt-protocol-implementer",
+                  "id": "chatgpt-protocol-implementer",
+                  "model": "GPT-5.6 Sol",
+                  "role": "implementer",
+                  "reasoning": "high"
+              },
+              "issue": 82,
+              "workItem": "issue-0081-0082-v2",
+              "baseCommit": "2056d90ed825402a4cadc5bf80da29b4d31da2a1",
+              "candidateRef": "be9c8240ddf49d5f8063b1bd89e86fcd4b052b73",
+              "summary": "Clean replay of the verified private protocol-v5 checkpoint transport for #81/#82: canonical base64 carries raw 128 KiB chunks in both directions; Host validates active-cell ownership, safe integer sequence/count, canonical base64, decoded byte/aggregate limits and complete publication before replacing the previous snapshot; Python validates the mirrored restore sequence and receives raw bytes.",
+              "files": [
+                  {"path": "src/runtime.ts", "pointers": ["PROTOCOL_VERSION=5", "checkpoint_chunk validation", "onResult complete-candidate publication", "buildRestoreFrames base64", "terminal accumulator cleanup"]},
+                  {"path": "python-runtime/rlm_kernel.py", "pointers": ["PROTOCOL_VERSION=5", "base64 restore reader", "bytes restore payload", "base64 checkpoint sender"]},
+                  {"path": "tests/rlm-checkpoint-transport.test.ts", "pointers": ["CJK/escaped/durable round trips", "foreign/negative/fractional/out-of-range/duplicate malformed chunks"]},
+                  {"path": "tests/rlm-loop.test.ts", "pointers": ["ready protocol version 5"]},
+                  {"path": "package.json", "pointers": ["scripts.test includes tests/rlm-checkpoint-transport.test.ts"]}
+              ],
+              "steps": [
+                  "Preserved the executable RED evidence from superseded PR #104, where unchanged v4 production failed the new multilingual/framing and malformed-chunk regressions as expected.",
+                  "Preserved the pre-commit GREEN evidence from one-shot Actions run 34018491215: guarded edits, git diff --check, Python compilation, TypeScript typecheck and the focused #81/#82 suite all passed before candidate 6521a9a was created.",
+                  "Replayed the exact verified final candidate tree as one new commit directly on current main, eliminating the unmergeable development-memory history from PR #104 without force-pushing or bypassing the append-only gate."
+              ],
+              "evidence": [
+                  {"kind": "test", "target": "superseded PR #104 RED run 34018105965", "result": "FAIL", "note": "Expected RED: v4 split CJK UTF-8 at byte 131071, escaped data exceeded the 256 KiB frame, Host-to-kernel non-ASCII restore was corrupted, and malformed chunks were accepted."},
+                  {"kind": "test", "target": "superseded PR #104 guarded GREEN workflow 34018491215", "result": "PASS", "note": "Guarded production edits, git diff check, py_compile, pnpm typecheck, focused checkpoint transport suite and commit/push all passed."},
+                  {"kind": "review", "target": "v2 tree replay be9c8240ddf49d5f8063b1bd89e86fcd4b052b73", "result": "PASS", "note": "The v2 commit points to the same final verified candidate tree with current main as its sole parent; temporary patch workflow/script and the bad #104 history are absent."},
+                  {"kind": "test", "target": "v2 Windows+Ubuntu full PR CI", "result": "NOT_RUN", "note": "Authoritative full matrix will run after this append-only record is committed and the v2 PR is opened."}
+              ],
+              "limitations": [
+                  "Durable crash consistency, at-rest permissions and aggregate durable quota remain #71/#83/#89.",
+                  "Protocol v5 is private and intentionally fail-closed; mixed v4/v5 Host/kernel files fail during the ready handshake."
+              ]
+          }
+          path = Path("docs/development-memory/records/2026/issue-82.jsonl")
+          with path.open("a", encoding="utf-8", newline="") as handle:
+              handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+          Path(".github/workflows/issue-82-v2-append-memory.yml").unlink()
+          PY
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m 'docs(issue-82): append clean v2 transport evidence'
+          git push origin HEAD:codex/issue-82-checkpoint-transport-v2
