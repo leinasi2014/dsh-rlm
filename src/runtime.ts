@@ -1,5 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
+import { RLM_SETTINGS_MANIFEST, type RlmRuntimeTierASettings, type RlmSettingsSpec, type RlmTierASettings } from './settings-manifest.js'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
@@ -259,67 +260,52 @@ function resolveTaskkill(): string {
   return path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe')
 }
 
-export interface RlmRuntimeConfig {
-  enabled?: boolean
-  /** Python interpreter command. Defaults to the `python` on PATH. */
-  python?: string
-  /** Total timeout budget for one eval (startup handshake + cell execution). */
-  timeout?: number
-  /** Byte cap for a cell's captured stdout. */
-  maxStdout?: number
-  /** Byte cap for a cell's resulting expression text. */
-  maxResult?: number
-  /** Max number of rlm_query calls a single cell may make. */
-  maxQueries?: number
-  /** Byte cap for one kernel-managed UTF-8 context file. */
-  maxContextBytes?: number
-  /** Sandbox confinement for the Session Python kernel. */
-  kernelSandbox?: 'auto' | 'require' | 'off'
-  /** Optional host-owned durable root for cross-restart M10 checkpoint references. */
-  durableRoot?: string
-  /** Opt-in M5 recovery after an owned timeout/crash/protocol-fatal loss. */
-  snapshotRecovery?: boolean
+export type RlmRuntimeConfig = RlmRuntimeTierASettings & {
   /**
-   * Idle TTL before a ready kernel is released (Issue #76). Bounded retention:
-   * active/queued cells are never evicted and M5/M10 recovery remains the
-   * resume path. Runtime-only knob; the schema/GUI keep the documented limits.
+   * Idle TTL before a ready kernel is released (Issue #76). Bounded
+   * retention only; this runtime-only knob is intentionally absent
+   * from the 14-field Tier-A settings manifest and GUI.
    */
   kernelIdleTtlMs?: number
 }
 
-/** Plugin-facing configuration: runtime settings plus the subagent provider. */
-export interface RlmPluginConfig extends RlmRuntimeConfig {
-  /** The `ctx.subagents` provider used for each one-shot rlm_query child. */
-  provider?: string
-  /** Absolute official DSH delegation cap for an rlm_query child branch. */
-  maxDepth?: number
-  /** Enable the per-cell observed-token guard (M11). */
-  guardQueryTokens?: boolean
-  /** Observed token ceiling per cell before query admission is rejected (M11). */
-  maxQueryTokensPerCell?: number
+/** Plugin-facing Tier-A settings plus the runtime-only idle TTL. */
+export type RlmPluginConfig = RlmTierASettings & {
+  kernelIdleTtlMs?: number
 }
 
+/** Build one Host Schemastery field from the environment-neutral manifest. */
+function schemaForSettingsSpec(spec: RlmSettingsSpec): z<unknown> {
+  let schema: any
+  switch (spec.kind) {
+    case 'toggle':
+      schema = z.boolean()
+      break
+    case 'text':
+      schema = z.string()
+      if ('hostMinLength' in spec && spec.hostMinLength !== undefined) schema = schema.min(spec.hostMinLength)
+      break
+    case 'number':
+      schema = z.natural().min(spec.min).max(spec.max)
+      break
+    case 'select':
+      schema = z.union(spec.options.map(option => z.const(option)) as any)
+      break
+  }
+  if (spec.schemaDefault) schema = schema.default(spec.default)
+  return schema.description(spec.description) as z<unknown>
+}
+
+const CONFIG_SCHEMA_FIELDS = Object.fromEntries(
+  RLM_SETTINGS_MANIFEST.map(spec => [spec.key, schemaForSettingsSpec(spec)]),
+) as Record<string, z<unknown>>
+
 /**
- * Single authoritative Config schema for the plugin. `src/index.ts` re-exports
- * this exact schema as its public `Config`; it is also the in-source test seam
- * that `tests/rlm-loop.test.ts` reads dynamically.
+ * Single authoritative Config schema for the plugin. Field names,
+ * defaults, ranges and enum choices come from RLM_SETTINGS_MANIFEST;
+ * Tier-B live validation remains in settings.ts.
  */
-export const ConfigSchema: z<RlmPluginConfig> = z.object({
-  enabled: z.boolean().default(false).description('Enable dsh-rlm after the local kernel/query loop is implemented.'),
-  provider: z.string().default('spawn').description('The ctx.subagents provider used to answer each rlm_query call.'),
-  python: z.string().min(1).default('python').description('Python interpreter command; defaults to the python on PATH.'),
-  timeout: z.natural().min(1000).max(3600000).default(30000).description('Per-eval total timeout in milliseconds.'),
-  maxStdout: z.natural().min(1024).max(262144).default(65536).description('Byte cap for a cell captured stdout.'),
-  maxResult: z.natural().min(1024).max(262144).default(65536).description('Byte cap for a cell last-expression result.'),
-  maxQueries: z.natural().min(1).max(4096).default(16).description('Max rlm_query calls per cell.'),
-  maxContextBytes: z.natural().min(1048576).max(1073741824).default(67108864).description('Byte cap for one kernel-managed UTF-8 context file.'),
-  kernelSandbox: z.union([z.const('auto'), z.const('require'), z.const('off')]).default('auto').description('Sandbox confinement for the Session Python kernel: auto uses DSH ctx.sandbox when available, require fails closed, off keeps trusted local spawn.'),
-  durableRoot: z.string().description('Optional absolute host-owned directory for cross-restart durable checkpoint references (M10).'),
-  snapshotRecovery: z.boolean().default(false).description('Restore a private bounded checkpoint after an owned kernel fault.'),
-  maxDepth: z.natural().min(1).max(8).default(DEFAULT_MAX_DEPTH).description('Absolute DSH delegation-depth cap for recursive rlm_query children.'),
-  guardQueryTokens: z.boolean().default(false).description('Reject query admission when the observed token usage exceeds the per-cell ceiling (M11).'),
-  maxQueryTokensPerCell: z.natural().max(1073741824).default(0).description('Observed token ceiling per cell; 0 means no ceiling.'),
-})
+export const ConfigSchema: z<RlmPluginConfig> = z.object(CONFIG_SCHEMA_FIELDS) as unknown as z<RlmPluginConfig>
 
 interface RlmEvalCommon {
   /**

@@ -1,3 +1,5 @@
+import { RLM_SETTINGS_MANIFEST, rlmSettingsSpec, type RlmManifestKind, type RlmManifestTab, type RlmSettingsKey, type RlmSettingsSpec, type RlmTierASettings } from '../settings-manifest.js'
+
 /**
  * Pure, React-free, DSH-free model behind the dsh-rlm settings card.
  *
@@ -8,93 +10,32 @@
  * validation, and the Save/Saving/Saved/Failed state machine.
  *
  * Effective value rule (frozen M13 contract): user layer > composition layer >
- * schema default. The card's hard-coded defaults mirror the single authoritative
- * `ConfigSchema` (`src/runtime.ts`), including `maxDepth` default `1` (task-1
- * determination: the schema default stays 1 to preserve M1-M12 byte-equivalence
- * when no user settings exist).
+ * schema default. Field keys/defaults/ranges/options come from the shared pure
+ * `RLM_SETTINGS_MANIFEST`; Host-only validation remains outside browser code.
  */
 
 export const RLM_SETTINGS_NAMESPACE = 'rlm' as const
 export const RLM_SETTINGS_LOCALE_NS = 'rlm.settings' as const
 
-export type RlmTab = 'core' | 'bounded' | 'recovery' | 'guard'
-export type RlmFieldKind = 'toggle' | 'select' | 'number' | 'text'
+export type RlmTab = RlmManifestTab
+export type RlmFieldKind = RlmManifestKind
+export type RlmSettings = RlmTierASettings
+export type RlmFieldKey = RlmSettingsKey
+export type RlmFieldSpec = RlmSettingsSpec
 
-/** User-configurable (Tier A) settings fields; exactly the 14 schema fields. */
-export interface RlmSettings {
-  enabled?: boolean
-  provider?: string
-  python?: string
-  timeout?: number
-  maxStdout?: number
-  maxResult?: number
-  maxQueries?: number
-  maxContextBytes?: number
-  kernelSandbox?: 'auto' | 'require' | 'off'
-  durableRoot?: string
-  snapshotRecovery?: boolean
-  maxDepth?: number
-  guardQueryTokens?: boolean
-  maxQueryTokensPerCell?: number
-}
-
-export type RlmFieldKey = keyof RlmSettings
-
-export interface RlmFieldSpec {
-  readonly key: RlmFieldKey
-  readonly tab: RlmTab
-  readonly kind: RlmFieldKind
-  readonly default: boolean | number | string
-  readonly min?: number
-  readonly max?: number
-  readonly options?: readonly string[]
-  readonly required?: boolean
-}
-
-/**
- * The 14 Tier A fields, grouped into the four card tabs. No Tier-C system-managed
- * constant (frame caps, CHECKPOINT_CHUNK_BYTES, env allowlist, provider/model
- * selection) is surfaced here.
- */
-export const RLM_FIELDS: readonly RlmFieldSpec[] = [
-  { key: 'enabled', tab: 'core', kind: 'toggle', default: false },
-  { key: 'provider', tab: 'core', kind: 'text', default: 'spawn', required: true },
-  { key: 'python', tab: 'core', kind: 'text', default: 'python', required: true },
-  { key: 'maxDepth', tab: 'core', kind: 'number', default: 1, min: 1, max: 8 },
-  { key: 'timeout', tab: 'bounded', kind: 'number', default: 30_000, min: 1000, max: 3_600_000 },
-  { key: 'maxStdout', tab: 'bounded', kind: 'number', default: 65_536, min: 1024, max: 262_144 },
-  { key: 'maxResult', tab: 'bounded', kind: 'number', default: 65_536, min: 1024, max: 262_144 },
-  { key: 'maxQueries', tab: 'bounded', kind: 'number', default: 16, min: 1, max: 4096 },
-  { key: 'maxContextBytes', tab: 'bounded', kind: 'number', default: 67_108_864, min: 1_048_576, max: 1_073_741_824 },
-  { key: 'snapshotRecovery', tab: 'recovery', kind: 'toggle', default: false },
-  { key: 'kernelSandbox', tab: 'recovery', kind: 'select', default: 'auto', options: ['auto', 'require', 'off'] },
-  { key: 'durableRoot', tab: 'recovery', kind: 'text', default: '' },
-  { key: 'guardQueryTokens', tab: 'guard', kind: 'toggle', default: false },
-  { key: 'maxQueryTokensPerCell', tab: 'guard', kind: 'number', default: 0, min: 0, max: 1_073_741_824 },
-] as const
+/** The exact shared Tier-A manifest; no browser-side metadata mirror. */
+export const RLM_FIELDS: readonly RlmFieldSpec[] = RLM_SETTINGS_MANIFEST
 
 /** Staged, user-typed value for every field (booleans for toggles, text otherwise). */
-export interface RlmDraft {
-  enabled: boolean
-  provider: string
-  python: string
-  maxDepth: string
-  timeout: string
-  maxStdout: string
-  maxResult: string
-  maxQueries: string
-  maxContextBytes: string
-  snapshotRecovery: boolean
-  kernelSandbox: string
-  durableRoot: string
-  guardQueryTokens: boolean
-  maxQueryTokensPerCell: string
+type DraftValueForSpec<S> = S extends { readonly kind: 'toggle' } ? boolean : string
+
+/** Staged values are generated from the same 14-field manifest. */
+export type RlmDraft = {
+  [S in RlmFieldSpec as S['key']]: DraftValueForSpec<S>
 }
 
 export function fieldSpec(key: RlmFieldKey): RlmFieldSpec {
-  const spec = RLM_FIELDS.find(candidate => candidate.key === key)
-  if (spec === undefined) throw new Error(`unknown RLM settings field: ${String(key)}`)
-  return spec
+  return rlmSettingsSpec(key)
 }
 
 export function tabFields(tab: RlmTab): readonly RlmFieldKey[] {
@@ -108,22 +49,13 @@ export function tabFields(tab: RlmTab): readonly RlmFieldKey[] {
  * its typed value.
  */
 export function deriveDraft(settings: RlmSettings | undefined): RlmDraft {
-  return {
-    enabled: settings?.enabled ?? false,
-    provider: settings?.provider ?? 'spawn',
-    python: settings?.python ?? 'python',
-    maxDepth: String(settings?.maxDepth ?? 1),
-    timeout: String(settings?.timeout ?? 30_000),
-    maxStdout: String(settings?.maxStdout ?? 65_536),
-    maxResult: String(settings?.maxResult ?? 65_536),
-    maxQueries: String(settings?.maxQueries ?? 16),
-    maxContextBytes: String(settings?.maxContextBytes ?? 67_108_864),
-    snapshotRecovery: settings?.snapshotRecovery ?? false,
-    kernelSandbox: settings?.kernelSandbox ?? 'auto',
-    durableRoot: settings?.durableRoot ?? '',
-    guardQueryTokens: settings?.guardQueryTokens ?? false,
-    maxQueryTokensPerCell: String(settings?.maxQueryTokensPerCell ?? 0),
+  const draft: Partial<Record<RlmFieldKey, boolean | string>> = {}
+  for (const spec of RLM_FIELDS) {
+    const configured = settings?.[spec.key]
+    const effective = configured ?? spec.default
+    draft[spec.key] = spec.kind === 'toggle' ? effective as boolean : String(effective)
   }
+  return draft as RlmDraft
 }
 
 /** The set of fields the raw user layer carries. Presence, not value, marks an override. */
