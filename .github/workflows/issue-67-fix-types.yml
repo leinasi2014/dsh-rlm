@@ -1,0 +1,42 @@
+name: issue-67-fix-types
+on:
+  push:
+    branches: [codex/issue-67-snapshot-io-v2]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-67-snapshot-io-v2
+      - name: Apply compile-only correction
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/runtime.ts')
+          text = p.read_text(encoding='utf-8')
+          old_import = "import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'"
+          new_import = "import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'"
+          if text.count(old_import) != 1:
+              raise SystemExit('sync fs import anchor changed')
+          text = text.replace(old_import, new_import, 1)
+          old_type = "private durableFingerprint(info: ReturnType<typeof lstatSync>): string"
+          new_type = "private durableFingerprint(info: NonNullable<ReturnType<typeof lstatSync>>): string"
+          old_opt = "private rememberDurableGeneration(sessionKey: string, payload: Buffer, info?: ReturnType<typeof lstatSync>): void"
+          new_opt = "private rememberDurableGeneration(sessionKey: string, payload: Buffer, info?: NonNullable<ReturnType<typeof lstatSync>>): void"
+          if text.count(old_type) != 1 or text.count(old_opt) != 1:
+              raise SystemExit('durable stat type anchors changed')
+          text = text.replace(old_type, new_type, 1).replace(old_opt, new_opt, 1)
+          p.write_text(text, encoding='utf-8')
+          Path('.github/workflows/issue-67-fix-types.yml').unlink()
+          PY
+      - name: Commit correction and remove workflow
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime.ts .github/workflows/issue-67-fix-types.yml
+          git commit -m "fix(issue-67): clean async fs imports and stat narrowing"
+          git push origin HEAD:codex/issue-67-snapshot-io-v2
