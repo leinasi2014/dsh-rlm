@@ -24,105 +24,92 @@ jobs:
 
           runtime_path = Path('src/runtime.ts')
           text = runtime_path.read_text(encoding='utf-8')
-          old_method = '''  private sendRestoreChunks(): void {
-            if (!this.snapshotPath || !existsSync(this.snapshotPath)) {
-              throw new RlmError('snapshot', 'checkpoint file is missing before restore')
-            }
-            const payload = readFileSync(this.snapshotPath)
-            const total = Math.max(1, Math.ceil(payload.length / CHECKPOINT_CHUNK_BYTES))
-            for (let seq = 0; seq < total; seq++) {
-              const chunk = payload.subarray(seq * CHECKPOINT_CHUNK_BYTES, Math.min(payload.length, (seq + 1) * CHECKPOINT_CHUNK_BYTES))
-              this.write({ type: 'restore_chunk', seq, total, id: 0, data: chunk.toString('utf8') })
-            }
-            this.write({ type: 'restore_end', total })
-          }
-          '''
-          new_method = '''  private buildRestoreFrames(): Frame[] {
-            if (!this.snapshotPath || !existsSync(this.snapshotPath)) {
-              throw new RlmError('snapshot', 'checkpoint file is missing before restore')
-            }
-            const payload = readFileSync(this.snapshotPath)
-            const total = Math.max(1, Math.ceil(payload.length / CHECKPOINT_CHUNK_BYTES))
-            const frames: Frame[] = []
-            for (let seq = 0; seq < total; seq++) {
-              const chunk = payload.subarray(seq * CHECKPOINT_CHUNK_BYTES, Math.min(payload.length, (seq + 1) * CHECKPOINT_CHUNK_BYTES))
-              frames.push({ type: 'restore_chunk', seq, total, id: 0, data: chunk.toString('utf8') })
-            }
-            frames.push({ type: 'restore_end', total })
-            for (const frame of frames) {
-              if (this.outboundFrameBytes(frame) > MAX_FRAME_BYTES) {
-                throw new RlmError('protocol', 'host restore frame exceeds 256 KiB')
-              }
-            }
-            return frames
-          }
-          '''
-          if text.count(old_method) != 1:
-            raise SystemExit('sendRestoreChunks block not found exactly once')
-          text = text.replace(old_method, new_method, 1)
 
-          old_restore = '''      const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch !== undefined
-              if (this.config.snapshotRecovery && this.snapshotPath) {
-                evalFrame.snapshot_recovery = true
-                evalFrame.max_snapshot_bytes = this.maxSnapshotBytes
-                if (chunked) evalFrame.snapshot_chunked = true
-                else evalFrame.snapshot_path = this.snapshotPath
-                if (this.restoreSnapshot) {
-                  // Recovery is a one-shot bootstrap action. Consume before writing so a
-                  // typed restore failure leaves this fresh kernel clean on its next
-                  // eval instead of replaying a stale/malformed checkpoint forever.
-                  this.restoreSnapshot = false
-                  evalFrame.restore_snapshot = true
-                  if (chunked) this.sendRestoreChunks()
-                }
-              }
-              if (input.contextPath !== undefined) evalFrame.context_path = input.contextPath
-              if (this.outboundFrameBytes(evalFrame) > MAX_FRAME_BYTES) {
-                throw new RlmError('protocol', 'host frame exceeds 256 KiB')
-              }
-          '''
-          new_restore = '''      const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch !== undefined
-              const restorePending = this.restoreSnapshot
-              let restoreFrames: Frame[] = []
-              if (this.config.snapshotRecovery && this.snapshotPath) {
-                evalFrame.snapshot_recovery = true
-                evalFrame.max_snapshot_bytes = this.maxSnapshotBytes
-                if (chunked) evalFrame.snapshot_chunked = true
-                else evalFrame.snapshot_path = this.snapshotPath
-                if (restorePending) {
-                  evalFrame.restore_snapshot = true
-                  if (chunked) restoreFrames = this.buildRestoreFrames()
-                }
-              }
-              if (input.contextPath !== undefined) evalFrame.context_path = input.contextPath
-              if (this.outboundFrameBytes(evalFrame) > MAX_FRAME_BYTES) {
-                throw new RlmError('protocol', 'host frame exceeds 256 KiB')
-              }
-          '''
-          if text.count(old_restore) != 1:
-            raise SystemExit('restore preflight block not found exactly once')
-          text = text.replace(old_restore, new_restore, 1)
+          method_start = text.find('  private sendRestoreChunks(): void {')
+          method_end = text.find('\n\n  async evalCell(', method_start)
+          if method_start < 0 or method_end < 0:
+              raise SystemExit('restore helper anchors not found')
+          old_method = text[method_start:method_end]
+          for token in ['readFileSync(this.snapshotPath)', "chunk.toString('utf8')", "this.write({ type: 'restore_end'"]:
+              if token not in old_method:
+                  raise SystemExit('restore helper root cause changed: ' + token)
+          new_method = "\n".join([
+              "  private buildRestoreFrames(): Frame[] {",
+              "    if (!this.snapshotPath || !existsSync(this.snapshotPath)) {",
+              "      throw new RlmError('snapshot', 'checkpoint file is missing before restore')",
+              "    }",
+              "    const payload = readFileSync(this.snapshotPath)",
+              "    const total = Math.max(1, Math.ceil(payload.length / CHECKPOINT_CHUNK_BYTES))",
+              "    const frames: Frame[] = []",
+              "    for (let seq = 0; seq < total; seq++) {",
+              "      const chunk = payload.subarray(seq * CHECKPOINT_CHUNK_BYTES, Math.min(payload.length, (seq + 1) * CHECKPOINT_CHUNK_BYTES))",
+              "      frames.push({ type: 'restore_chunk', seq, total, id: 0, data: chunk.toString('utf8') })",
+              "    }",
+              "    frames.push({ type: 'restore_end', total })",
+              "    for (const frame of frames) {",
+              "      if (this.outboundFrameBytes(frame) > MAX_FRAME_BYTES) {",
+              "        throw new RlmError('protocol', 'host restore frame exceeds 256 KiB')",
+              "      }",
+              "    }",
+              "    return frames",
+              "  }",
+          ])
+          text = text[:method_start] + new_method + text[method_end:]
 
-          old_send = '''    // A signal that was already aborted cancels the cell synchronously above;
-              // only send the eval frame if this cell is still pending.
-              if (this.pending !== p) return promise
-              this.write(evalFrame)
-              return promise
-          '''
-          new_send = '''    // A signal that was already aborted cancels the cell synchronously above;
-              // only commit the one-shot restore and send frames after every host-side
-              // preflight passed and this cell is still the admitted pending cell.
-              if (this.pending !== p) return promise
-              if (restorePending) {
-                this.restoreSnapshot = false
-                for (const frame of restoreFrames) this.write(frame)
-              }
-              this.write(evalFrame)
-              return promise
-          '''
-          if text.count(old_send) != 1:
-            raise SystemExit('eval send admission block not found exactly once')
-          text = text.replace(old_send, new_send, 1)
+          eval_start = text.find('  async evalCell(')
+          preflight_start = text.find('    const chunked = this.config.snapshotRecovery', eval_start)
+          preflight_end = text.find('    let resolve!:', preflight_start)
+          if preflight_start < 0 or preflight_end < 0:
+              raise SystemExit('restore preflight anchors not found')
+          old_preflight = text[preflight_start:preflight_end]
+          for token in ['this.restoreSnapshot = false', 'this.sendRestoreChunks()', "throw new RlmError('protocol', 'host frame exceeds 256 KiB')"]:
+              if token not in old_preflight:
+                  raise SystemExit('restore preflight root cause changed: ' + token)
+          new_preflight = "\n".join([
+              "    const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch !== undefined",
+              "    const restorePending = this.restoreSnapshot",
+              "    let restoreFrames: Frame[] = []",
+              "    if (this.config.snapshotRecovery && this.snapshotPath) {",
+              "      evalFrame.snapshot_recovery = true",
+              "      evalFrame.max_snapshot_bytes = this.maxSnapshotBytes",
+              "      if (chunked) evalFrame.snapshot_chunked = true",
+              "      else evalFrame.snapshot_path = this.snapshotPath",
+              "      if (restorePending) {",
+              "        evalFrame.restore_snapshot = true",
+              "        if (chunked) restoreFrames = this.buildRestoreFrames()",
+              "      }",
+              "    }",
+              "    if (input.contextPath !== undefined) evalFrame.context_path = input.contextPath",
+              "    if (this.outboundFrameBytes(evalFrame) > MAX_FRAME_BYTES) {",
+              "      throw new RlmError('protocol', 'host frame exceeds 256 KiB')",
+              "    }",
+              "",
+          ])
+          text = text[:preflight_start] + new_preflight + text[preflight_end:]
+
+          send_start = text.find('    // A signal that was already aborted cancels the cell synchronously above;', preflight_start)
+          send_end_marker = '    return promise\n'
+          send_end = text.find(send_end_marker, send_start)
+          if send_start < 0 or send_end < 0:
+              raise SystemExit('eval send anchors not found')
+          send_end += len(send_end_marker)
+          old_send = text[send_start:send_end]
+          if 'if (this.pending !== p) return promise' not in old_send or 'this.write(evalFrame)' not in old_send:
+              raise SystemExit('eval send root cause changed')
+          new_send = "\n".join([
+              "    // A signal that was already aborted cancels the cell synchronously above;",
+              "    // only commit the one-shot restore after every host preflight passed",
+              "    // and this cell is still the admitted pending cell.",
+              "    if (this.pending !== p) return promise",
+              "    if (restorePending) {",
+              "      this.restoreSnapshot = false",
+              "      for (const frame of restoreFrames) this.write(frame)",
+              "    }",
+              "    this.write(evalFrame)",
+              "    return promise",
+              "",
+          ])
+          text = text[:send_start] + new_send + text[send_end:]
           runtime_path.write_text(text, encoding='utf-8')
 
           test_path = Path('tests/rlm-loop.test.ts')
@@ -130,9 +117,9 @@ jobs:
           marker = "test('M10 Issue#44: reset deletes the durable reference for that Session only', async () => {"
           pos = tests.find(marker)
           if pos < 0:
-            raise SystemExit('test insertion marker not found')
+              raise SystemExit('test insertion marker not found')
           if 'Issue#64: rejected oversized eval does not consume pending snapshot restore' in tests:
-            raise SystemExit('Issue #64 regression already present')
+              raise SystemExit('Issue #64 regression already present')
           block = r'''test('Issue#64: rejected oversized eval does not consume pending snapshot restore', async () => {
             const { createRlmRuntime, RlmError } = await import('../src/runtime.ts')
             const runtime = createRlmRuntime(undefined, { snapshotRecovery: true, timeout: 8_000 })
