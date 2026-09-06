@@ -17,7 +17,7 @@ const KERNEL_PATH = path.resolve(
   'python-runtime',
   'rlm_kernel.py',
 )
-const PROTOCOL_VERSION = 4
+const PROTOCOL_VERSION = 5
 const DEFAULT_TIMEOUT = 30_000
 const DEFAULT_MAX_STDOUT = 64 * 1024
 const DEFAULT_MAX_RESULT = 64 * 1024
@@ -28,6 +28,9 @@ const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 const MAX_SNAPSHOT_ROOT_BYTES = 64 * 1024 * 1024
 const MAX_FRAME_BYTES = 256 * 1024
 const CHECKPOINT_CHUNK_BYTES = 128 * 1024
+const MAX_CHECKPOINT_CHUNKS = Math.ceil(MAX_SNAPSHOT_BYTES / CHECKPOINT_CHUNK_BYTES)
+const MAX_CHECKPOINT_CHUNK_BASE64_CHARS = Math.ceil(CHECKPOINT_CHUNK_BYTES / 3) * 4
+const CHECKPOINT_BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
 const MAX_STDERR_BYTES = 64 * 1024
 const MAX_QUERY_RESULT_BYTES = 64 * 1024
 const STDERR_TRUNCATED_MARKER = ' [stderr truncated]'
@@ -465,7 +468,7 @@ class Kernel {
   private readonly snapshotPath: string | undefined
   private readonly launch: KernelLaunch | undefined
   private restoreSnapshot: boolean
-  private pendingChunks = new Map<number, { count: number; data: string[] }>()
+  private pendingChunks = new Map<number, { count: number; parts: Buffer[]; bytes: number }>()
   private readonly maxSnapshotBytes: number
   private retainCheckpoint = true
   /** Kernel capability token -> official child id. Never sent back to Python. */
@@ -618,20 +621,68 @@ class Kernel {
         this.onFollowup(frame)
         return
       case 'checkpoint_chunk': {
+        const p = this.pending
         const id = frame.id
         const seq = frame.seq
         const count = frame.count
         const data = frame.data
-        if (typeof id !== 'number' || typeof seq !== 'number' || typeof count !== 'number' || typeof data !== 'string') {
+        if (
+          !p
+          || !this.config.snapshotRecovery
+          || !this.snapshotPath
+          || !this.launch
+          || typeof id !== 'number'
+          || typeof seq !== 'number'
+          || typeof count !== 'number'
+          || !Number.isSafeInteger(id)
+          || !Number.isSafeInteger(seq)
+          || !Number.isSafeInteger(count)
+          || id !== p.id
+          || frame.encoding !== 'base64'
+          || typeof data !== 'string'
+        ) {
           this.handleExit(new RlmError('protocol', 'malformed checkpoint_chunk frame'))
           return
         }
-        const acc = this.pendingChunks.get(id) ?? { count, data: [] }
-        if (acc.count !== count) {
-          this.handleExit(new RlmError('protocol', 'checkpoint_chunk count mismatch'))
+        const maxCount = Math.min(
+          MAX_CHECKPOINT_CHUNKS,
+          Math.max(0, Math.ceil(this.maxSnapshotBytes / CHECKPOINT_CHUNK_BYTES)),
+        )
+        if (count < 1 || count > maxCount || seq < 0 || seq >= count) {
+          this.handleExit(new RlmError('protocol', 'checkpoint_chunk sequence is out of range'))
           return
         }
-        acc.data[seq] = data
+        if (
+          data.length === 0
+          || data.length > MAX_CHECKPOINT_CHUNK_BASE64_CHARS
+          || data.length % 4 !== 0
+          || !CHECKPOINT_BASE64_RE.test(data)
+        ) {
+          this.handleExit(new RlmError('protocol', 'checkpoint_chunk base64 is invalid'))
+          return
+        }
+        const decoded = Buffer.from(data, 'base64')
+        if (
+          decoded.length < 1
+          || decoded.length > CHECKPOINT_CHUNK_BYTES
+          || decoded.toString('base64') !== data
+          || (seq < count - 1 && decoded.length !== CHECKPOINT_CHUNK_BYTES)
+        ) {
+          this.handleExit(new RlmError('protocol', 'checkpoint_chunk decoded bytes are invalid'))
+          return
+        }
+        const acc = this.pendingChunks.get(id) ?? { count, parts: [], bytes: 0 }
+        if (acc.count !== count || seq !== acc.parts.length) {
+          this.handleExit(new RlmError('protocol', 'checkpoint_chunk is duplicate, reordered, or count-mismatched'))
+          return
+        }
+        const aggregate = acc.bytes + decoded.length
+        if (aggregate > this.maxSnapshotBytes || aggregate > MAX_SNAPSHOT_BYTES) {
+          this.handleExit(new RlmError('protocol', 'checkpoint_chunk aggregate exceeds snapshot limit'))
+          return
+        }
+        acc.parts.push(decoded)
+        acc.bytes = aggregate
         this.pendingChunks.set(id, acc)
         return
       }
@@ -870,37 +921,81 @@ class Kernel {
       this.handleExit(new RlmError('protocol', 'result frame for unknown cell'))
       return
     }
+    const recovery = typeof frame.recovery === 'object' && frame.recovery !== null && !Array.isArray(frame.recovery)
+      ? (frame.recovery as Record<string, unknown>)
+      : undefined
+    const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch !== undefined
+    const chunks = this.pendingChunks.get(p.id)
+    const checkpointCommitted = recovery?.checkpoint_committed === true
+    let checkpointBuffer: Buffer | undefined
+
+    if (chunked && recovery === undefined) {
+      this.handleExit(new RlmError('protocol', 'chunked result is missing recovery metadata'))
+      return
+    }
+    if (!chunked && chunks !== undefined) {
+      this.handleExit(new RlmError('protocol', 'checkpoint chunks arrived for a non-chunked cell'))
+      return
+    }
+    if (chunked && checkpointCommitted) {
+      const declaredBytes = recovery?.checkpoint_bytes
+      if (
+        !chunks
+        || typeof declaredBytes !== 'number'
+        || !Number.isSafeInteger(declaredBytes)
+        || declaredBytes < 1
+        || declaredBytes > this.maxSnapshotBytes
+        || declaredBytes > MAX_SNAPSHOT_BYTES
+        || chunks.bytes !== declaredBytes
+        || chunks.parts.length !== chunks.count
+        || chunks.count !== Math.max(1, Math.ceil(declaredBytes / CHECKPOINT_CHUNK_BYTES))
+      ) {
+        this.handleExit(new RlmError('protocol', 'checkpoint chunk sequence is incomplete or byte count mismatched'))
+        return
+      }
+      checkpointBuffer = Buffer.concat(chunks.parts, chunks.bytes)
+      try {
+        const text = checkpointBuffer.toString('utf8')
+        if (!Buffer.from(text, 'utf8').equals(checkpointBuffer)) {
+          throw new Error('checkpoint is not canonical UTF-8')
+        }
+        const envelope = JSON.parse(text) as unknown
+        if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) {
+          throw new Error('checkpoint envelope is not an object')
+        }
+      } catch {
+        this.handleExit(new RlmError('protocol', 'checkpoint payload is invalid before publication'))
+        return
+      }
+    } else if (chunked && chunks !== undefined) {
+      this.handleExit(new RlmError('protocol', 'checkpoint chunks were emitted without a committed checkpoint'))
+      return
+    }
+
     this.clearTimer(p)
     this.detachAbort()
     this.pending = null
-    // Block routing now; the public settle waits for child quiescence.
     this.settling = true
     const out: RlmEvalOutput = {
       stdout: String(frame.stdout ?? ''),
       truncated: frame.truncated === true,
     }
     if (typeof frame.result === 'string') out.result = frame.result
-    const chunks = this.pendingChunks.get(frame.id)
-    if (chunks && typeof frame.recovery === 'object' && frame.recovery !== null && !Array.isArray(frame.recovery)
-        && (frame.recovery as Record<string, unknown>).checkpoint_committed === true) {
-      const joined = chunks.data.join('')
-      const buffer = Buffer.from(joined, 'utf8')
+
+    if (checkpointBuffer !== undefined && recovery !== undefined) {
       try {
-        if (!this.snapshotPath) {
-          throw new Error('snapshot path is undefined')
-        }
+        if (!this.snapshotPath) throw new Error('snapshot path is undefined')
         const temp = this.snapshotPath + '.tmp-' + String(process.pid)
-        writeFileSync(temp, buffer)
+        writeFileSync(temp, checkpointBuffer)
         renameSync(temp, this.snapshotPath)
       } catch {
-        const rec = frame.recovery as Record<string, unknown>
-        rec.checkpoint_committed = false
-        rec.reason = 'host checkpoint write failed'
+        recovery.checkpoint_committed = false
+        recovery.reason = 'host checkpoint write failed'
       }
-      this.pendingChunks.delete(frame.id)
     }
-    if (frame.recovery && typeof frame.recovery === 'object' && !Array.isArray(frame.recovery)) {
-      const recovery = frame.recovery as Record<string, unknown>
+    this.pendingChunks.delete(p.id)
+
+    if (recovery !== undefined) {
       out.recovery = {
         restored: recovery.restored === true,
         checkpointCommitted: recovery.checkpoint_committed === true,
@@ -920,6 +1015,7 @@ class Kernel {
     }
     this.clearTimer(p)
     this.detachAbort()
+    this.pendingChunks.delete(p.id)
     this.pending = null
     // Block routing now; the public settle waits for child quiescence.
     this.settling = true
@@ -973,6 +1069,7 @@ class Kernel {
     if (this.pending !== p) return
     this.clearTimer(p)
     this.detachAbort()
+    this.pendingChunks.delete(p.id)
     this.pending = null
     const err = new RlmError('cancel', message)
     this.retainCheckpoint = false
@@ -987,6 +1084,7 @@ class Kernel {
     if (this.exited) return
     this.exited = true
     this.continuableChildren.clear()
+    this.pendingChunks.clear()
     this.settling = true
     if (!this.readyDone) {
       this.readyDone = true
@@ -1065,13 +1163,30 @@ class Kernel {
       throw new RlmError('snapshot', 'checkpoint file is missing before restore')
     }
     const payload = readFileSync(this.snapshotPath)
-    const total = Math.max(1, Math.ceil(payload.length / CHECKPOINT_CHUNK_BYTES))
+    const limit = Math.min(MAX_SNAPSHOT_BYTES, this.maxSnapshotBytes)
+    if (payload.length < 1 || payload.length > limit) {
+      throw new RlmError('snapshot', 'checkpoint file exceeds the restore byte limit')
+    }
+    const total = Math.ceil(payload.length / CHECKPOINT_CHUNK_BYTES)
+    if (total < 1 || total > MAX_CHECKPOINT_CHUNKS) {
+      throw new RlmError('snapshot', 'checkpoint file has an invalid restore chunk count')
+    }
     const frames: Frame[] = []
     for (let seq = 0; seq < total; seq++) {
-      const chunk = payload.subarray(seq * CHECKPOINT_CHUNK_BYTES, Math.min(payload.length, (seq + 1) * CHECKPOINT_CHUNK_BYTES))
-      frames.push({ type: 'restore_chunk', seq, total, id: 0, data: chunk.toString('utf8') })
+      const chunk = payload.subarray(
+        seq * CHECKPOINT_CHUNK_BYTES,
+        Math.min(payload.length, (seq + 1) * CHECKPOINT_CHUNK_BYTES),
+      )
+      frames.push({
+        type: 'restore_chunk',
+        id: 0,
+        seq,
+        total,
+        encoding: 'base64',
+        data: chunk.toString('base64'),
+      })
     }
-    frames.push({ type: 'restore_end', total })
+    frames.push({ type: 'restore_end', total, bytes: payload.length, encoding: 'base64' })
     for (const frame of frames) {
       if (this.outboundFrameBytes(frame) > MAX_FRAME_BYTES) {
         throw new RlmError('protocol', 'host restore frame exceeds 256 KiB')
@@ -1155,6 +1270,7 @@ class Kernel {
       if (this.pending !== p) return
       this.clearTimer(p)
       this.detachAbort()
+      this.pendingChunks.delete(p.id)
       this.pending = null
       const err = new RlmError('timeout', 'cell timed out after ' + timeout + 'ms')
       this.exited = true
@@ -1310,6 +1426,7 @@ class Kernel {
     this.retainCheckpoint = false
     this.exited = true
     this.continuableChildren.clear()
+    this.pendingChunks.clear()
     this.settling = true
     // A dispose during the ready handshake must settle the waiting eval; the
     // startup waiters share the ready promise, so rejecting it unblocks them.
