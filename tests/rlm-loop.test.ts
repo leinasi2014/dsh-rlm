@@ -1358,6 +1358,50 @@ test('M10 Issue#44: a new runtime with the same durableRoot restores the same Se
   }
 })
 
+test('Issue#61: chunked recovery restores managed context metadata emitted by the same kernel', async () => {
+  const { createRlmRuntime, RlmError } = await import('../src/runtime.ts')
+  const workspace = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m5-context-meta-'))
+  const source = path.join(workspace, 'context.txt')
+  writeFileSync(source, 'context-元数据-hello', 'utf8')
+  const ctx: any = {
+    get(name: string) {
+      if (name === 'sandbox') {
+        return {
+          confine(argv: string[]) {
+            return { argv: [...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] }
+          },
+        }
+      }
+      if (name === 'sandboxPolicy') {
+        return { resolve() { return { mode: 'workspace-write', workspaceRoot: workspace } } }
+      }
+      return undefined
+    },
+  }
+  const runtime = createRlmRuntime(ctx, { snapshotRecovery: true, timeout: 8_000 })
+  try {
+    const saved = await runtime.eval('issue61-context', {
+      session: { id: 'issue61-context' },
+      contextPath: source,
+      code: 'keep = 41',
+    })
+    assert.equal(saved.recovery?.checkpointCommitted, true)
+    await assert.rejects(
+      runtime.eval('issue61-context', { session: { id: 'issue61-context' }, code: 'import os\nos._exit(13)' }),
+      (error: unknown) => error instanceof RlmError && error.kind === 'closed',
+    )
+    const restored = await runtime.eval('issue61-context', {
+      session: { id: 'issue61-context' },
+      code: '(keep + 1, context, context_meta["kind"], context_meta["bytes"])',
+    })
+    assert.equal(restored.result, "(42, 'context-元数据-hello', 'file', 20)")
+    assert.equal(restored.recovery?.restored, true)
+  } finally {
+    await runtime.dispose()
+    rmSync(workspace, { recursive: true, force: true })
+  }
+})
+
 test('M10 Issue#44: reset deletes the durable reference for that Session only', async () => {
   const durable = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m10-reset-'))
   const runtime = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 3_000 })
