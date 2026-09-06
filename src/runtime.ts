@@ -73,6 +73,12 @@ interface KernelLaunch {
   enforcement: string
   denialSignatures: readonly string[]
   runnerFailureRules: readonly unknown[]
+  /**
+   * True only for kernels launched through an enforced DSH sandbox
+   * confinement. A `danger-full-access` launch shares the Session cwd but
+   * stays on the legacy (non-chunked) M5 transport like an unconfined kernel.
+   */
+  confined: boolean
 }
 
 interface HostPromptDeliverer {
@@ -516,7 +522,7 @@ class Kernel {
         ? spawn(this.launch.argv[0]!, this.launch.argv.slice(1), opts)
         : spawn(this.config.python, [KERNEL_PATH], opts)
     } catch (err) {
-      this.rejectReady(this.launch
+      this.rejectReady(this.launch?.confined
         ? new RlmError('sandbox', 'sandboxed kernel launch failed: ' + String(err))
         : new RlmError('spawn', String(err)))
       return
@@ -541,14 +547,14 @@ class Kernel {
       }
     })
     child.on('error', (err) => {
-      this.handleExit(this.launch && !this.readyDone
+      this.handleExit(this.launch?.confined && !this.readyDone
         ? new RlmError('sandbox', 'sandbox runner failed: ' + String(err))
         : new RlmError('spawn', String(err)))
     })
     child.on('close', () => {
       let detail = this.stderr.trim()
       if (this.stderrTruncated) detail += STDERR_TRUNCATED_MARKER
-      this.handleExit(this.launch && !this.readyDone
+      this.handleExit(this.launch?.confined && !this.readyDone
         ? new RlmError('sandbox', 'sandbox runner exited before the kernel became ready', { detailed: detail })
         : new RlmError('closed', 'kernel exited', { detailed: detail }))
     })
@@ -632,7 +638,7 @@ class Kernel {
           !p
           || !this.config.snapshotRecovery
           || !this.snapshotPath
-          || !this.launch
+          || this.launch?.confined !== true
           || typeof id !== 'number'
           || typeof seq !== 'number'
           || typeof count !== 'number'
@@ -926,7 +932,7 @@ class Kernel {
     const recovery = typeof frame.recovery === 'object' && frame.recovery !== null && !Array.isArray(frame.recovery)
       ? (frame.recovery as Record<string, unknown>)
       : undefined
-    const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch !== undefined
+    const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch?.confined === true
     const chunks = this.pendingChunks.get(p.id)
     const checkpointCommitted = recovery?.checkpoint_committed === true
     let checkpointBuffer: Buffer | undefined
@@ -1227,7 +1233,7 @@ class Kernel {
       max_context_bytes: this.config.maxContextBytes,
     }
     if (this.launch) evalFrame.cwd = this.launch.cwd
-    const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch !== undefined
+    const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch?.confined === true
     const restorePending = this.restoreSnapshot
     let restoreFrames: Frame[] = []
     if (this.config.snapshotRecovery && this.snapshotPath) {
@@ -1737,8 +1743,19 @@ class RlmRuntimeImpl implements RlmRuntime {
     const policy = policyService.resolve(session === undefined ? {} : { session })
     if (policy.mode === 'danger-full-access') {
       // The upstream consumer contract bypasses confine() entirely for the
-      // unrestricted mode: the sandbox policy type carries only confined modes.
-      return undefined
+      // unrestricted mode. The Session workspace identity is still preserved
+      // (Issue #87): the kernel starts in policy.workspaceRoot with the plain
+      // interpreter argv, and the M9 chunked checkpoint transport stays off
+      // because the launch is not confined.
+      return {
+        argv: [this.config.python ?? 'python', KERNEL_PATH],
+        cwd: policy.workspaceRoot,
+        mode: policy.mode,
+        enforcement: 'full',
+        denialSignatures: [],
+        runnerFailureRules: [],
+        confined: false,
+      }
     }
     let confined: SandboxConfined
     try {
@@ -1753,6 +1770,7 @@ class RlmRuntimeImpl implements RlmRuntime {
       enforcement: confined.enforcement,
       denialSignatures: [...confined.denialSignatures],
       runnerFailureRules: [...confined.runnerFailureRules],
+      confined: true,
     }
   }
   async eval(sessionKey: string, input: RlmEvalInput): Promise<RlmEvalOutput> {

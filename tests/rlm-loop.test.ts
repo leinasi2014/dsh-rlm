@@ -1323,6 +1323,68 @@ test('M9 Issue#42: confined M5 never writes the checkpoint into the sandbox work
 })
 
 
+test('Issue#87: danger-full-access keeps the Session workspace cwd and never confines', async () => {
+  const ws = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m9-danger-'))
+  let confineCount = 0
+  const sandbox = {
+    confine(argv: readonly string[]) { confineCount += 1; return { argv: [...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] } },
+  }
+  const fakeCtx = {
+    get(name: string) {
+      if (name === 'sandbox') return sandbox
+      if (name === 'sandboxPolicy') return { resolve() { return { mode: 'danger-full-access', workspaceRoot: ws } } }
+      return undefined
+    },
+  } as unknown as Context
+  const runtime = createRlmRuntime(fakeCtx, { snapshotRecovery: true, timeout: 10_000 })
+  try {
+    const cwdOut = await runtime.eval('m9-danger', { code: 'import os\nos.getcwd()' })
+    assert.equal(cwdOut.result, ws, 'danger-full-access must start in the Session workspace root')
+    const writeOut = await runtime.eval('m9-danger', { code: "open('rel.txt', 'w').write('ok')\n'written'" })
+    assert.equal(writeOut.result, 'written')
+    assert.equal(readFileSync(path.join(ws, 'rel.txt'), 'utf8'), 'ok')
+    assert.equal(confineCount, 0, 'danger-full-access must bypass confine() entirely')
+    // The unconfined launch keeps the legacy M5 transport: a snapshot must
+    // still commit through the host-private file path, not chunk frames.
+    assert.equal(writeOut.recovery?.checkpointCommitted, true)
+  } finally {
+    await runtime.dispose()
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try { rmSync(ws, { recursive: true, force: true }); break } catch { await new Promise((res) => setTimeout(res, 100)) }
+    }
+  }
+})
+
+test('Issue#87: workspace identity stays stable when enforcement mode changes across a reset', async () => {
+  const ws = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m9-mode-'))
+  let mode = 'workspace-write'
+  const sandbox = {
+    confine(argv: readonly string[]) { return { argv: [...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] } },
+  }
+  const fakeCtx = {
+    get(name: string) {
+      if (name === 'sandbox') return sandbox
+      if (name === 'sandboxPolicy') return { resolve() { return { mode, workspaceRoot: ws } } }
+      return undefined
+    },
+  } as unknown as Context
+  const runtime = createRlmRuntime(fakeCtx, { timeout: 10_000 })
+  try {
+    const first = await runtime.eval('m9-mode', { code: 'import os\nos.getcwd()' })
+    assert.equal(first.result, ws)
+    await runtime.eval('m9-mode', { reset: true })
+    mode = 'danger-full-access'
+    const second = await runtime.eval('m9-mode', { code: 'import os\nos.getcwd()' })
+    assert.equal(second.result, ws, 'mode change must not move the kernel to the Host cwd')
+  } finally {
+    await runtime.dispose()
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try { rmSync(ws, { recursive: true, force: true }); break } catch { await new Promise((res) => setTimeout(res, 100)) }
+    }
+  }
+})
+
+
 test('M10 Issue#44 RED: a durableRoot is not consulted on the accepted M9 base', async () => {
   const durable = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m10-red-'))
   const runtime = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 3_000 })
