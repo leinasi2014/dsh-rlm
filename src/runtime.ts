@@ -3,7 +3,7 @@ import z from '@deepseek-ai/schemastery'
 import { RLM_SETTINGS_MANIFEST, type RlmRuntimeTierASettings, type RlmSettingsSpec, type RlmTierASettings } from './settings-manifest.ts'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { open as openFile, readFile as readFileAsync, rename as renameAsync, rm as rmAsync } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -1604,11 +1604,11 @@ class RlmRuntimeImpl implements RlmRuntime {
     }
   }
 
-  private durableFingerprint(info: ReturnType<typeof lstatSync>): string {
+  private durableFingerprint(info: NonNullable<ReturnType<typeof lstatSync>>): string {
     return [info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs].join(':')
   }
 
-  private rememberDurableGeneration(sessionKey: string, payload: Buffer, info?: ReturnType<typeof lstatSync>): void {
+  private rememberDurableGeneration(sessionKey: string, payload: Buffer, info?: NonNullable<ReturnType<typeof lstatSync>>): void {
     const key = this.durableFileKey(sessionKey)
     this.durableHashes.set(key, createHash('sha256').update(payload).digest('hex'))
     const current = info ?? this.durableLstat(this.durablePath(sessionKey, '.checkpoint.json'), 'durable checkpoint')
