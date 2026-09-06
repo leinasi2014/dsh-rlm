@@ -243,3 +243,30 @@ export function awaitRlmSettings(ctx: Context): Promise<void> {
     ctx.inject(['settings'], () => resolve())
   })
 }
+
+/** True when the Settings service is mounted on this context (Issue #79). */
+export function settingsServicePresent(ctx: Context): boolean {
+  const accessor = ctx as unknown as { get?: (key: string) => unknown } | undefined
+  try {
+    return accessor?.get?.('settings') !== undefined
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Resolve the activation config without ever waiting indefinitely (Issue #79).
+ * A composition that mounts no Settings provider resolves its schema-validated
+ * composition layer immediately (the pre-M13 headless/CLI contract); a
+ * composition with Settings waits for the live scope so the user layer wins at
+ * mount time (M13 restart-to-apply semantics).
+ */
+export async function resolveActivationConfig(
+  ctx: Context,
+  binding: RlmSettingsBinding,
+): Promise<RlmPluginConfig> {
+  if (settingsServicePresent(ctx)) {
+    await awaitRlmSettings(ctx)
+  }
+  return binding.effective()
+}

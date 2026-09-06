@@ -1,4 +1,4 @@
-import type { Context } from '@deepseek-ai/cordis'
+import { CordisError, type Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import {
@@ -13,7 +13,7 @@ import {
   type RlmRuntime,
   type RlmEvalOutput,
 } from './runtime.js'
-import { RLM_SETTINGS_NAMESPACE, awaitRlmSettings, mountRlmSettings } from './settings.js'
+import { RLM_SETTINGS_NAMESPACE, mountRlmSettings, resolveActivationConfig } from './settings.js'
 
 export const name = 'rlm'
 export const inject = ['tools', 'subagents', 'systemPrompt']
@@ -33,11 +33,20 @@ export function apply(ctx: Context, config: Config): void {
   // this entry's own init phase, and a synchronous resolve would freeze the
   // runtime on composition defaults (stale after a user-layer save). Mounting
   // through the live binding inside `ctx.effect` reads
-  // { ...compositionDefaults, ...userSettings } at mount time.
+  // { ...compositionDefaults, ...userSettings } at mount time. A composition
+  // without a Settings provider must never block activation (Issue #79).
   ctx.effect(async () => {
     const binding = mountRlmSettings(ctx, config, ConfigSchema)
-    await awaitRlmSettings(ctx)
-    const resolved = binding.effective()
+    let resolved: Config
+    try {
+      resolved = await resolveActivationConfig(ctx, binding)
+    } catch (err) {
+      // Disposing the plugin while the Settings scope was still mounting leaves
+      // this continuation pending; a dead fiber must never register the tool.
+      if (err instanceof CordisError && err.code === 'INACTIVE_EFFECT') {        return () => undefined
+      }
+      throw err
+    }
     if (resolved.enabled !== true) return () => undefined
     registerRlmPlugin(ctx, resolved)
     return () => undefined

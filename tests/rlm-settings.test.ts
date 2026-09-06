@@ -9,6 +9,7 @@ import {
   mergeRlmConfig,
   mountRlmSettings,
   registerRlmSettings,
+  resolveActivationConfig,
   resolveRlmConfig,
 } from '../src/settings.ts'
 import type { RlmPluginConfig } from '../src/runtime.ts'
@@ -152,6 +153,47 @@ test('mountRlmSettings effective() reflects the user layer when Settings mounts 
     await settingsFiber.await()
     assert.equal(binding.effective().maxQueries, 1)
     assert.ok(binding.scope(), 'expected the rlm scope to be registered once Settings mounts')
+    await settingsFiber.dispose()
+  } finally {
+    await ctx.fiber.dispose()
+  }
+})
+
+
+/**
+ * Issue #79: a composition that never mounts a Settings provider must not leave
+ * activation pending forever. `resolveActivationConfig` (used by the plugin
+ * `apply` path) resolves the schema-validated composition layer immediately in
+ * that case (pre-M13 headless/CLI contract), while a composition with Settings
+ * waits for the live scope so the user layer wins at mount time.
+ */
+test('Issue#79: activation config resolves immediately when no Settings provider is mounted', async () => {
+  const ctx = new Context()
+  ctx.provide('subagents', fakeSubagents())
+  const binding = mountRlmSettings(ctx, { enabled: true, maxQueries: 16, maxDepth: 2 }, ConfigSchema)
+  try {
+    const resolved = await Promise.race([
+      resolveActivationConfig(ctx, binding),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('activation never resolved: headless composition hangs')), 500)),
+    ])
+    assert.equal(resolved.enabled, true)
+    assert.equal(resolved.maxQueries, 16)
+    assert.equal(resolved.maxDepth, 2)
+  } finally {
+    await ctx.fiber.dispose()
+  }
+})
+
+test('Issue#79: activation config waits for and merges the user layer when Settings is mounted', async () => {
+  const ctx = new Context()
+  ctx.provide('subagents', fakeSubagents())
+  const binding = mountRlmSettings(ctx, { enabled: true, maxQueries: 16, maxDepth: 2 }, ConfigSchema)
+  try {
+    const settingsFiber = await mountSettings(ctx, { rlm: { maxQueries: 1 } })
+    const resolved = await resolveActivationConfig(ctx, binding)
+    assert.equal(resolved.maxQueries, 1)
+    assert.equal(resolved.maxDepth, 2)
     await settingsFiber.dispose()
   } finally {
     await ctx.fiber.dispose()
