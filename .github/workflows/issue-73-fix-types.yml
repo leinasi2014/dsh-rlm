@@ -1,0 +1,42 @@
+name: issue-73-fix-types
+
+on:
+  push:
+    branches: [codex/issue-73-settings-manifest-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-73-settings-manifest-v2
+      - name: Patch only client manifest narrowing sites
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('src/client/rlm-settings-model.ts')
+          text = p.read_text(encoding='utf-8')
+          a = "if (!(spec.options ?? []).includes(String(draft[spec.key]))) problems[spec.key] = 'invalidEnum'"
+          b = "if (!(spec.options as readonly string[]).includes(String(draft[spec.key]))) problems[spec.key] = 'invalidEnum'"
+          c = "if (spec.required === true && raw.trim() === '') {"
+          d = "if ('required' in spec && spec.required === true && raw.trim() === '') {"
+          if text.count(a) != 1 or text.count(c) != 1:
+              raise SystemExit('Issue #73 type narrowing anchors changed')
+          text = text.replace(a, b, 1).replace(c, d, 1)
+          p.write_text(text, encoding='utf-8')
+          Path('.github/workflows/issue-73-fix-types.yml').unlink()
+          PY
+      - name: Commit correction and remove workflow
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/client/rlm-settings-model.ts .github/workflows/issue-73-fix-types.yml
+          git commit -m "fix(issue-73): narrow shared manifest field unions safely"
+          git push origin HEAD:codex/issue-73-settings-manifest-v2
