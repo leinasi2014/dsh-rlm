@@ -15,7 +15,7 @@ export const rlmSettingsEn = {
   disabledStatus: 'Disabled',
   quickStartTitle: 'Recommended starting point',
   quickStart: 'For most installations, enable dsh-rlm, keep the default spawn Provider and automatic sandbox, and change Python only when your interpreter is not available as “python”. Advanced limits can stay at their defaults until you have a measured reason to tune them.',
-  unsavedSummary: 'You have unsaved changes. Review the highlighted section, then save once; the complete draft is applied together.',
+  unsavedSummary: 'You have unsaved changes. Review the highlighted section, then save the staged draft. If DSH rejects or conflicts with it, your edits stay available for review.',
   effectiveValue: 'Readable value',
 
   'tab.core': 'General',
@@ -94,7 +94,7 @@ export const rlmSettingsZh: Record<RlmSettingsKey, string> = {
   disabledStatus: '未启用',
   quickStartTitle: '推荐起步配置',
   quickStart: '大多数环境只需要启用 dsh-rlm，保留默认 spawn Provider 和“自动”沙箱；只有当系统找不到 “python” 时才需要修改解释器。高级限制建议先保持默认值，有明确性能或资源需求后再调整。',
-  unsavedSummary: '当前有未保存修改。确认参数后一次保存，整组草稿会一起提交。',
+  unsavedSummary: '当前有未保存修改。确认参数后保存草稿；如果 DSH 拒绝或发生配置冲突，你的修改会保留，便于检查后重试。',
   effectiveValue: '易读值',
 
   'tab.core': '常用设置',
