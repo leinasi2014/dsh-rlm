@@ -313,6 +313,52 @@ test('M7 Issue#36 successor: asyncio.wait_for cancellation drains admitted queri
   }
 })
 
+test('Issue#88: an over-budget snapshot is rejected non-fatally and the successful cell keeps its result', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    const snap = path.join(os.tmpdir(), 'dsh-rlm-88-' + String(process.pid) + '-' + String(Date.now()) + '.json')
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: ['big = "x" * 4096', 'len(big)'].join('\n'),
+      snapshot_recovery: true,
+      snapshot_path: snap,
+      max_snapshot_bytes: 1024,
+    })
+    const result = await k.next()
+    assert.equal(result.type, 'result')
+    assert.equal(result.result, '4096', 'the user cell must succeed even when the checkpoint is impossible')
+    assert.equal(result.recovery.checkpoint_committed, false)
+    assert.match(result.recovery.reason, /maxSnapshotBytes/)
+  } finally {
+    await k.close()
+  }
+})
+
+test('Issue#88: a small managed context preflight still permits a fitting checkpoint', async () => {
+  const k = new Kernel()
+  try {
+    await ready(k)
+    const ctx = path.join(os.tmpdir(), 'dsh-rlm-88-ctx-' + String(process.pid) + '.txt')
+    writeFileSync(ctx, 'tiny context', 'utf8')
+    k.send({
+      type: 'eval',
+      id: 1,
+      code: ['keep = 41', 'keep'].join('\n'),
+      context_path: ctx,
+      snapshot_recovery: true,
+      snapshot_path: ctx + '.json',
+      max_snapshot_bytes: 8192,
+    })
+    const result = await k.next()
+    assert.equal(result.type, 'result')
+    assert.equal(result.recovery.checkpoint_committed, true)
+  } finally {
+    await k.close()
+  }
+})
+
 test('Issue#90: a detached task of a retired cell is cancelled before the next cell', async () => {
   const k = new Kernel()
   try {

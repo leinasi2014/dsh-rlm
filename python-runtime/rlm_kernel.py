@@ -56,6 +56,31 @@ CELL_FILENAME = "<rlm-cell>"
 TASK_DRAIN_TIMEOUT = 1.0
 
 
+class _SnappingBudget:
+    """Mutable upper-bound byte accounting for the M5 checkpoint candidate
+    (Issue #88): the traversal stops as soon as the accumulated JSON size
+    estimate exceeds the snapshot budget, instead of first building the full
+    detached tree and encoding it."""
+
+    __slots__ = ("max", "used", "over")
+
+    def __init__(self, max_bytes: int) -> None:
+        self.max = max_bytes
+        self.used = 0
+        self.over = False
+
+    def charge(self, n: int) -> bool:
+        self.used += n
+        if self.used > self.max:
+            self.over = True
+            return False
+        return True
+
+
+# Translate table deleting every JSON control character (fast C-level count).
+_JSON_CONTROL_DELETE = {i: None for i in range(0x20)}
+
+
 class _CellOwner:
     """Immutable ownership token for one cell epoch (task-local Issue #4).
 
@@ -968,7 +993,25 @@ class RlmKernel:
             "bytes": len(payload),
         }
 
-    def _snapshot_value(self, value: Any, seen: set[int]) -> "tuple[bool, Any, str]":
+    @staticmethod
+    def _json_str_bytes(text: str) -> int:
+        """Exact-size upper bound of one JSON string value under
+        ensure_ascii=False: raw UTF-8 bytes + 2 per escaped quote/backslash +
+        6 per control character + the surrounding quotes."""
+        controls = len(text) - len(text.translate(_JSON_CONTROL_DELETE))
+        return (
+            len(text.encode("utf-8"))
+            + 2 * (text.count('"') + text.count("\\"))
+            + 6 * controls
+            + 2
+        )
+
+    def _snapshot_value(
+        self,
+        value: Any,
+        seen: set[int],
+        budget: Optional["_SnappingBudget"] = None,
+    ) -> "tuple[bool, Any, str]":
         """Detach the intentionally tiny M5 JSON subset without invoking user hooks."""
         kind = type(value)
         if value is None or kind is bool:
@@ -978,6 +1021,8 @@ class RlmKernel:
                 value.encode("utf-8", "strict")
             except UnicodeEncodeError:
                 return False, None, "invalid UTF-8 string"
+            if budget is not None and not budget.charge(self._json_str_bytes(value)):
+                return False, None, "checkpoint exceeds maxSnapshotBytes"
             return True, value, ""
         if kind is int:
             if -MAX_SAFE_INTEGER <= value <= MAX_SAFE_INTEGER:
@@ -997,10 +1042,12 @@ class RlmKernel:
             if kind is list:
                 output: list[Any] = []
                 for item in value:
-                    ok, detached, reason = self._snapshot_value(item, seen)
+                    ok, detached, reason = self._snapshot_value(item, seen, budget)
                     if not ok:
                         return False, None, reason
                     output.append(detached)
+                if budget is not None and not budget.charge(2 + 2 * len(output)):
+                    return False, None, "checkpoint exceeds maxSnapshotBytes"
                 return True, output, ""
             output_dict: dict[str, Any] = {}
             for key, item in value.items():
@@ -1010,10 +1057,14 @@ class RlmKernel:
                     key.encode("utf-8", "strict")
                 except UnicodeEncodeError:
                     return False, None, "invalid UTF-8 dictionary key"
-                ok, detached, reason = self._snapshot_value(item, seen)
+                ok, detached, reason = self._snapshot_value(item, seen, budget)
                 if not ok:
                     return False, None, reason
                 output_dict[key] = detached
+            if budget is not None:
+                for _key in output_dict:
+                    if not budget.charge(4):
+                        return False, None, "checkpoint exceeds maxSnapshotBytes"
             return True, output_dict, ""
         finally:
             seen.discard(identity)
@@ -1026,18 +1077,42 @@ class RlmKernel:
         """
         skipped: list[str] = []
         variables: dict[str, Any] = {}
+        # Issue #88: preflight the managed context with its already-known exact
+        # UTF-8 bytes plus conservative envelope/escaping overhead BEFORE any
+        # variable traversal or full JSON encoding, so an impossible checkpoint
+        # never allocates the whole payload just to reject it.
+        envelope_overhead = 128
+        if self.managed_context is not None:
+            context_estimate = (
+                envelope_overhead
+                + self._json_str_bytes(self.managed_context)
+                + 64
+            )
+            if context_estimate > max_bytes:
+                return None, skipped, {"reason": "checkpoint exceeds maxSnapshotBytes"}
+        budget = _SnappingBudget(max_bytes)
+        budget.charge(envelope_overhead)
         reserved = {"__name__", "__builtins__", "asyncio", "rlm_query", "rlm_query_batched", "rlm_spawn", "rlm_followup", "context", "context_meta"}
         for name in sorted(name for name in self.namespace if type(name) is str and name not in reserved):
+            if budget.over:
+                break
+            # Key cost: quotes + colon + comma per pair.
+            if not budget.charge(self._json_str_bytes(name) + 4):
+                continue
             try:
-                ok, detached, reason = self._snapshot_value(self.namespace[name], set())
+                ok, detached, reason = self._snapshot_value(self.namespace[name], set(), budget)
             except BaseException:
                 ok, detached, reason = False, None, "snapshot validation failed"
             if ok:
                 variables[name] = detached
+            elif budget.over:
+                break
             elif len(skipped) < 64:
                 safe_name, _ = self._cut(name, 128)
                 safe_reason, _ = self._cut(reason, 128)
                 skipped.append(safe_name + ": " + safe_reason)
+        if budget.over:
+            return None, skipped, {"reason": "checkpoint exceeds maxSnapshotBytes"}
         envelope: dict[str, Any] = {"version": 1, "variables": variables, "context": None}
         if self.managed_context is not None:
             envelope["context"] = {"text": self.managed_context, "meta": dict(self.managed_context_meta or {})}
