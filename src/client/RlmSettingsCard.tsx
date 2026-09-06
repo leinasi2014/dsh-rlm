@@ -1,12 +1,9 @@
 /**
- * dsh-rlm settings card, registered under `settings.plugin.item` keyed by the
- * `rlm` namespace. Mirrors the swarm `TeamSkillSettingsCard` shell and the
- * official CardForm semantics: a staged draft, per-field override badge, reset
- * to composition, and Save/Saving/Saved/Failed footer states.
+ * dsh-rlm Settings > Plugins card.
  *
- * All stage/override/validation/save-state logic lives in the pure
- * `rlm-settings-model.ts` module (no React/DOM/DSH imports there) so it is
- * testable with `node --test`.
+ * The UI is deliberately simple-first: common controls are in General, while
+ * limits, recovery/safety, and token guard settings stay discoverable without
+ * overwhelming a first-time user. Writes remain staged until Save.
  */
 import { useCallback, useEffect, useMemo, useReducer, useState, useSyncExternalStore, type CSSProperties } from 'react'
 import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client'
@@ -22,7 +19,6 @@ import {
   buildWrites,
   buildMutation,
   resetState,
-  canStageReset,
   saveStateReducer,
   fieldSpec,
   tabFields,
@@ -32,31 +28,157 @@ import {
   type RlmSettings,
   type RlmTab,
 } from './rlm-settings-model.js'
-import { FIELD_HINT, FIELD_LABEL, TAB_LABEL } from './rlm-settings-locales.js'
+import { FIELD_HINT, FIELD_LABEL, TAB_HELP, TAB_LABEL } from './rlm-settings-locales.js'
 
 export type RlmSettingsFace = { readonly scope: SettingsScope<RlmSettings> }
 export type RlmSettingsCardProps = PropsRuntime<'settings.plugin.item'> & PropsLocale<typeof RLM_SETTINGS_LOCALE_NS> & InjectFace<RlmSettingsFace>
 
+
+const token = (name: string, fallback: string): string => `var(${name}, ${fallback})`
+
 const layout: Record<string, CSSProperties> = {
-  card: { listStyle: 'none', border: '1px solid var(--dsh-color-border, #555)', borderRadius: 16, marginBottom: 16, overflow: 'hidden' },
-  header: { width: '100%', display: 'flex', alignItems: 'center', gap: 14, textAlign: 'left', padding: '18px 20px', background: 'transparent', border: 0, color: 'inherit', cursor: 'pointer' },
-  mark: { width: 44, height: 44, borderRadius: 12, display: 'grid', placeItems: 'center', fontWeight: 800, color: '#dbe2ff', background: 'linear-gradient(145deg, #3478c9, #1e4a7a)' },
-  title: { display: 'block', fontWeight: 750, fontSize: 18 },
-  description: { display: 'block', marginTop: 4, opacity: 0.72 },
-  badge: { border: '1px solid var(--dsh-color-border, #555)', borderRadius: 999, padding: '3px 9px', fontSize: 12, opacity: 0.8 },
-  body: { padding: '0 20px 20px', borderTop: '1px solid var(--dsh-color-border, #555)' },
-  tabs: { display: 'flex', flexWrap: 'wrap', gap: 8, borderBottom: '1px solid var(--dsh-color-border, #555)', marginBottom: 20 },
-  tab: { padding: '13px 10px', border: 0, borderBottomWidth: 2, borderBottomStyle: 'solid', borderBottomColor: 'transparent', background: 'transparent', color: 'inherit', cursor: 'pointer' },
-  tabActive: { borderBottomColor: 'var(--dsh-color-primary, #7187ff)', fontWeight: 700 },
-  grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14 },
-  field: { display: 'grid', gap: 6 },
-  input: { width: '100%', boxSizing: 'border-box', minHeight: 38 },
-  hint: { margin: '10px 0', opacity: 0.72, fontSize: 13 },
-  badgeRow: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
-  overrideBadge: { border: '1px solid var(--dsh-color-border, #555)', borderRadius: 999, padding: '1px 7px', fontSize: 11, opacity: 0.8 },
-  invalid: { color: 'var(--dsh-color-danger, #d44)' },
-  footer: { display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center', marginTop: 16 },
+  card: {
+    listStyle: 'none',
+    border: `0.5px solid ${token('--dsw-alias-border-l4', token('--dsh-color-border', '#555'))}`,
+    borderRadius: 16,
+    marginBottom: 16,
+    overflow: 'hidden',
+    background: token('--dsw-alias-bg-layer-3', 'transparent'),
+  },
+  header: {
+    width: '100%',
+    display: 'flex',
+    alignItems: 'center',
+    gap: 12,
+    textAlign: 'left',
+    padding: '14px 16px',
+    background: 'transparent',
+    border: 0,
+    color: 'inherit',
+    cursor: 'pointer',
+    font: 'inherit',
+  },
+  mark: {
+    width: 36,
+    height: 36,
+    flex: '0 0 36px',
+    borderRadius: 10,
+    display: 'grid',
+    placeItems: 'center',
+    fontSize: 11,
+    fontWeight: 800,
+    letterSpacing: '0.04em',
+    border: `0.5px solid ${token('--dsw-alias-border-l4', token('--dsh-color-border', '#555'))}`,
+    background: token('--dsw-alias-bg-module-platform', 'transparent'),
+    color: token('--dsw-alias-label-primary', 'inherit'),
+  },
+  titleWrap: { flex: 1, minWidth: 0, display: 'grid', gap: 3 },
+  title: { display: 'block', fontWeight: 600, fontSize: 15, lineHeight: 1.4, color: token('--dsw-alias-label-primary', 'inherit') },
+  description: { display: 'block', fontSize: 13, lineHeight: 1.5, color: token('--dsw-alias-label-tertiary', 'currentColor') },
+  statusRow: { display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap', justifyContent: 'flex-end' },
+  badge: {
+    borderRadius: 999,
+    padding: '2px 8px',
+    fontSize: 11,
+    lineHeight: '17px',
+    fontWeight: 500,
+    background: token('--dsw-alias-bg-module-platform', 'transparent'),
+    color: token('--dsw-alias-label-secondary', 'inherit'),
+    whiteSpace: 'nowrap',
+  },
+  body: { margin: '0 16px', padding: '0 0 10px', borderTop: `0.5px solid ${token('--dsw-alias-border-l2', token('--dsh-color-border', '#555'))}` },
+  intro: { margin: '14px 0 12px', display: 'grid', gap: 7 },
+  introTitle: { margin: 0, fontSize: 13, fontWeight: 600, color: token('--dsw-alias-label-primary', 'inherit') },
+  introText: { margin: 0, fontSize: 12, lineHeight: 1.55, color: token('--dsw-alias-label-tertiary', 'currentColor') },
+  readOnly: { margin: '12px 0 0', fontSize: 12, lineHeight: 1.5, color: token('--dsw-alias-label-tertiary', 'currentColor') },
+  tabs: {
+    display: 'flex',
+    gap: 4,
+    overflowX: 'auto',
+    padding: '2px 0 0',
+    borderBottom: `0.5px solid ${token('--dsw-alias-border-l2', token('--dsh-color-border', '#555'))}`,
+  },
+  tab: {
+    appearance: 'none',
+    flex: '0 0 auto',
+    padding: '9px 10px',
+    border: 0,
+    borderBottom: '2px solid transparent',
+    background: 'transparent',
+    color: token('--dsw-alias-label-tertiary', 'inherit'),
+    cursor: 'pointer',
+    font: 'inherit',
+    fontSize: 12,
+  },
+  tabActive: { borderBottomColor: token('--dsw-alias-brand-primary', token('--dsh-color-primary', '#7187ff')), color: token('--dsw-alias-label-primary', 'inherit'), fontWeight: 600 },
+  tabHelp: { margin: '12px 0', fontSize: 12, lineHeight: 1.55, color: token('--dsw-alias-label-tertiary', 'currentColor') },
+  grid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(250px, 1fr))', gap: 10 },
+  field: {
+    display: 'grid',
+    gap: 7,
+    padding: 12,
+    border: `0.5px solid ${token('--dsw-alias-border-l2', token('--dsh-color-border', '#555'))}`,
+    borderRadius: 12,
+    background: token('--dsw-alias-bg-layer-3', 'transparent'),
+    alignContent: 'start',
+  },
+  toggleField: { gridTemplateColumns: '1fr auto', alignItems: 'center', columnGap: 14 },
+  fieldDisabled: { opacity: 0.58 },
+  label: { fontSize: 13, fontWeight: 600, lineHeight: 1.4, color: token('--dsw-alias-label-primary', 'inherit') },
+  labelRow: { display: 'flex', alignItems: 'center', gap: 7, flexWrap: 'wrap' },
+  overrideBadge: {
+    borderRadius: 999,
+    padding: '1px 7px',
+    fontSize: 10,
+    lineHeight: '16px',
+    background: token('--dsw-alias-bg-module-platform', 'transparent'),
+    color: token('--dsw-alias-label-secondary', 'inherit'),
+  },
+  hint: { margin: 0, fontSize: 11.5, lineHeight: 1.55, color: token('--dsw-alias-label-tertiary', 'currentColor') },
+  dependencyHint: { margin: 0, fontSize: 11.5, lineHeight: 1.5, color: token('--dsw-alias-label-secondary', 'currentColor') },
+  valueMeta: { margin: 0, fontSize: 11, lineHeight: 1.4, color: token('--dsw-alias-label-dimmed', 'currentColor') },
+  input: {
+    width: '100%',
+    boxSizing: 'border-box',
+    minHeight: 36,
+    borderRadius: 8,
+    border: `1px solid ${token('--dsw-alias-border-l2', token('--dsh-color-border', '#555'))}`,
+    background: token('--dsw-alias-bg-layer-3', 'transparent'),
+    color: token('--dsw-alias-label-primary', 'inherit'),
+    padding: '7px 10px',
+    font: 'inherit',
+    fontSize: 13,
+  },
+  checkbox: { width: 18, height: 18, accentColor: token('--dsw-alias-brand-primary', token('--dsh-color-primary', '#7187ff')), cursor: 'pointer' },
+  invalid: { color: token('--dsw-alias-label-error', token('--dsh-color-danger', '#d44')) },
+  summary: {
+    margin: '12px 0 0',
+    padding: '9px 10px',
+    borderRadius: 9,
+    fontSize: 12,
+    lineHeight: 1.5,
+    background: token('--dsw-alias-bg-module-platform', 'transparent'),
+    color: token('--dsw-alias-label-secondary', 'inherit'),
+  },
+  summaryError: { color: token('--dsw-alias-label-error', token('--dsh-color-danger', '#d44')) },
+  footer: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: 8,
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    marginTop: 12,
+    padding: '12px 0 4px',
+    borderTop: `0.5px solid ${token('--dsw-alias-border-l2', token('--dsh-color-border', '#555'))}`,
+  },
+  footerStatus: { flex: '1 1 260px', margin: 0, fontSize: 12, lineHeight: 1.5, color: token('--dsw-alias-label-tertiary', 'currentColor') },
+  footerError: { color: token('--dsw-alias-label-error', token('--dsh-color-danger', '#d44')) },
+  button: { appearance: 'none', borderRadius: 8, padding: '6px 12px', font: 'inherit', fontSize: 12, lineHeight: 1.5, cursor: 'pointer' },
+  secondaryButton: { border: `1px solid ${token('--dsw-alias-border-l2', token('--dsh-color-border', '#555'))}`, background: 'transparent', color: token('--dsw-alias-label-secondary', 'inherit') },
+  primaryButton: { border: '1px solid transparent', background: token('--dsw-alias-label-primary', 'currentColor'), color: token('--dsw-alias-bg-layer-3', 'white') },
 }
+
+const TAB_ORDER: readonly RlmTab[] = ['core', 'bounded', 'recovery', 'guard']
 
 export function RlmSettingsCard(props: RlmSettingsCardProps) {
   const snapshot = useSyncExternalStore(
@@ -80,12 +202,20 @@ export function RlmSettingsCard(props: RlmSettingsCardProps) {
   const editable = snapshot.status === 'ready' && snapshot.writable === true && saveState !== 'saving'
   const problems = useMemo(() => validateDraft(draft), [draft])
   const invalid = !isDraftValid(draft)
+  const writes = useMemo(() => buildWrites(draft, dirty, stagedClear), [draft, dirty, stagedClear])
 
   const edit = (field: RlmFieldKey, value: RlmDraft[RlmFieldKey]) => {
     setDraft(current => ({ ...current, [field]: value }))
     setDirty(current => new Set(current).add(field))
     setStagedClear(current => { const next = new Set(current); next.delete(field); return next })
     dispatch({ type: 'edit' })
+  }
+
+  const discard = () => {
+    setDraft(deriveDraft(snapshot.value))
+    setDirty(new Set())
+    setStagedClear(new Set())
+    dispatch({ type: 'reset' })
   }
 
   const reset = () => {
@@ -96,22 +226,25 @@ export function RlmSettingsCard(props: RlmSettingsCardProps) {
     dispatch({ type: 'reset' })
   }
 
-  const canSave = editable && dirty.size > 0 && !invalid
+  const canSave = editable && writes.length > 0 && !invalid && snapshot.revision !== undefined
+  const canDiscard = saveState !== 'saving' && dirty.size > 0
+  const canReset = editable && (dirty.size > 0 || overrides.size > 0)
 
   const save = () => {
-    if (!canSave) return
+    if (!canSave || snapshot.revision === undefined) return
+    const expectedRevision = snapshot.revision
+    const planned = [...writes]
     void (async () => {
       dispatch({ type: 'begin' })
       try {
-        // Issue #69: one atomic revision-fenced mutation for the whole staged
-        // save, so validation/persistence/revision fencing is all-or-nothing.
-        await props.scope.mutate(buildMutation(buildWrites(draft, dirty, stagedClear)), snapshot.revision)
-        // Only after the atomic mutation settles does the editor state release.
+        // Issue #69 is the supported contract: one atomic, revision-fenced
+        // namespace mutation. Never regress this UI to sequential field writes.
+        await props.scope.mutate(buildMutation(planned), expectedRevision)
         setDirty(new Set())
         setStagedClear(new Set())
         dispatch({ type: 'succeed' })
       } catch {
-        // Keep the draft and staged state so the user can inspect and retry.
+        // Keep the staged draft so the user can inspect and retry.
         dispatch({ type: 'fail' })
       }
     })()
@@ -120,35 +253,97 @@ export function RlmSettingsCard(props: RlmSettingsCardProps) {
   if (snapshot.status === 'unavailable') return null
 
   const firstProblem = firstProblemKey(problems)
+  const effectiveEnabled = draft.enabled
 
   return (
     <li style={layout.card} data-rlm-settings-entry>
-      <button type="button" style={layout.header} aria-expanded={open} aria-label={`${props.t(open ? 'close' : 'open')}: ${props.t('title')} ${props.t('subtitle')}`} onClick={() => { setOpen(value => !value) }}>
-        <span aria-hidden="true" style={layout.mark}>RL</span>
-        <span style={{ flex: 1 }}>
+      <button
+        type="button"
+        style={layout.header}
+        aria-expanded={open}
+        aria-label={`${props.t(open ? 'close' : 'open')}: ${props.t('title')} ${props.t('subtitle')}`}
+        onClick={() => { setOpen(value => !value) }}
+      >
+        <span aria-hidden="true" style={layout.mark}>RLM</span>
+        <span style={layout.titleWrap}>
           <span style={layout.title}>{props.t('title')} · {props.t('subtitle')}</span>
           <span style={layout.description}>{props.t('description')}</span>
         </span>
-        <span style={layout.badge}>{props.t('active')}</span>
-        <span aria-hidden="true">{open ? '⌃' : '⌄'}</span>
+        <span style={layout.statusRow}>
+          {dirty.size > 0 ? <span style={layout.badge}>{props.t('unsaved')}</span> : null}
+          <span style={layout.badge}>{props.t(effectiveEnabled ? 'enabledStatus' : 'disabledStatus')}</span>
+          <span aria-hidden="true">{open ? '⌃' : '⌄'}</span>
+        </span>
       </button>
+
       {open ? (
         <div style={layout.body}>
-          {!editable && snapshot.status === 'ready' ? <p role="status" style={layout.hint}>{props.t('readOnly')}</p> : null}
-          <nav aria-label={props.t('title')} style={layout.tabs}>
-            {(['core', 'bounded', 'recovery', 'guard'] as const).map(value => <TabButton key={value} current={tab} value={value} onSelect={setTab}>{props.t(TAB_LABEL[value])}</TabButton>)}
-          </nav>
-          <section style={layout.grid}>
-            {tabFields(tab).map(field => <Field key={field} field={field} draft={draft} editable={editable} overridden={isFieldOverridden(field, { dirty: dirty.has(field), stagedClear: stagedClear.has(field), userOwns: overrides.has(field) })} problem={problems[field]} t={props.t} onEdit={edit} />)}
+          <div style={layout.intro}>
+            <p style={layout.introTitle}>{props.t('quickStartTitle')}</p>
+            <p style={layout.introText}>{props.t('quickStart')}</p>
+          </div>
+          {!editable && snapshot.status === 'ready' && saveState !== 'saving'
+            ? <p role="status" style={layout.readOnly}>{props.t('readOnly')}</p>
+            : null}
+
+          <div role="tablist" aria-label={props.t('sectionLabel')} style={layout.tabs}>
+            {TAB_ORDER.map(value => (
+              <TabButton key={value} current={tab} value={value} onSelect={setTab}>
+                {props.t(TAB_LABEL[value])}
+              </TabButton>
+            ))}
+          </div>
+
+          <section
+            id={`rlm-panel-${tab}`}
+            role="tabpanel"
+            aria-labelledby={`rlm-tab-${tab}`}
+          >
+            <p style={layout.tabHelp}>{props.t(TAB_HELP[tab])}</p>
+            <div style={layout.grid}>
+              {fieldsForTab(tab).map(field => (
+                <Field
+                  key={field}
+                  field={field}
+                  draft={draft}
+                  editable={editable}
+                  overridden={isFieldOverridden(field, {
+                    dirty: dirty.has(field),
+                    stagedClear: stagedClear.has(field),
+                    userOwns: overrides.has(field),
+                  })}
+                  problem={problems[field]}
+                  t={props.t}
+                  onEdit={edit}
+                />
+              ))}
+            </div>
           </section>
-          <p role={firstProblem === undefined ? undefined : 'alert'} style={{ ...layout.hint, color: firstProblem === undefined ? undefined : 'var(--dsh-color-danger, #d44)' }}>
-            {firstProblem === undefined ? props.t('restart') : props.t(firstProblem)}
-          </p>
+
+          <div
+            role={firstProblem === undefined ? 'status' : 'alert'}
+            style={{ ...layout.summary, ...(firstProblem === undefined ? {} : layout.summaryError) }}
+          >
+            {firstProblem === undefined
+              ? props.t(dirty.size > 0 ? 'unsavedSummary' : 'restart')
+              : props.t('validationSummary')}
+          </div>
+
           <div style={layout.footer}>
-            {saveState === 'saved' ? <span role="status">{props.t('saved')} {props.t('restart')}</span> : null}
-            {saveState === 'failed' ? <span role="alert">{props.t('saveFailed')}</span> : null}
-            <button type="button" disabled={!canSave} onClick={save}>{props.t(saveState === 'saving' ? 'saving' : 'save')}</button>
-            <button type="button" disabled={!editable || !canStageReset(overrides, dirty)} onClick={reset}>{props.t('reset')}</button>
+            {saveState === 'saved'
+              ? <p role="status" style={layout.footerStatus}>{props.t('saved')} {props.t('restart')}</p>
+              : saveState === 'failed'
+                ? <p role="alert" style={{ ...layout.footerStatus, ...layout.footerError }}>{props.t('saveFailed')}</p>
+                : <span style={{ flex: 1 }} />}
+            <button type="button" style={{ ...layout.button, ...layout.secondaryButton }} disabled={!canReset} onClick={reset}>
+              {props.t('reset')}
+            </button>
+            <button type="button" style={{ ...layout.button, ...layout.secondaryButton }} disabled={!canDiscard} onClick={discard}>
+              {props.t('discard')}
+            </button>
+            <button type="button" style={{ ...layout.button, ...layout.primaryButton }} disabled={!canSave} onClick={save}>
+              {props.t(saveState === 'saving' ? 'saving' : 'save')}
+            </button>
           </div>
         </div>
       ) : null}
@@ -158,7 +353,15 @@ export function RlmSettingsCard(props: RlmSettingsCardProps) {
 
 function TabButton(props: { readonly current: RlmTab; readonly value: RlmTab; readonly onSelect: (tab: RlmTab) => void; readonly children: string }) {
   return (
-    <button type="button" role="tab" aria-selected={props.current === props.value} style={{ ...layout.tab, ...(props.current === props.value ? layout.tabActive : {}) }} onClick={() => { props.onSelect(props.value) }}>
+    <button
+      id={`rlm-tab-${props.value}`}
+      type="button"
+      role="tab"
+      aria-selected={props.current === props.value}
+      aria-controls={`rlm-panel-${props.value}`}
+      style={{ ...layout.tab, ...(props.current === props.value ? layout.tabActive : {}) }}
+      onClick={() => { props.onSelect(props.value) }}
+    >
       {props.children}
     </button>
   )
@@ -176,17 +379,29 @@ function Field(props: {
   const spec = fieldSpec(props.field)
   const labelKey = FIELD_LABEL[props.field]
   const hintKey = FIELD_HINT[props.field]
-  const controlled = !props.editable || (spec.key === 'enabled' ? false : !props.draft.enabled)
+  const dependency = dependencyOf(props.field, props.draft)
+  const controlled = !props.editable || dependency.disabled
   const invalid = props.problem !== undefined
+  const meta = readableValue(props.field, props.draft)
+  const fieldStyle = {
+    ...layout.field,
+    ...(spec.kind === 'toggle' ? layout.toggleField : {}),
+    ...(dependency.disabled ? layout.fieldDisabled : {}),
+  }
+
   return (
-    <label style={layout.field}>
-      <span style={layout.badgeRow}>
-        {props.t(labelKey)}
-        {props.overridden ? <span style={layout.overrideBadge}>{props.t('overridden')}</span> : null}
+    <label style={fieldStyle}>
+      <span style={{ display: 'grid', gap: 6 }}>
+        <span style={layout.labelRow}>
+          <span style={layout.label}>{props.t(labelKey)}</span>
+          {props.overridden ? <span style={layout.overrideBadge}>{props.t('overridden')}</span> : null}
+        </span>
+        {hintKey !== undefined ? <span style={layout.hint}>{props.t(hintKey)}</span> : null}
+        {dependency.message !== undefined ? <span style={layout.dependencyHint}>{props.t(dependency.message)}</span> : null}
+        {meta !== undefined ? <span style={layout.valueMeta}>{props.t('effectiveValue')}: {meta}</span> : null}
+        {invalid ? <span role="alert" style={{ ...layout.hint, ...layout.invalid }}>{props.t(props.problem ?? 'invalidNumber')}</span> : null}
       </span>
       <FieldControl spec={spec} draft={props.draft} controlled={controlled} t={props.t} onEdit={props.onEdit} />
-      {hintKey !== undefined ? <span style={layout.hint}>{props.t(hintKey)}</span> : null}
-      {invalid ? <span role="alert" style={{ ...layout.hint, ...layout.invalid }}>{props.t(props.problem ?? 'invalidNumber')}</span> : null}
     </label>
   )
 }
@@ -201,18 +416,98 @@ function FieldControl(props: {
   const { spec, draft, controlled, onEdit } = props
   switch (spec.kind) {
     case 'toggle':
-      return <input type="checkbox" checked={draft[spec.key] as boolean} disabled={controlled} onChange={event => { onEdit(spec.key, event.target.checked) }} />
+      return (
+        <input
+          aria-label={props.t(FIELD_LABEL[spec.key])}
+          type="checkbox"
+          checked={draft[spec.key] as boolean}
+          disabled={controlled}
+          style={layout.checkbox}
+          onChange={event => { onEdit(spec.key, event.target.checked) }}
+        />
+      )
     case 'select':
       return (
-        <select aria-label={props.t(FIELD_LABEL[spec.key])} style={layout.input} value={String(draft[spec.key])} disabled={controlled} onChange={event => { onEdit(spec.key, event.target.value) }}>
-          {(spec.options ?? []).map(option => <option key={option} value={option}>{option}</option>)}
+        <select
+          aria-label={props.t(FIELD_LABEL[spec.key])}
+          style={layout.input}
+          value={String(draft[spec.key])}
+          disabled={controlled}
+          onChange={event => { onEdit(spec.key, event.target.value) }}
+        >
+          {(spec.options ?? []).map(option => <option key={option} value={option}>{sandboxOption(option, props.t)}</option>)}
         </select>
       )
     case 'number':
-      return <input type="number" min={spec.min} max={spec.max} step="1" style={layout.input} value={String(draft[spec.key])} disabled={controlled} onChange={event => { onEdit(spec.key, event.target.value) }} />
+      return (
+        <input
+          aria-label={props.t(FIELD_LABEL[spec.key])}
+          type="number"
+          min={spec.min}
+          max={spec.max}
+          step="1"
+          style={layout.input}
+          value={String(draft[spec.key])}
+          disabled={controlled}
+          onChange={event => { onEdit(spec.key, event.target.value) }}
+        />
+      )
     case 'text':
-      return <input type="text" style={layout.input} value={String(draft[spec.key])} disabled={controlled} onChange={event => { onEdit(spec.key, event.target.value) }} />
+      return (
+        <input
+          aria-label={props.t(FIELD_LABEL[spec.key])}
+          type="text"
+          style={layout.input}
+          value={String(draft[spec.key])}
+          disabled={controlled}
+          onChange={event => { onEdit(spec.key, event.target.value) }}
+        />
+      )
   }
+}
+
+function fieldsForTab(tab: RlmTab): readonly RlmFieldKey[] {
+  if (tab === 'core') return [...tabFields('core'), 'timeout']
+  if (tab === 'bounded') return tabFields('bounded').filter(field => field !== 'timeout')
+  return tabFields(tab)
+}
+
+function dependencyOf(field: RlmFieldKey, draft: RlmDraft): { disabled: boolean; message?: 'dependency.snapshotRecovery' | 'dependency.tokenGuard' } {
+  if (field === 'durableRoot' && !draft.snapshotRecovery) return { disabled: true, message: 'dependency.snapshotRecovery' }
+  if (field === 'maxQueryTokensPerCell' && !draft.guardQueryTokens) return { disabled: true, message: 'dependency.tokenGuard' }
+  return { disabled: false }
+}
+
+function readableValue(field: RlmFieldKey, draft: RlmDraft): string | undefined {
+  const raw = draft[field]
+  if (typeof raw === 'boolean') return undefined
+  const numeric = Number(String(raw))
+  if (!Number.isFinite(numeric)) return undefined
+  if (field === 'timeout') return formatDuration(numeric)
+  if (field === 'maxStdout' || field === 'maxResult' || field === 'maxContextBytes') return formatBytes(numeric)
+  if (field === 'maxQueryTokensPerCell') return numeric === 0 ? '0' : numeric.toLocaleString('en-US')
+  return undefined
+}
+
+function formatDuration(ms: number): string {
+  if (ms % 60_000 === 0) return `${ms / 60_000} min`
+  if (ms % 1_000 === 0) return `${ms / 1_000} s`
+  return `${ms} ms`
+}
+
+function formatBytes(bytes: number): string {
+  const mib = 1024 * 1024
+  const kib = 1024
+  if (bytes % mib === 0) return `${bytes / mib} MiB`
+  if (bytes % kib === 0) return `${bytes / kib} KiB`
+  return `${bytes.toLocaleString('en-US')} B`
+}
+
+function sandboxOption(option: string, t: RlmSettingsCardProps['t']): string {
+  if (option === 'auto') return t('sandbox.auto')
+  if (option === 'require') return t('sandbox.require')
+  if (option === 'off') return t('sandbox.off')
+  return option
 }
 
 function firstProblemKey(problems: Readonly<Partial<Record<RlmFieldKey, RlmDraftProblem>>>): RlmDraftProblem | undefined {
