@@ -1467,7 +1467,7 @@ test('M12 Issue#48: an inert spec does not start the cell until run() is called'
   await runtime.dispose()
 })
 
-test('M12 Issue#48: a job kill settles as killed and disposes the kernel', async () => {
+test('M12 Issue#48/#74: a job kill settles killed and leaves the shared runtime usable', async () => {
   const { createRlmRuntime } = await import('../src/runtime.ts')
   const { createRlmJobSpec } = await import('../src/runtime.ts')
   const runtime = createRlmRuntime(undefined, {})
@@ -1478,6 +1478,9 @@ test('M12 Issue#48: a job kill settles as killed and disposes the kernel', async
   hooks.cancel('test kill')
   const outcome = await hooks.done
   assert.equal(outcome.status, 'killed', 'job must settle killed after cancel')
+  assert.match(outcome.detail ?? '', /test kill/)
+  const sibling = await runtime.eval('m12-after-kill', { code: '6 * 7' })
+  assert.equal(sibling.result, '42', 'job kill must not dispose the shared RLM runtime')
   await runtime.dispose()
 })
 
