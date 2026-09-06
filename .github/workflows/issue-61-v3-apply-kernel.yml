@@ -1,0 +1,51 @@
+name: issue-61-v3-apply-kernel
+
+on:
+  push:
+    branches: [codex/issue-61-context-metadata-v3]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-61-context-metadata-v3
+          fetch-depth: 0
+      - name: Apply line-guarded context metadata fix
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('python-runtime/rlm_kernel.py')
+          lines = path.read_text(encoding='utf-8').splitlines()
+          needle = 'restored_meta.get("read_bytes") != context_bytes'
+          hits = [i for i, line in enumerate(lines) if needle in line]
+          if len(hits) != 1:
+              raise SystemExit(f'Issue #61 expected one read_bytes line, found {len(hits)}')
+          i = hits[0]
+          if i + 1 >= len(lines) or lines[i + 1].strip() != 'or restored_meta.get("canonical_path") != canonical_context_path':
+              raise SystemExit('Issue #61 canonical_path continuation changed')
+          indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+          lines[i:i + 2] = [
+              indent + 'restored_meta.get("kind") != "file"',
+              indent + 'or type(restored_meta.get("path")) is not str',
+              indent + 'or not os.path.isabs(restored_meta["path"])',
+              indent + 'or type(restored_meta.get("bytes")) is not int',
+              indent + 'or restored_meta["bytes"] < 0',
+              indent + 'or restored_meta["bytes"] != context_bytes',
+              indent + 'or canonical_context_path != restored_meta["path"]',
+          ]
+          path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+          Path('.github/workflows/issue-61-v3-apply-kernel.yml').unlink()
+          PY
+          git diff --check
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add python-runtime/rlm_kernel.py .github/workflows/issue-61-v3-apply-kernel.yml
+          git commit -m 'fix(issue-61): restore writer-owned context metadata schema'
+          git push origin HEAD:codex/issue-61-context-metadata-v3
