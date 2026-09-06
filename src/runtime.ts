@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
-import { RLM_SETTINGS_MANIFEST, type RlmRuntimeTierASettings, type RlmSettingsSpec, type RlmTierASettings } from './settings-manifest.js'
+import { RLM_SETTINGS_MANIFEST, type RlmRuntimeTierASettings, type RlmSettingsSpec, type RlmTierASettings } from './settings-manifest.ts'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'

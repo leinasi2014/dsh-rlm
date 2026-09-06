@@ -1,4 +1,4 @@
-import { RLM_SETTINGS_MANIFEST, rlmSettingsSpec, type RlmManifestKind, type RlmManifestTab, type RlmSettingsKey, type RlmSettingsSpec, type RlmTierASettings } from '../settings-manifest.js'
+import { RLM_SETTINGS_MANIFEST, rlmSettingsSpec, type RlmManifestKind, type RlmManifestTab, type RlmSettingsKey, type RlmSettingsSpec, type RlmTierASettings } from '../settings-manifest.ts'
 
 /**
  * Pure, React-free, DSH-free model behind the dsh-rlm settings card.
