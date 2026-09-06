@@ -84,7 +84,7 @@ class Kernel {
 async function ready(k: Kernel): Promise<void> {
   const frame = await k.next()
   assert.equal(frame.type, 'ready')
-  assert.equal(frame.version, 4)
+  assert.equal(frame.version, 5)
 }
 
 test('M1A: persistent globals and top-level await across cells', async () => {
