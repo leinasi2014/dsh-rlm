@@ -9,11 +9,38 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    # The current orphan-process regression uses Windows tasklist. Keep this
-    # gate honest until that probe is made cross-platform.
-    runs-on: windows-latest
+  memory:
+    runs-on: ubuntu-latest
     timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Check development memory
+        shell: bash
+        env:
+          MEMORY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          MEMORY_HEAD: ${{ github.sha }}
+        run: |
+          pnpm check:memory
+          node scripts/check-development-memory.mjs --range "${MEMORY_BASE}..${MEMORY_HEAD}"
+
+  test:
+    needs: memory
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,14 +56,9 @@ jobs:
         with:
           python-version: '3.11'
       - run: pnpm install --frozen-lockfile
-      - name: Check development memory
-        shell: pwsh
-        env:
-          MEMORY_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-          MEMORY_HEAD: ${{ github.sha }}
-        run: |
-          pnpm check:memory
-          node scripts/check-development-memory.mjs --range "$env:MEMORY_BASE..$env:MEMORY_HEAD"
       - run: pnpm typecheck
       - run: pnpm build
       - run: pnpm test
+      - name: Run POSIX descendant cleanup regression
+        if: runner.os == 'Linux'
+        run: node --test tests/posix-process-tree.test.ts
