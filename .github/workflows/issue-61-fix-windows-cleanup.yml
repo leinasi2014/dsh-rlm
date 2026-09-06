@@ -1,0 +1,67 @@
+name: issue-61-fix-windows-cleanup
+
+on:
+  push:
+    branches: [codex/issue-61-context-metadata]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-61-context-metadata
+          fetch-depth: 0
+      - name: Patch only Issue 61 cleanup block
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('tests/rlm-loop.test.ts')
+          text = p.read_text(encoding='utf-8')
+          test_start = text.find("test('Issue#61: chunked recovery restores managed context metadata emitted by the same kernel'")
+          if test_start < 0:
+              raise SystemExit('Issue #61 test not found')
+          test_end = text.find("\n\ntest(", test_start + 20)
+          if test_end < 0:
+              raise SystemExit('Issue #61 test end not found')
+          block = text[test_start:test_end]
+          old = """    } finally {
+              await runtime.dispose()
+              rmSync(workspace, { recursive: true, force: true })
+            }
+          })"""
+          new = """    } finally {
+              await runtime.dispose()
+              let removed = false
+              for (let attempt = 0; attempt < 30; attempt++) {
+                try {
+                  rmSync(workspace, { recursive: true, force: true })
+                  removed = true
+                  break
+                } catch (error) {
+                  if (attempt === 29) throw error
+                  await new Promise(resolve => setTimeout(resolve, 50))
+                }
+              }
+              assert.equal(removed, true, 'temporary workspace must be removable after runtime disposal')
+            }
+          })"""
+          if block.count(old) != 1:
+              raise SystemExit('Issue #61 cleanup block changed; refusing patch')
+          block = block.replace(old, new, 1)
+          p.write_text(text[:test_start] + block + text[test_end:], encoding='utf-8')
+          Path('.github/workflows/issue-61-fix-windows-cleanup.yml').unlink()
+          PY
+      - name: Commit cleanup correction and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add tests/rlm-loop.test.ts .github/workflows/issue-61-fix-windows-cleanup.yml
+          git commit -m "test(issue-61): retry Windows workspace cleanup after kernel exit"
+          git push origin HEAD:codex/issue-61-context-metadata
