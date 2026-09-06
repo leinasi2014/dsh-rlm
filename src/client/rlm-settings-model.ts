@@ -82,7 +82,7 @@ export function validateDraft(draft: RlmDraft): Readonly<Partial<Record<RlmField
       case 'toggle':
         break
       case 'select': {
-        if (!(spec.options ?? []).includes(String(draft[spec.key]))) problems[spec.key] = 'invalidEnum'
+        if (!(spec.options as readonly string[]).includes(String(draft[spec.key]))) problems[spec.key] = 'invalidEnum'
         break
       }
       case 'number': {
@@ -95,7 +95,7 @@ export function validateDraft(draft: RlmDraft): Readonly<Partial<Record<RlmField
       }
       case 'text': {
         const raw = String(draft[spec.key])
-        if (spec.required === true && raw.trim() === '') {
+        if ('required' in spec && spec.required === true && raw.trim() === '') {
           problems[spec.key] = 'required'
         } else if (spec.key === 'durableRoot' && raw.trim() !== '' && !isAbsolutePath(raw.trim())) {
           problems[spec.key] = 'pathNotAbsolute'
