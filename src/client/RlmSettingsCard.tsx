@@ -241,7 +241,20 @@ export function RlmSettingsCard(props: RlmSettingsCardProps) {
     void (async () => {
       dispatch({ type: 'begin' })
       try {
-        await props.scope.mutate(ops, expectedRevision)
+        const compatible = props.scope as SettingsScope<RlmSettings> & {
+          mutate?: (ops: readonly SettingsMutationOp[], expectedRevision?: number) => Promise<void>
+        }
+        if (typeof compatible.mutate === 'function') {
+          await compatible.mutate(ops, expectedRevision)
+        } else {
+          // dsh-client-runtime 0.1.1-rc.2 has only field writes. Keep that
+          // supported baseline usable; #69/#77 track moving the minimum DSH
+          // version to the atomic namespace mutation contract.
+          for (const write of planned) {
+            if (write.op === 'clear') await props.scope.unset(write.key)
+            else await props.scope.set(write.key, write.value)
+          }
+        }
         const accepted = props.scope.getSnapshot()
         if (!writesLanded(accepted.user, planned)) {
           dispatch({ type: 'fail' })
