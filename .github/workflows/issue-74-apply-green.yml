@@ -1,0 +1,118 @@
+name: issue-74-apply-green
+
+on:
+  push:
+    branches: [codex/issue-74-jobs-lifecycle]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-74-jobs-lifecycle
+          fetch-depth: 0
+      - name: Apply guarded runtime and integration-test patch
+        shell: python
+        run: |
+          from pathlib import Path
+
+          runtime_path = Path('src/runtime.ts')
+          runtime = runtime_path.read_text(encoding='utf-8')
+          start_marker = 'export function createRlmJobSpec(\n'
+          end_marker = '\n\n/** Start one official DSH background job running this RLM cell (M12 consumer path). */'
+          start = runtime.find(start_marker)
+          end = runtime.find(end_marker, start)
+          if start < 0 or end < 0:
+              raise SystemExit('createRlmJobSpec anchors not found')
+          old = runtime[start:end]
+          required = ['runtime.dispose()', 'const done = new Promise', 'void runtime.eval(key, { code })']
+          if any(token not in old for token in required):
+              raise SystemExit('createRlmJobSpec no longer matches the RED root cause; refusing broad edit')
+          new = '''export function createRlmJobSpec(
+            parent: Agent,
+            code: string,
+            runtime: RlmRuntime,
+          ): RlmJobStartInput {
+            const key = String(parent.id)
+            let hooks: RlmJobHooks | undefined
+            return {
+              kind: 'rlm',
+              label: 'rlm_eval job: ' + code.slice(0, 80),
+              outputLimitBytes: 64 * 1024,
+              owner: parent,
+              run() {
+                if (hooks !== undefined) return hooks
+                const controller = new AbortController()
+                let captured = ''
+                const done: RlmJobHooks['done'] = Promise.resolve()
+                  .then(() => runtime.eval(key, { code, signal: controller.signal }))
+                  .then(
+                    (out) => {
+                      captured = (out.stdout ?? '') + (out.result === undefined ? '' : '\\n' + out.result)
+                      return { status: 'completed' as const, output: captured }
+                    },
+                    (err: unknown) => ({
+                      status: err instanceof RlmError && err.kind === 'cancel' ? 'killed' as const : 'failed' as const,
+                      detail: err instanceof Error ? err.message : String(err),
+                    }),
+                  )
+                hooks = {
+                  cancel(reason?: string) {
+                    if (!controller.signal.aborted) controller.abort(reason ?? 'job cancelled')
+                  },
+                  done,
+                  readOutput() {
+                    const out = captured
+                    captured = ''
+                    return out
+                  },
+                }
+                return hooks
+              },
+            }
+          }'''
+          runtime_path.write_text(runtime[:start] + new + runtime[end:], encoding='utf-8')
+
+          test_path = Path('tests/rlm-loop.test.ts')
+          tests = test_path.read_text(encoding='utf-8')
+          test_start_marker = "test('M12 Issue#48: a job kill settles as killed and disposes the kernel', async () => {"
+          test_end_marker = '\n\n// ---- M1C/M1D: DSH tool registration and rlm_query -> one-shot Subagent bridge ----'
+          test_start = tests.find(test_start_marker)
+          test_end = tests.find(test_end_marker, test_start)
+          if test_start < 0 or test_end < 0:
+              raise SystemExit('legacy M12 kill test anchors not found')
+          old_test = tests[test_start:test_end]
+          if "hooks.cancel('test kill')" not in old_test or 'await runtime.dispose()' not in old_test:
+              raise SystemExit('legacy M12 kill test changed unexpectedly; refusing broad edit')
+          new_test = '''test('M12 Issue#48/#74: a job kill settles killed and leaves the shared runtime usable', async () => {
+            const { createRlmRuntime } = await import('../src/runtime.ts')
+            const { createRlmJobSpec } = await import('../src/runtime.ts')
+            const runtime = createRlmRuntime(undefined, {})
+            const exec = makeExec('m12-kill')
+            const spec = createRlmJobSpec(exec.agent, 'import time\\ntime.sleep(30)', runtime)
+            const hooks = spec.run()
+            await new Promise((res) => setTimeout(res, 200))
+            hooks.cancel('test kill')
+            const outcome = await hooks.done
+            assert.equal(outcome.status, 'killed', 'job must settle killed after cancel')
+            assert.match(outcome.detail ?? '', /test kill/)
+            const sibling = await runtime.eval('m12-after-kill', { code: '6 * 7' })
+            assert.equal(sibling.result, '42', 'job kill must not dispose the shared RLM runtime')
+            await runtime.dispose()
+          })'''
+          test_path.write_text(tests[:test_start] + new_test + tests[test_end:], encoding='utf-8')
+
+          Path('.github/workflows/issue-74-apply-green.yml').unlink()
+      - name: Commit exact GREEN patch and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime.ts tests/rlm-loop.test.ts .github/workflows/issue-74-apply-green.yml
+          git commit -m "fix(issue-74): scope RLM Job cancellation to its cell"
+          git push origin HEAD:codex/issue-74-jobs-lifecycle
