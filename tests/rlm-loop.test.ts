@@ -2421,7 +2421,7 @@ test('M2 Issue#1 successor: startup and cell share one total deadline', async ()
       `import time
 time.sleep(0.5)
 import sys, json
-sys.stdout.write(json.dumps({"type": "ready", "version": 4}) + "\\n")
+sys.stdout.write(json.dumps({"type": "ready", "version": 5}) + "\\n")
 sys.stdout.flush()`,
       async (pidFile) => {
         const start = Date.now()
