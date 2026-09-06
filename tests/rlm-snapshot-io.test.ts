@@ -76,12 +76,15 @@ test('Issue#67: eval settles only after durable commit is immediately restorable
 })
 
 test('Issue#67: hot checkpoint publication uses awaited async I/O and reuses chunk payloads', () => {
-  const source = readFileSync(new URL('../src/runtime.ts', import.meta.url), 'utf8')
+  // Issue #84 split: the assertions follow the owning implementation files.
+  const session = readFileSync(new URL('../src/runtime/session.ts', import.meta.url), 'utf8')
+  const kernel = readFileSync(new URL('../src/runtime/kernel.ts', import.meta.url), 'utf8')
+  const source = session + kernel
   assert.match(source, /from 'node:fs\/promises'/)
   assert.match(source, /await this\.publishDurable\(/)
   assert.match(source, /takeCommittedCheckpointPayload\(\)/)
-  const runEntry = source.slice(source.indexOf('private async runEntry'), source.indexOf('\n  dispose(): Promise<void>', source.indexOf('private async runEntry')))
+  const runEntry = session.slice(session.indexOf('private async runEntry'), source.indexOf('\n  dispose(): Promise<void>', source.indexOf('private async runEntry')))
   assert.doesNotMatch(runEntry, /readFileSync\(p\)/, 'runEntry must not synchronously reread a just-committed snapshot')
-  const onResult = source.slice(source.indexOf('private onResult'), source.indexOf('\n  private onError', source.indexOf('private onResult')))
+  const onResult = kernel.slice(kernel.indexOf('private onResult'), source.indexOf('\n  private onError', source.indexOf('private onResult')))
   assert.doesNotMatch(onResult, /writeFileSync|renameSync/, 'chunked checkpoint commit must not block the Host event loop')
 })
