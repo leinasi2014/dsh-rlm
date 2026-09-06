@@ -1358,6 +1358,28 @@ test('M10 Issue#44: a new runtime with the same durableRoot restores the same Se
   }
 })
 
+test('Issue#64: rejected oversized eval does not consume pending snapshot restore', async () => {
+  const { createRlmRuntime, RlmError } = await import('../src/runtime.ts')
+  const runtime = createRlmRuntime(undefined, { snapshotRecovery: true, timeout: 8_000 })
+  try {
+    const saved = await runtime.eval('issue64-restore-admit', { code: 'keep = 41' })
+    assert.equal(saved.recovery?.checkpointCommitted, true)
+    await assert.rejects(
+      runtime.eval('issue64-restore-admit', { code: 'import os\nos._exit(13)' }),
+      (error: unknown) => error instanceof RlmError && error.kind === 'closed',
+    )
+    await assert.rejects(
+      runtime.eval('issue64-restore-admit', { code: '#' + 'x'.repeat(300_000) }),
+      (error: unknown) => error instanceof RlmError && error.kind === 'protocol',
+    )
+    const restored = await runtime.eval('issue64-restore-admit', { code: 'keep + 1' })
+    assert.equal(restored.result, '42')
+    assert.equal(restored.recovery?.restored, true)
+  } finally {
+    await runtime.dispose()
+  }
+})
+
 test('M10 Issue#44: reset deletes the durable reference for that Session only', async () => {
   const durable = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m10-reset-'))
   const runtime = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 3_000 })
