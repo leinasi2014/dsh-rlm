@@ -1,8 +1,8 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -26,6 +26,8 @@ const DEFAULT_MAX_CONTEXT_BYTES = 64 * 1024 * 1024
 const DEFAULT_MAX_DEPTH = 1
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 const MAX_SNAPSHOT_ROOT_BYTES = 64 * 1024 * 1024
+const DURABLE_MAGIC = 'dsh-rlm-durable'
+const MAX_DURABLE_HEADER_BYTES = 4 * 1024
 const MAX_FRAME_BYTES = 256 * 1024
 const CHECKPOINT_CHUNK_BYTES = 128 * 1024
 const MAX_CHECKPOINT_CHUNKS = Math.ceil(MAX_SNAPSHOT_BYTES / CHECKPOINT_CHUNK_BYTES)
@@ -1475,7 +1477,7 @@ class RlmRuntimeImpl implements RlmRuntime {
   private config: RlmRuntimeConfig
   private readonly ctx: Context | undefined
   private readonly durableRoot: string | undefined
-  private readonly durableVersion = 1
+  private readonly durableVersion = 2
   private disposed = false
   private disposePromise: Promise<void> | undefined
   constructor(config: RlmRuntimeConfig, ctx?: Context) {
@@ -1492,35 +1494,188 @@ class RlmRuntimeImpl implements RlmRuntime {
     return path.join(this.durableRoot!, createHash('sha256').update(sessionKey).digest('hex') + suffix)
   }
 
-  /**
-   * Atomically publish the host-private checkpoint bytes under durableRoot (M10).
-   * Keeps a sidecar meta file with the frozen schemaVersion and content sha-256.
-   */
+  private durableError(message: string): RlmError {
+    return new RlmError('snapshot', message, { phase: 'snapshot' })
+  }
+
+  private durableLstat(file: string, label: string): ReturnType<typeof lstatSync> | undefined {
+    try {
+      return lstatSync(file)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+      throw this.durableError(`could not inspect ${label}`)
+    }
+  }
+
+  private syncDurableDirectory(): void {
+    if (!this.durableRoot || process.platform === 'win32') return
+    let fd: number | undefined
+    try {
+      fd = openSync(this.durableRoot, 'r')
+      fsyncSync(fd)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code !== 'EINVAL' && code !== 'ENOTSUP' && code !== 'EISDIR') {
+        throw this.durableError('durable directory fsync failed')
+      }
+    } finally {
+      if (fd !== undefined) {
+        try { closeSync(fd) } catch { /* best-effort close after fsync */ }
+      }
+    }
+  }
+
+  private encodeDurableEnvelope(bytes: Buffer): Buffer {
+    if (bytes.length < 1 || bytes.length > MAX_SNAPSHOT_BYTES) {
+      throw this.durableError('durable checkpoint exceeds the per-Session byte limit')
+    }
+    const header = Buffer.from(JSON.stringify({
+      magic: DURABLE_MAGIC,
+      schemaVersion: this.durableVersion,
+      checkpointBytes: bytes.length,
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+    }) + '\n', 'utf8')
+    if (header.length < 2 || header.length > MAX_DURABLE_HEADER_BYTES) {
+      throw this.durableError('durable checkpoint header is invalid')
+    }
+    return Buffer.concat([header, bytes], header.length + bytes.length)
+  }
+
+  private decodeDurableEnvelope(container: Buffer): Buffer {
+    if (container.length < 2 || container.length > MAX_SNAPSHOT_BYTES + MAX_DURABLE_HEADER_BYTES) {
+      throw this.durableError('durable checkpoint envelope size is invalid')
+    }
+    const newline = container.indexOf(0x0a)
+    if (newline <= 0 || newline > MAX_DURABLE_HEADER_BYTES) {
+      throw this.durableError('durable checkpoint header is malformed')
+    }
+    const headerBytes = container.subarray(0, newline)
+    const headerText = headerBytes.toString('utf8')
+    if (!Buffer.from(headerText, 'utf8').equals(headerBytes)) {
+      throw this.durableError('durable checkpoint header is not valid UTF-8')
+    }
+    let header: Record<string, unknown>
+    try {
+      const parsed = JSON.parse(headerText) as unknown
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not object')
+      header = parsed as Record<string, unknown>
+    } catch {
+      throw this.durableError('durable checkpoint header is malformed')
+    }
+    if (header.magic !== DURABLE_MAGIC) throw this.durableError('durable checkpoint magic mismatch')
+    if (header.schemaVersion !== this.durableVersion) throw this.durableError('durable schema version mismatch')
+    const declaredBytes = header.checkpointBytes
+    if (
+      typeof declaredBytes !== 'number'
+      || !Number.isSafeInteger(declaredBytes)
+      || declaredBytes < 1
+      || declaredBytes > MAX_SNAPSHOT_BYTES
+    ) {
+      throw this.durableError('durable checkpoint byte count is invalid')
+    }
+    const payload = container.subarray(newline + 1)
+    if (payload.length !== declaredBytes) throw this.durableError('durable checkpoint byte count mismatch')
+    if (
+      typeof header.sha256 !== 'string'
+      || header.sha256 !== createHash('sha256').update(payload).digest('hex')
+    ) {
+      throw this.durableError('durable content hash mismatch')
+    }
+    return Buffer.from(payload)
+  }
+
+  /** Publish one crash-consistent, host-private durable generation. */
   private publishDurable(sessionKey: string, bytes: Buffer): void {
     if (!this.durableRoot) return
     const target = this.durablePath(sessionKey, '.checkpoint.json')
-    const meta = this.durablePath(sessionKey, '.meta.json')
-    const temp = target + '.tmp-' + String(process.pid)
-    writeFileSync(temp, bytes)
-    renameSync(temp, target)
-    writeFileSync(meta, JSON.stringify({ schemaVersion: this.durableVersion, bytes: bytes.length, publishedAt: Date.now(), sha256: createHash('sha256').update(bytes).digest('hex') }))
+    const legacyMeta = this.durablePath(sessionKey, '.meta.json')
+    const temp = target + '.tmp-' + randomBytes(16).toString('hex')
+    const envelope = this.encodeDurableEnvelope(bytes)
+    let fd: number | undefined
+    try {
+      fd = openSync(temp, 'wx', 0o600)
+      writeFileSync(fd, envelope)
+      fsyncSync(fd)
+      closeSync(fd)
+      fd = undefined
+      // The prior committed target remains valid until this single rename.
+      renameSync(temp, target)
+      // A stale legacy sidecar is irrelevant once target is a v2 envelope.
+      try { rmSync(legacyMeta, { force: true }) } catch { /* best-effort migration cleanup */ }
+      this.syncDurableDirectory()
+    } catch (error) {
+      if (fd !== undefined) {
+        try { closeSync(fd) } catch { /* best-effort close */ }
+      }
+      try { rmSync(temp, { force: true }) } catch { /* never follow or expose temp paths */ }
+      if (error instanceof RlmError) throw error
+      throw this.durableError('durable checkpoint publication failed')
+    }
   }
 
-  /** Read and validate a durable reference; returns bytes or a typed failure reason. */
+  /** Read a committed v2 envelope, with strict read-only compatibility for M10 v1 pairs. */
   private readDurable(sessionKey: string): Buffer | undefined {
     if (!this.durableRoot) return undefined
     const target = this.durablePath(sessionKey, '.checkpoint.json')
-    const metaPath = this.durablePath(sessionKey, '.meta.json')
-    if (!existsSync(target) || !existsSync(metaPath)) return undefined
+    const legacyMetaPath = this.durablePath(sessionKey, '.meta.json')
+    const targetInfo = this.durableLstat(target, 'durable checkpoint')
+    const legacyMetaInfo = this.durableLstat(legacyMetaPath, 'durable metadata')
+    if (!targetInfo && !legacyMetaInfo) return undefined
+    if (!targetInfo) throw this.durableError('durable checkpoint is incomplete')
+    if (!targetInfo.isFile()) throw this.durableError('durable checkpoint is not a regular file')
+
+    let container: Buffer
     try {
-      const bytes = readFileSync(target)
-      const meta = JSON.parse(readFileSync(metaPath, 'utf8')) as { schemaVersion?: number; sha256?: string }
-      if (meta.schemaVersion !== this.durableVersion) throw new Error('durable schema version mismatch')
-      if (meta.sha256 !== createHash('sha256').update(bytes).digest('hex')) throw new Error('durable content hash mismatch')
-      return bytes
+      container = readFileSync(target)
     } catch {
-      return undefined
+      throw this.durableError('durable checkpoint could not be read')
     }
+
+    // New generations are self-describing and ignore any stale legacy sidecar.
+    const newline = container.indexOf(0x0a)
+    if (newline > 0 && newline <= MAX_DURABLE_HEADER_BYTES) {
+      try {
+        const candidate = JSON.parse(container.subarray(0, newline).toString('utf8')) as unknown
+        if (
+          typeof candidate === 'object'
+          && candidate !== null
+          && !Array.isArray(candidate)
+          && (candidate as Record<string, unknown>).magic === DURABLE_MAGIC
+        ) {
+          return this.decodeDurableEnvelope(container)
+        }
+      } catch {
+        if (!legacyMetaInfo) throw this.durableError('durable checkpoint header is malformed')
+      }
+    }
+
+    // Legacy v1 pair: validate strictly, then migrate on the next successful publish.
+    if (!legacyMetaInfo) throw this.durableError('durable checkpoint envelope is invalid')
+    if (!legacyMetaInfo.isFile()) throw this.durableError('durable metadata is not a regular file')
+    if (container.length < 1 || container.length > MAX_SNAPSHOT_BYTES) {
+      throw this.durableError('legacy durable checkpoint size is invalid')
+    }
+    let meta: { schemaVersion?: unknown; bytes?: unknown; sha256?: unknown }
+    try {
+      const rawMeta = readFileSync(legacyMetaPath)
+      if (rawMeta.length < 2 || rawMeta.length > MAX_DURABLE_HEADER_BYTES) {
+        throw new Error('legacy metadata size')
+      }
+      meta = JSON.parse(rawMeta.toString('utf8')) as { schemaVersion?: unknown; bytes?: unknown; sha256?: unknown }
+    } catch {
+      throw this.durableError('legacy durable metadata is malformed')
+    }
+    if (meta.schemaVersion !== 1) throw this.durableError('durable schema version mismatch')
+    if (meta.bytes !== undefined && meta.bytes !== container.length) {
+      throw this.durableError('legacy durable byte count mismatch')
+    }
+    if (
+      typeof meta.sha256 !== 'string'
+      || meta.sha256 !== createHash('sha256').update(container).digest('hex')
+    ) {
+      throw this.durableError('durable content hash mismatch')
+    }
+    return container
   }
 
   private dropDurable(sessionKey: string): void {
