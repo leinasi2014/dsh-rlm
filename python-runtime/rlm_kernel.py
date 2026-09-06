@@ -25,6 +25,8 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import base64
+import binascii
 import builtins
 import contextvars
 import inspect
@@ -37,7 +39,7 @@ import sys
 import threading
 from typing import Any, Optional
 
-PROTOCOL_VERSION = 4
+PROTOCOL_VERSION = 5
 DEFAULT_MAX_STDOUT = 64 * 1024
 DEFAULT_MAX_RESULT = 64 * 1024
 DEFAULT_MAX_CONTEXT_BYTES = 64 * 1024 * 1024
@@ -46,6 +48,8 @@ MAX_SAFE_INTEGER = 2**53 - 1
 MAX_QUERY_TEXT = 64 * 1024
 MAX_FRAME_BYTES = 256 * 1024
 CHECKPOINT_CHUNK_BYTES = 128 * 1024
+MAX_CHECKPOINT_CHUNKS = (DEFAULT_MAX_SNAPSHOT_BYTES + CHECKPOINT_CHUNK_BYTES - 1) // CHECKPOINT_CHUNK_BYTES
+MAX_CHECKPOINT_CHUNK_BASE64_CHARS = ((CHECKPOINT_CHUNK_BYTES + 2) // 3) * 4
 MAX_ERROR_TEXT = 64 * 1024
 BATCH_CONCURRENCY = 4
 CELL_FILENAME = "<rlm-cell>"
@@ -214,7 +218,10 @@ class RlmKernel:
         # and may be dropped; unknown, future, or duplicate ids stay fatal
         # protocol faults (Issue #1 contract).
         self.cell_generation = 0
-        self._restore_chunks: list[str] = []
+        self._restore_chunks: list[bytes] = []
+        self._restore_total: Optional[int] = None
+        self._restore_bytes = 0
+        self._restore_complete = False
         self.cell_floor = 1
         self.cell_ceiling = 1
         self.cell_done = False
@@ -359,21 +366,93 @@ class RlmKernel:
                 return
             kind = frame.get("type")
             if kind == "restore_chunk":
-                payload = frame.get("data")
-                if not isinstance(payload, str) or len(payload) > CHECKPOINT_CHUNK_BYTES:
-                    self._fatal("invalid restore_chunk data")
+                seq = frame.get("seq")
+                total = frame.get("total")
+                data = frame.get("data")
+                if (
+                    type(seq) is not int
+                    or type(total) is not int
+                    or total < 1
+                    or total > MAX_CHECKPOINT_CHUNKS
+                    or seq < 0
+                    or seq >= total
+                    or frame.get("encoding") != "base64"
+                    or not isinstance(data, str)
+                    or len(data) == 0
+                    or len(data) > MAX_CHECKPOINT_CHUNK_BASE64_CHARS
+                    or self._restore_complete
+                ):
+                    self._fatal("invalid restore_chunk frame")
                     return
-                self._restore_chunks.append(payload)
+                if self._restore_total is None:
+                    self._restore_total = total
+                elif self._restore_total != total:
+                    self._fatal("restore_chunk total mismatch")
+                    return
+                if seq != len(self._restore_chunks):
+                    self._fatal("restore_chunk is duplicate or reordered")
+                    return
+                try:
+                    encoded = data.encode("ascii", "strict")
+                    chunk = base64.b64decode(encoded, validate=True)
+                except (UnicodeEncodeError, binascii.Error, ValueError):
+                    self._fatal("restore_chunk base64 is invalid")
+                    return
+                if (
+                    len(chunk) < 1
+                    or len(chunk) > CHECKPOINT_CHUNK_BYTES
+                    or base64.b64encode(chunk).decode("ascii") != data
+                    or (seq < total - 1 and len(chunk) != CHECKPOINT_CHUNK_BYTES)
+                ):
+                    self._fatal("restore_chunk decoded bytes are invalid")
+                    return
+                aggregate = self._restore_bytes + len(chunk)
+                if aggregate > DEFAULT_MAX_SNAPSHOT_BYTES:
+                    self._fatal("restore_chunk aggregate exceeds snapshot limit")
+                    return
+                self._restore_chunks.append(chunk)
+                self._restore_bytes = aggregate
             elif kind == "restore_end":
                 total = frame.get("total")
-                if not isinstance(total, int) or total < 1 or total != len(self._restore_chunks):
-                    self._fatal("invalid restore_end total")
+                byte_count = frame.get("bytes")
+                if (
+                    type(total) is not int
+                    or type(byte_count) is not int
+                    or total < 1
+                    or total > MAX_CHECKPOINT_CHUNKS
+                    or byte_count < 1
+                    or byte_count > DEFAULT_MAX_SNAPSHOT_BYTES
+                    or frame.get("encoding") != "base64"
+                    or self._restore_complete
+                    or self._restore_total is None
+                    or total != self._restore_total
+                    or total != len(self._restore_chunks)
+                    or byte_count != self._restore_bytes
+                    or total != max(1, (byte_count + CHECKPOINT_CHUNK_BYTES - 1) // CHECKPOINT_CHUNK_BYTES)
+                ):
+                    self._fatal("invalid restore_end frame")
                     return
+                self._restore_complete = True
             elif kind == "eval":
-                if self._restore_chunks:
-                    payload = "".join(self._restore_chunks)
-                    self._restore_chunks.clear()
+                has_restore_state = (
+                    self._restore_total is not None
+                    or bool(self._restore_chunks)
+                    or self._restore_bytes != 0
+                    or self._restore_complete
+                )
+                if has_restore_state:
+                    if not self._restore_complete:
+                        self._fatal("eval arrived with an incomplete restore sequence")
+                        return
+                    payload = b"".join(self._restore_chunks)
+                    if len(payload) != self._restore_bytes:
+                        self._fatal("restore payload byte count changed during assembly")
+                        return
                     frame["_restore_payload"] = payload
+                    self._restore_chunks.clear()
+                    self._restore_total = None
+                    self._restore_bytes = 0
+                    self._restore_complete = False
                 self.loop.call_soon_threadsafe(self.queue.put_nowait, frame)
             elif kind in ("query_result", "spawn_result", "followup_result", "error"):
                 qid = frame.get("id")
@@ -1162,9 +1241,9 @@ class RlmKernel:
             try:
                 if snapshot_chunked:
                     raw = frame.get("_restore_payload")
-                    if not isinstance(raw, str):
+                    if not isinstance(raw, bytes):
                         raise RlmSnapshotError("missing chunked restore payload")
-                    self._restore_checkpoint_payload(raw.encode("utf-8", "strict"), max_snapshot_bytes)
+                    self._restore_checkpoint_payload(raw, max_snapshot_bytes)
                 else:
                     self._restore_checkpoint(str(snapshot_path), max_snapshot_bytes)
                 recovery = {"restored": True, "checkpoint_committed": False}
@@ -1288,7 +1367,8 @@ class RlmKernel:
                             "id": eval_id,
                             "seq": seq,
                             "count": len(chunks),
-                            "data": chunk.decode("utf-8", "strict"),
+                            "encoding": "base64",
+                            "data": base64.b64encode(chunk).decode("ascii"),
                         })
                     checkpoint["checkpoint_bytes"] = len(payload)
             else:
