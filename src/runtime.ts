@@ -26,6 +26,7 @@ const DEFAULT_MAX_CONTEXT_BYTES = 64 * 1024 * 1024
 const DEFAULT_MAX_DEPTH = 1
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024
 const MAX_SNAPSHOT_ROOT_BYTES = 64 * 1024 * 1024
+const IDLE_KERNEL_TTL_MS = 15 * 60 * 1000
 const DURABLE_MAGIC = 'dsh-rlm-durable'
 const MAX_DURABLE_HEADER_BYTES = 4 * 1024
 const MAX_FRAME_BYTES = 256 * 1024
@@ -278,6 +279,12 @@ export interface RlmRuntimeConfig {
   durableRoot?: string
   /** Opt-in M5 recovery after an owned timeout/crash/protocol-fatal loss. */
   snapshotRecovery?: boolean
+  /**
+   * Idle TTL before a ready kernel is released (Issue #76). Bounded retention:
+   * active/queued cells are never evicted and M5/M10 recovery remains the
+   * resume path. Runtime-only knob; the schema/GUI keep the documented limits.
+   */
+  kernelIdleTtlMs?: number
 }
 
 /** Plugin-facing configuration: runtime settings plus the subagent provider. */
@@ -1434,12 +1441,19 @@ class Kernel {
     })
   }
 
-  dispose(): Promise<void> {
+  /** True when no cell is running or settling and the process is ready (Issue #76). */
+  isIdle(): boolean {
+    return this.readyDone && this.pending === null && !this.settling
+  }
+
+  dispose(options?: { keepCheckpoint?: boolean }): Promise<void> {
     if (this.disposedPromise) return this.disposedPromise
     // Terminal state is set synchronously so no eval can enter after unload;
     // the awaitable barrier resolves only after the child cleanup barrier.
     this.disposed = true
-    this.retainCheckpoint = false
+    // Idle eviction (Issue #76) keeps the committed M5 checkpoint so the next
+    // same-Session eval resumes through the documented recovery path.
+    if (options?.keepCheckpoint !== true) this.retainCheckpoint = false
     this.exited = true
     this.continuableChildren.clear()
     this.pendingChunks.clear()
@@ -1494,6 +1508,7 @@ class RlmRuntimeImpl implements RlmRuntime {
   private readonly checkpointReservations = new Map<string, number>()
   private queues = new Map<string, QueuedEval[]>()
   private drains = new Map<string, Promise<void>>()
+  private readonly kernelLastUse = new Map<string, number>()
   private config: RlmRuntimeConfig
   private readonly ctx: Context | undefined
   private readonly durableRoot: string | undefined
@@ -1858,7 +1873,28 @@ class RlmRuntimeImpl implements RlmRuntime {
       confined: true,
     }
   }
+  /**
+   * Bounded idle-kernel retention (Issue #76): release ready kernels that have
+   * been unused past the TTL. Active/queued cells are never evicted and a
+   * later same-Session eval starts a fresh kernel (M5/M10 recovery is the
+   * documented resume path).
+   */
+  private evictIdleKernels(): void {
+    const ttl = this.config.kernelIdleTtlMs ?? IDLE_KERNEL_TTL_MS
+    const now = Date.now()
+    for (const [key, kernel] of [...this.kernels]) {
+      if (!kernel.isIdle()) continue
+      if ((this.kernelLastUse.get(key) ?? 0) + ttl > now) continue
+      const queued = this.queues.get(key)
+      if (queued !== undefined && queued.some((entry) => !entry.active)) continue
+      this.kernels.delete(key)
+      this.kernelLastUse.delete(key)
+      void kernel.dispose({ keepCheckpoint: true })
+    }
+  }
+
   async eval(sessionKey: string, input: RlmEvalInput): Promise<RlmEvalOutput> {
+    this.evictIdleKernels()
     // A pre-aborted signal never starts a session kernel and never queues work.
     if (input.signal?.aborted) {
       throw new RlmError('cancel', String(input.signal.reason ?? 'cancelled'))
@@ -2064,10 +2100,12 @@ class RlmRuntimeImpl implements RlmRuntime {
         kernel = new Kernel(sessionKey, this.config, this.snapshotFor(sessionKey), launch)
         kernel.onExit = (exited) => {
           if (this.kernels.get(sessionKey) === kernel) this.kernels.delete(sessionKey)
+          this.kernelLastUse.delete(sessionKey)
           if (!exited.keepsCheckpoint || !this.checkpoints.has(sessionKey)) this.dropCheckpoint(sessionKey)
         }
         this.kernels.set(sessionKey, kernel)
       }
+      this.kernelLastUse.set(sessionKey, Date.now())
       const remaining = Math.max(0, entry.deadline - Date.now())
       await kernel.waitReady({
         timeout: remaining,
@@ -2086,6 +2124,7 @@ class RlmRuntimeImpl implements RlmRuntime {
           }
         }
       }
+      this.kernelLastUse.set(sessionKey, Date.now())
       this.settleEntry(entry, out)
     } catch (err) {
       if (entry.settled) return
@@ -2100,6 +2139,7 @@ class RlmRuntimeImpl implements RlmRuntime {
     // Issue #86: disposal releases every per-Session job slot; later starts on
     // a disposed runtime still fail closed through eval.
     activeJobLocks.delete(this)
+    this.kernelLastUse.clear()
     // Terminal state synchronously: new evals reject immediately and drain
     // workers stop starting new work.
     this.disposed = true

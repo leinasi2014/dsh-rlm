@@ -1572,6 +1572,39 @@ test('Issue#89: reset releases the Session durable quota share', async () => {
   }
 })
 
+test('Issue#76: an idle kernel is evicted after the TTL and recovery restores the Session', async () => {
+  const runtime = createRlmRuntime(undefined, { kernelIdleTtlMs: 200, snapshotRecovery: true, timeout: 30_000 })
+  try {
+    await runtime.eval('ttl-a', { code: 'keep = 41' })
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    // A different Session starts now: this is the only eviction trigger point.
+    const other = await runtime.eval('ttl-b', { code: '9 * 6' })
+    assert.equal(other.result, '54')
+    // The evicted Session resumes through the M5 recovery path.
+    const resumed = await runtime.eval('ttl-a', { code: 'keep + 1' })
+    assert.equal(resumed.result, '42')
+    assert.equal(resumed.recovery?.restored, true, 'resume after eviction must restore the checkpoint')
+  } finally {
+    await runtime.dispose()
+  }
+})
+
+test('Issue#76: without recovery a fresh kernel starts after eviction (bounded state is dropped)', async () => {
+  const runtime = createRlmRuntime(undefined, { kernelIdleTtlMs: 200, timeout: 30_000 })
+  try {
+    await runtime.eval('ttl-c', { code: 'only = 123' })
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    await runtime.eval('ttl-d', { code: '1 + 1' })
+    await assert.rejects(
+      runtime.eval('ttl-c', { code: 'only' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'eval',
+      'a fresh kernel without recovery must not see the evicted namespace',
+    )
+  } finally {
+    await runtime.dispose()
+  }
+})
+
 test('M10 Issue#44 RED: a durableRoot is not consulted on the accepted M9 base', async () => {
   const durable = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m10-red-'))
   const runtime = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 3_000 })
