@@ -1,0 +1,179 @@
+name: issue-73-apply-manifest
+
+on:
+  push:
+    branches: [codex/issue-73-settings-manifest]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-73-settings-manifest
+          fetch-depth: 0
+      - name: Rewire Host and client to shared manifest
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          runtime = Path('src/runtime.ts')
+          text = runtime.read_text(encoding='utf-8')
+          import_anchor = "import z from '@deepseek-ai/schemastery'\n"
+          manifest_import = "import { RLM_SETTINGS_MANIFEST, type RlmRuntimeTierASettings, type RlmSettingsSpec, type RlmTierASettings } from './settings-manifest.js'\n"
+          if text.count(import_anchor) != 1:
+              raise SystemExit('runtime import anchor changed')
+          if manifest_import not in text:
+              text = text.replace(import_anchor, import_anchor + manifest_import, 1)
+
+          start = text.find('export interface RlmRuntimeConfig {')
+          end = text.find('\ninterface RlmEvalCommon {', start)
+          if start < 0 or end < 0:
+              raise SystemExit('runtime config/schema block changed')
+          replacement = r'''export type RlmRuntimeConfig = RlmRuntimeTierASettings & {
+            /**
+             * Idle TTL before a ready kernel is released (Issue #76). Bounded
+             * retention only; this runtime-only knob is intentionally absent
+             * from the 14-field Tier-A settings manifest and GUI.
+             */
+            kernelIdleTtlMs?: number
+          }
+
+          /** Plugin-facing Tier-A settings plus the runtime-only idle TTL. */
+          export type RlmPluginConfig = RlmTierASettings & {
+            kernelIdleTtlMs?: number
+          }
+
+          /** Build one Host Schemastery field from the environment-neutral manifest. */
+          function schemaForSettingsSpec(spec: RlmSettingsSpec): z<unknown> {
+            let schema: any
+            switch (spec.kind) {
+              case 'toggle':
+                schema = z.boolean()
+                break
+              case 'text':
+                schema = z.string()
+                if ('hostMinLength' in spec && spec.hostMinLength !== undefined) schema = schema.min(spec.hostMinLength)
+                break
+              case 'number':
+                schema = z.natural().min(spec.min).max(spec.max)
+                break
+              case 'select':
+                schema = z.union(spec.options.map(option => z.const(option)) as any)
+                break
+            }
+            if (spec.schemaDefault) schema = schema.default(spec.default)
+            return schema.description(spec.description) as z<unknown>
+          }
+
+          const CONFIG_SCHEMA_FIELDS = Object.fromEntries(
+            RLM_SETTINGS_MANIFEST.map(spec => [spec.key, schemaForSettingsSpec(spec)]),
+          ) as Record<string, z<unknown>>
+
+          /**
+           * Single authoritative Config schema for the plugin. Field names,
+           * defaults, ranges and enum choices come from RLM_SETTINGS_MANIFEST;
+           * Tier-B live validation remains in settings.ts.
+           */
+          export const ConfigSchema: z<RlmPluginConfig> = z.object(CONFIG_SCHEMA_FIELDS) as unknown as z<RlmPluginConfig>
+          '''
+          text = text[:start] + replacement.rstrip() + '\n' + text[end:]
+          runtime.write_text(text, encoding='utf-8')
+
+          client = Path('src/client/rlm-settings-model.ts')
+          text = client.read_text(encoding='utf-8')
+          if not text.startswith('/**'):
+              raise SystemExit('client model header changed')
+          client_import = "import { RLM_SETTINGS_MANIFEST, rlmSettingsSpec, type RlmManifestKind, type RlmManifestTab, type RlmSettingsKey, type RlmSettingsSpec, type RlmTierASettings } from '../settings-manifest.js'\n\n"
+          if client_import not in text:
+              text = client_import + text
+
+          type_start = text.find("export type RlmTab = 'core' | 'bounded' | 'recovery' | 'guard'")
+          fields_end_marker = '] as const\n'
+          fields_end = text.find(fields_end_marker, type_start)
+          if type_start < 0 or fields_end < 0:
+              raise SystemExit('client duplicated field block changed')
+          fields_end += len(fields_end_marker)
+          shared_block = r'''export type RlmTab = RlmManifestTab
+          export type RlmFieldKind = RlmManifestKind
+          export type RlmSettings = RlmTierASettings
+          export type RlmFieldKey = RlmSettingsKey
+          export type RlmFieldSpec = RlmSettingsSpec
+
+          /** The exact shared Tier-A manifest; no browser-side metadata mirror. */
+          export const RLM_FIELDS: readonly RlmFieldSpec[] = RLM_SETTINGS_MANIFEST
+          '''
+          text = text[:type_start] + shared_block.rstrip() + '\n' + text[fields_end:]
+
+          draft_start = text.find('export interface RlmDraft {')
+          field_fn = text.find('\nexport function fieldSpec', draft_start)
+          if draft_start < 0 or field_fn < 0:
+              raise SystemExit('client draft block changed')
+          draft_block = r'''type DraftValueForSpec<S> = S extends { readonly kind: 'toggle' } ? boolean : string
+
+          /** Staged values are generated from the same 14-field manifest. */
+          export type RlmDraft = {
+            [S in RlmFieldSpec as S['key']]: DraftValueForSpec<S>
+          }
+          '''
+          text = text[:draft_start] + draft_block.rstrip() + '\n' + text[field_fn:]
+
+          old_field_fn = r'''export function fieldSpec(key: RlmFieldKey): RlmFieldSpec {
+            const spec = RLM_FIELDS.find(candidate => candidate.key === key)
+            if (spec === undefined) throw new Error(`unknown RLM settings field: ${String(key)}`)
+            return spec
+          }'''
+          new_field_fn = r'''export function fieldSpec(key: RlmFieldKey): RlmFieldSpec {
+            return rlmSettingsSpec(key)
+          }'''
+          if text.count(old_field_fn) != 1:
+              raise SystemExit('client fieldSpec implementation changed')
+          text = text.replace(old_field_fn, new_field_fn, 1)
+
+          derive_start = text.find('export function deriveDraft(settings: RlmSettings | undefined): RlmDraft {')
+          derive_end = text.find('\n}\n\n/** The set of fields the raw user layer carries.', derive_start)
+          if derive_start < 0 or derive_end < 0:
+              raise SystemExit('client deriveDraft block changed')
+          derive_end += 2
+          derive_block = r'''export function deriveDraft(settings: RlmSettings | undefined): RlmDraft {
+            const draft: Partial<Record<RlmFieldKey, boolean | string>> = {}
+            for (const spec of RLM_FIELDS) {
+              const configured = settings?.[spec.key]
+              const effective = configured ?? spec.default
+              draft[spec.key] = spec.kind === 'toggle' ? effective as boolean : String(effective)
+            }
+            return draft as RlmDraft
+          }'''
+          text = text[:derive_start] + derive_block + text[derive_end:]
+          text = text.replace(
+              "schema default. The card's hard-coded defaults mirror the single authoritative\n * `ConfigSchema` (`src/runtime.ts`), including `maxDepth` default `1` (task-1\n * determination: the schema default stays 1 to preserve M1-M12 byte-equivalence\n * when no user settings exist).",
+              "schema default. Field keys/defaults/ranges/options come from the shared pure\n * `RLM_SETTINGS_MANIFEST`; Host-only validation remains outside browser code.",
+              1,
+          )
+          client.write_text(text, encoding='utf-8')
+
+          package = Path('package.json')
+          pkg = package.read_text(encoding='utf-8')
+          needle = 'tests/rlm-settings.test.ts tests/rlm-python-resolution.test.ts'
+          replacement = 'tests/rlm-settings.test.ts tests/rlm-settings-manifest.test.ts tests/rlm-python-resolution.test.ts'
+          if replacement not in pkg:
+              if pkg.count(needle) != 1:
+                  raise SystemExit('package test command changed')
+              pkg = pkg.replace(needle, replacement, 1)
+          package.write_text(pkg, encoding='utf-8')
+
+          Path('.github/workflows/issue-73-apply-manifest.yml').unlink()
+          PY
+      - name: Commit refactor and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime.ts src/client/rlm-settings-model.ts package.json .github/workflows/issue-73-apply-manifest.yml
+          git commit -m "refactor(issue-73): derive Host and GUI settings from one manifest"
+          git push origin HEAD:codex/issue-73-settings-manifest
