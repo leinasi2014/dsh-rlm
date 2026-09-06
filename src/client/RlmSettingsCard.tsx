@@ -21,6 +21,7 @@ import {
   isFieldOverridden,
   buildWrites,
   resetState,
+  canStageReset,
   saveStateReducer,
   fieldSpec,
   tabFields,
@@ -145,7 +146,7 @@ export function RlmSettingsCard(props: RlmSettingsCardProps) {
             {saveState === 'saved' ? <span role="status">{props.t('saved')} {props.t('restart')}</span> : null}
             {saveState === 'failed' ? <span role="alert">{props.t('saveFailed')}</span> : null}
             <button type="button" disabled={!canSave} onClick={save}>{props.t(saveState === 'saving' ? 'saving' : 'save')}</button>
-            <button type="button" disabled={!editable || dirty.size === 0} onClick={reset}>{props.t('reset')}</button>
+            <button type="button" disabled={!editable || !canStageReset(overrides, dirty)} onClick={reset}>{props.t('reset')}</button>
           </div>
         </div>
       ) : null}

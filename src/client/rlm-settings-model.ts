@@ -265,6 +265,20 @@ export function resetState(base: RlmSettings | undefined, user: Record<string, u
   }
 }
 
+/**
+ * Whether the Reset-to-composition action is meaningful in the current editor
+ * state (Issue #80): it must be available whenever the user layer still owns at
+ * least one field (even when the draft is clean), and whenever local staged
+ * edits exist that can be discarded. The card gates the button on this instead
+ * of on draft dirtiness alone.
+ */
+export function canStageReset(
+  storedOverrides: ReadonlySet<RlmFieldKey>,
+  dirty: ReadonlySet<RlmFieldKey>,
+): boolean {
+  return storedOverrides.size > 0 || dirty.size > 0
+}
+
 /** Save state machine: idle -> saving -> saved | failed; any edit/reset returns to idle. */
 export type RlmSaveState = 'idle' | 'saving' | 'saved' | 'failed'
 export type RlmSaveEvent =

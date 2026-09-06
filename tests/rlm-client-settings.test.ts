@@ -11,6 +11,7 @@ import {
   isFieldOverridden,
   buildWrites,
   resetState,
+  canStageReset,
   saveStateReducer,
   valueFromDraft,
   isAbsolutePath,
@@ -147,6 +148,18 @@ test('reset-to-composition reverts the draft to the base layer and stages clears
     { key: 'provider', op: 'clear' },
     { key: 'timeout', op: 'clear' },
   ].toSorted(byKey))
+})
+
+test('Issue#80: reset is available with a clean draft whenever overrides exist', () => {
+  const user = { provider: 'custom', timeout: 12345 }
+  const overrides = deriveOverrides(user)
+  assert.ok(overrides.size > 0, 'the user layer owns two fields')
+  // Clean draft: no local edits yet.
+  assert.equal(canStageReset(overrides, new Set()), true, 'stored overrides alone must enable reset')
+  // Draft-edited state (even without overrides) keeps reset meaningful.
+  assert.equal(canStageReset(new Set(), new Set(['maxDepth'])), true)
+  // Nothing to reset and nothing staged: no-op.
+  assert.equal(canStageReset(new Set(), new Set()), false)
 })
 
 test('save state machine: idle -> saving -> saved | failed, and any edit/reset returns to idle', () => {
