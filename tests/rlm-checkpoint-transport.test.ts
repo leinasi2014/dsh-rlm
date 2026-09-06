@@ -117,10 +117,10 @@ test('Issue#82: host-to-kernel chunked restore preserves durable non-ASCII check
 
 for (const [name, fragment] of [
   ['foreign id', '{"type":"checkpoint_chunk","id":999,"seq":0,"count":1,"encoding":"base64","data":"e30="}'],
-  ['negative sequence', '{"type":"checkpoint_chunk","id":1,"seq":-1,"count":1,"encoding":"base64","data":"e30="}'],
-  ['fractional sequence', '{"type":"checkpoint_chunk","id":1,"seq":0.5,"count":1,"encoding":"base64","data":"e30="}'],
-  ['out-of-range sequence', '{"type":"checkpoint_chunk","id":1,"seq":1,"count":1,"encoding":"base64","data":"e30="}'],
-  ['duplicate sequence', '{"type":"checkpoint_chunk","id":1,"seq":0,"count":1,"encoding":"base64","data":"e30="}'],
+  ['negative sequence', '{"type":"checkpoint_chunk","id":2,"seq":-1,"count":1,"encoding":"base64","data":"e30="}'],
+  ['fractional sequence', '{"type":"checkpoint_chunk","id":2,"seq":0.5,"count":1,"encoding":"base64","data":"e30="}'],
+  ['out-of-range sequence', '{"type":"checkpoint_chunk","id":2,"seq":1,"count":1,"encoding":"base64","data":"e30="}'],
+  ['duplicate sequence', '{"type":"checkpoint_chunk","id":2,"seq":0,"count":1,"encoding":"base64","data":"e30="}'],
 ] as const) {
   test(`Issue#81: ${name} checkpoint chunks are fatal and preserve the prior committed snapshot`, async () => {
     const workspace = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-i81-malformed-'))
