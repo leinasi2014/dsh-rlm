@@ -28,6 +28,19 @@ jobs:
         with:
           python-version: '3.11'
       - run: pnpm install --frozen-lockfile
+      - name: Preserve TypeScript newline escapes in the patch generator
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/issue-71-apply-durable-v2.py')
+          text = path.read_text(encoding='utf-8')
+          if text.count('durable_block = """') != 1 or text.count('new_test = """') != 1:
+              raise SystemExit('durable generator markers changed')
+          text = text.replace('durable_block = """', 'durable_block = r"""', 1)
+          text = text.replace('new_test = """', 'new_test = r"""', 1)
+          path.write_text(text, encoding='utf-8')
+          PY
       - name: Apply guarded durable v2 edits
         run: python scripts/issue-71-apply-durable-v2.py
       - run: git diff --check
