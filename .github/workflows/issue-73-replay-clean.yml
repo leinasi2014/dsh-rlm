@@ -1,0 +1,44 @@
+name: issue-73-replay-clean
+
+on:
+  push:
+    branches: [codex/issue-73-settings-manifest-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  replay:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-73-settings-manifest-v2
+          fetch-depth: 0
+      - name: Replay only material Issue 73 files from the superseded branch
+        shell: bash
+        run: |
+          git fetch origin codex/issue-73-settings-manifest
+          git diff origin/main...origin/codex/issue-73-settings-manifest -- \
+            src/settings-manifest.ts \
+            src/runtime.ts \
+            src/client/rlm-settings-model.ts \
+            tests/rlm-settings-manifest.test.ts \
+            package.json > /tmp/issue73.patch
+          test -s /tmp/issue73.patch
+          git apply --check /tmp/issue73.patch
+          git apply /tmp/issue73.patch
+          mkdir -p docs/development-memory/records/2026
+          cat > docs/development-memory/records/2026/issue-73.jsonl <<'EOF'
+          {"schemaVersion":1,"recordId":"mem-20260906-issue73-clean-manifest","recordedAt":"2026-09-06T21:55:00+08:00","agent":{"name":"chatgpt-settings-refactor","id":"chatgpt-settings-refactor","model":"GPT-5.6 Sol","role":"implementer","reasoning":"high"},"issue":73,"workItem":"issue-0073","baseCommit":"5434c517fe278c7941c11f38989f129ccda01826","candidateRef":"same-commit","summary":"Clean replay of the shared Tier-A settings manifest refactor: one browser-safe manifest now owns the 14 user-facing keys/defaults/ranges/options/grouping metadata and drives both Host ConfigSchema and the client settings model.","files":[{"path":"src/settings-manifest.ts","pointers":["RLM_SETTINGS_MANIFEST","RlmTierASettings","RlmRuntimeTierASettings"]},{"path":"src/runtime.ts","pointers":["schemaForSettingsSpec","CONFIG_SCHEMA_FIELDS","ConfigSchema"]},{"path":"src/client/rlm-settings-model.ts","pointers":["RLM_FIELDS","generated RlmDraft","manifest-driven deriveDraft"]},{"path":"tests/rlm-settings-manifest.test.ts","pointers":["Issue#73 Host/GUI drift guards"]},{"path":"package.json","pointers":["scripts.test manifest regression"]}],"steps":["Replayed only the five material files from the superseded candidate onto current main, excluding its invalid development-memory history and all temporary workflows.","Preserved durableRoot semantics: browser fallback remains empty string while Host ConfigSchema still applies no absent-key default.","Kept Tier-B provider/python/path validation in src/settings.ts and kept protocol/runtime-only constants outside the GUI manifest."],"evidence":[{"kind":"test","target":"superseded one-shot rewiring workflow 34037039239","result":"PASS","note":"The guarded source transformation itself matched and committed successfully."},{"kind":"test","target":"clean replay git apply --check","result":"PASS","note":"The material patch applies cleanly to current main."},{"kind":"test","target":"Windows+Ubuntu PR CI","result":"NOT_RUN","note":"Final authoritative gate runs after this clean commit."}],"limitations":["Issue #75 UI layout/copy remains a separate follow-up."]}
+          EOF
+          rm .github/workflows/issue-73-replay-clean.yml
+      - name: Commit clean candidate and remove replay workflow
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/settings-manifest.ts src/runtime.ts src/client/rlm-settings-model.ts tests/rlm-settings-manifest.test.ts package.json docs/development-memory/records/2026/issue-73.jsonl .github/workflows/issue-73-replay-clean.yml
+          git commit -m "refactor(issue-73): share one Host and GUI settings manifest"
+          git push origin HEAD:codex/issue-73-settings-manifest-v2
