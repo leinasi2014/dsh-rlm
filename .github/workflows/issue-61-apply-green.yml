@@ -23,23 +23,8 @@ jobs:
           from pathlib import Path
           p = Path('python-runtime/rlm_kernel.py')
           text = p.read_text(encoding='utf-8')
-          old = '''            if (
-              restored_meta.get("read_bytes") != context_bytes
-              or restored_meta.get("canonical_path") != canonical_context_path
-          ):
-              raise RlmSnapshotError("checkpoint context metadata is invalid")
-          '''
-          new = '''            if (
-              restored_meta.get("kind") != "file"
-              or type(restored_meta.get("path")) is not str
-              or not os.path.isabs(restored_meta["path"])
-              or type(restored_meta.get("bytes")) is not int
-              or restored_meta["bytes"] < 0
-              or restored_meta["bytes"] != context_bytes
-              or canonical_context_path != restored_meta["path"]
-          ):
-              raise RlmSnapshotError("checkpoint context metadata is invalid")
-          '''
+          old = "            if (\n                restored_meta.get(\"read_bytes\") != context_bytes\n                or restored_meta.get(\"canonical_path\") != canonical_context_path\n            ):\n                raise RlmSnapshotError(\"checkpoint context metadata is invalid\")\n"
+          new = "            if (\n                restored_meta.get(\"kind\") != \"file\"\n                or type(restored_meta.get(\"path\")) is not str\n                or not os.path.isabs(restored_meta[\"path\"])\n                or type(restored_meta.get(\"bytes\")) is not int\n                or restored_meta[\"bytes\"] < 0\n                or restored_meta[\"bytes\"] != context_bytes\n                or canonical_context_path != restored_meta[\"path\"]\n            ):\n                raise RlmSnapshotError(\"checkpoint context metadata is invalid\")\n"
           if text.count(old) != 1:
               raise SystemExit('drifted chunked metadata validator not found exactly once')
           p.write_text(text.replace(old, new, 1), encoding='utf-8')
