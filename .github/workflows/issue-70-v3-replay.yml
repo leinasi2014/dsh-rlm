@@ -1,0 +1,43 @@
+name: issue-70-v3-replay
+
+on:
+  push:
+    branches: [codex/issue-70-python-resolution-v3]
+
+permissions:
+  contents: write
+
+jobs:
+  replay:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-70-python-resolution-v3
+          fetch-depth: 0
+      - name: Replay only the verified Issue 70 files and preserve current tests
+        shell: bash
+        run: |
+          git fetch origin codex/issue-70-python-resolution-v2
+          git show origin/codex/issue-70-python-resolution-v2:src/settings.ts > src/settings.ts
+          git show origin/codex/issue-70-python-resolution-v2:tests/rlm-python-resolution.test.ts > tests/rlm-python-resolution.test.ts
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('package.json')
+          text = p.read_text(encoding='utf-8')
+          needle = 'tests/rlm-settings.test.ts tests/rlm-client-settings.test.ts'
+          replacement = 'tests/rlm-settings.test.ts tests/rlm-python-resolution.test.ts tests/rlm-client-settings.test.ts'
+          if text.count(needle) != 1:
+              raise SystemExit('current test command anchor changed; refusing replay')
+          p.write_text(text.replace(needle, replacement, 1), encoding='utf-8')
+          Path('.github/workflows/issue-70-v3-replay.yml').unlink()
+          PY
+      - name: Commit replay and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/settings.ts tests/rlm-python-resolution.test.ts package.json .github/workflows/issue-70-v3-replay.yml
+          git commit -m "fix(issue-70): align Python interpreter resolution with spawn"
+          git push origin HEAD:codex/issue-70-python-resolution-v3
