@@ -1381,15 +1381,22 @@ test('M10 Issue#44: a durable version mismatch fails closed without restoring st
   } finally {
     await runtime.dispose()
   }
-  const metaFile = path.join(durable, readdirSync(durable).find((f) => f.endsWith('.meta.json'))!)
-  const meta = JSON.parse(readFileSync(metaFile, 'utf8'))
-  meta.schemaVersion = 999
-  writeFileSync(metaFile, JSON.stringify(meta))
+  const durableFile = path.join(durable, readdirSync(durable).find((f) => f.endsWith('.checkpoint.json'))!)
+  const envelope = readFileSync(durableFile)
+  const newline = envelope.indexOf(0x0a)
+  assert.ok(newline > 0, 'v2 durable envelope must contain one bounded header line')
+  const header = JSON.parse(envelope.subarray(0, newline).toString('utf8'))
+  header.schemaVersion = 999
+  writeFileSync(durableFile, Buffer.concat([
+    Buffer.from(JSON.stringify(header) + '\n', 'utf8'),
+    envelope.subarray(newline + 1),
+  ]))
   const runtimeB = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true })
   try {
-    const out = await runtimeB.eval('m10-ver', { code: 'y = 2' })
-    // Mismatch must not restore; a fresh kernel namespaces x as absent.
-    assert.equal(out.recovery?.restored, false)
+    await assert.rejects(
+      runtimeB.eval('m10-ver', { code: 'y = 2' }),
+      (err: unknown) => err instanceof RlmError && err.kind === 'snapshot',
+    )
   } finally {
     await runtimeB.dispose()
   }
