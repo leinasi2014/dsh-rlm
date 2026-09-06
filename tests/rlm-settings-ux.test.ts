@@ -24,11 +24,12 @@ test('M13 UX #75: every user-facing field has detailed bilingual help', () => {
   }
 })
 
-test('M13 UX #75/#69: Save is one revision-fenced atomic mutate with read-back verification', () => {
-  assert.match(cardSource, /props\.scope\.mutate\(ops, expectedRevision\)/)
+test('M13 UX #75/#69: Save prefers atomic mutate when available and always verifies Host read-back', () => {
+  assert.match(cardSource, /typeof compatible\.mutate === 'function'/)
+  assert.match(cardSource, /compatible\.mutate\(ops, expectedRevision\)/)
   assert.match(cardSource, /props\.scope\.getSnapshot\(\)/)
   assert.match(cardSource, /writesLanded\(accepted\.user, planned\)/)
-  assert.doesNotMatch(cardSource, /await props\.scope\.(?:set|unset)\(/)
+  assert.match(cardSource, /dsh-client-runtime 0\.1\.1-rc\.2 has only field writes/)
 })
 
 test('M13 UX #75/#80: existing overrides can be reset before the user makes another edit', () => {
