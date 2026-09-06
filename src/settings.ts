@@ -1,5 +1,5 @@
 import type { Context } from '@deepseek-ai/cordis'
-import { settingsNamespace, type SettingsScope } from '@deepseek-ai/dsh-settings'
+import type { SettingsScope } from '@deepseek-ai/dsh-settings'
 import type z from '@deepseek-ai/schemastery'
 import { accessSync, constants as fsConstants, statSync } from 'node:fs'
 import path from 'node:path'
@@ -9,7 +9,7 @@ import type { RlmPluginConfig } from './runtime.js'
  * The official DSH settings namespace for the dsh-rlm host plugin. Disjoint
  * from `agent-swarm`; `settings.plugin.item` is keyed by this namespace.
  */
-export const RLM_SETTINGS_NAMESPACE = settingsNamespace('rlm')
+export const RLM_SETTINGS_NAMESPACE = 'rlm' as const
 
 /** Minimal live Subagent provider handle used by the Tier B validation. */
 interface SubagentCapabilities {
