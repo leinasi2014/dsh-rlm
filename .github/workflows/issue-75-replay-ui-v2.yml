@@ -1,0 +1,24 @@
+name: issue-75-replay-ui-v2
+on:
+  push:
+    branches: [codex/issue-75-settings-ux-v2]
+permissions:
+  contents: write
+jobs:
+  replay:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-75-settings-ux-v2
+          fetch-depth: 0
+      - run: git fetch origin codex/issue-75-settings-ux
+      - run: python scripts/issue75-replay.py
+      - name: Commit UI candidate and remove temporary helper
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git commit -m "feat(issue-75): simplify and unify RLM settings UI"
+          git push origin HEAD:codex/issue-75-settings-ux-v2
