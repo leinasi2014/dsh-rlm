@@ -1060,17 +1060,24 @@ class Kernel {
     })
   }
 
-  private sendRestoreChunks(): void {
+  private buildRestoreFrames(): Frame[] {
     if (!this.snapshotPath || !existsSync(this.snapshotPath)) {
       throw new RlmError('snapshot', 'checkpoint file is missing before restore')
     }
     const payload = readFileSync(this.snapshotPath)
     const total = Math.max(1, Math.ceil(payload.length / CHECKPOINT_CHUNK_BYTES))
+    const frames: Frame[] = []
     for (let seq = 0; seq < total; seq++) {
       const chunk = payload.subarray(seq * CHECKPOINT_CHUNK_BYTES, Math.min(payload.length, (seq + 1) * CHECKPOINT_CHUNK_BYTES))
-      this.write({ type: 'restore_chunk', seq, total, id: 0, data: chunk.toString('utf8') })
+      frames.push({ type: 'restore_chunk', seq, total, id: 0, data: chunk.toString('utf8') })
     }
-    this.write({ type: 'restore_end', total })
+    frames.push({ type: 'restore_end', total })
+    for (const frame of frames) {
+      if (this.outboundFrameBytes(frame) > MAX_FRAME_BYTES) {
+        throw new RlmError('protocol', 'host restore frame exceeds 256 KiB')
+      }
+    }
+    return frames
   }
 
   async evalCell(input: RlmCodeEvalInput, deadline?: number): Promise<RlmEvalOutput> {
@@ -1104,18 +1111,16 @@ class Kernel {
     }
     if (this.launch) evalFrame.cwd = this.launch.cwd
     const chunked = this.config.snapshotRecovery && this.snapshotPath !== undefined && this.launch !== undefined
+    const restorePending = this.restoreSnapshot
+    let restoreFrames: Frame[] = []
     if (this.config.snapshotRecovery && this.snapshotPath) {
       evalFrame.snapshot_recovery = true
       evalFrame.max_snapshot_bytes = this.maxSnapshotBytes
       if (chunked) evalFrame.snapshot_chunked = true
       else evalFrame.snapshot_path = this.snapshotPath
-      if (this.restoreSnapshot) {
-        // Recovery is a one-shot bootstrap action. Consume before writing so a
-        // typed restore failure leaves this fresh kernel clean on its next
-        // eval instead of replaying a stale/malformed checkpoint forever.
-        this.restoreSnapshot = false
+      if (restorePending) {
         evalFrame.restore_snapshot = true
-        if (chunked) this.sendRestoreChunks()
+        if (chunked) restoreFrames = this.buildRestoreFrames()
       }
     }
     if (input.contextPath !== undefined) evalFrame.context_path = input.contextPath
@@ -1159,8 +1164,13 @@ class Kernel {
     }, timeout)
     this.attachAbort(p)
     // A signal that was already aborted cancels the cell synchronously above;
-    // only send the eval frame if this cell is still pending.
+    // only commit the one-shot restore after every host preflight passed
+    // and this cell is still the admitted pending cell.
     if (this.pending !== p) return promise
+    if (restorePending) {
+      this.restoreSnapshot = false
+      for (const frame of restoreFrames) this.write(frame)
+    }
     this.write(evalFrame)
     return promise
   }
