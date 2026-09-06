@@ -1,0 +1,35 @@
+name: issue-73-fix-source-imports
+on:
+  push:
+    branches: [codex/issue-73-settings-manifest-v2]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-73-settings-manifest-v2
+      - name: Patch only new manifest import specifiers
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          targets = [Path('src/runtime.ts'), Path('src/client/rlm-settings-model.ts')]
+          for p in targets:
+              text = p.read_text(encoding='utf-8')
+              old = "settings-manifest.js'"
+              new = "settings-manifest.ts'"
+              if text.count(old) != 1:
+                  raise SystemExit(f'{p}: manifest import anchor changed')
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+          Path('.github/workflows/issue-73-fix-source-imports.yml').unlink()
+          PY
+      - name: Commit correction and remove workflow
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add src/runtime.ts src/client/rlm-settings-model.ts .github/workflows/issue-73-fix-source-imports.yml
+          git commit -m "fix(issue-73): resolve shared manifest in source tests"
+          git push origin HEAD:codex/issue-73-settings-manifest-v2
