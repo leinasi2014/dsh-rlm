@@ -1,7 +1,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { settingsNamespace, type SettingsScope } from '@deepseek-ai/dsh-settings'
 import type z from '@deepseek-ai/schemastery'
-import { existsSync } from 'node:fs'
+import { accessSync, constants as fsConstants, statSync } from 'node:fs'
 import path from 'node:path'
 import type { RlmPluginConfig } from './runtime.js'
 
@@ -44,12 +44,23 @@ function subagentsOf(ctx: Context): SubagentsLike | undefined {
   return undefined
 }
 
+/** True only when `candidate` is a spawnable ordinary file on this host. */
+function isSpawnableFile(candidate: string): boolean {
+  try {
+    if (!statSync(candidate).isFile()) return false
+    if (process.platform !== 'win32') accessSync(candidate, fsConstants.X_OK)
+    return true
+  } catch {
+    return false
+  }
+}
+
 /** Resolve a bare or path-prefixed interpreter exactly like the runtime spawns it. */
-function pythonResolves(python: string): boolean {
+export function pythonResolves(python: string): boolean {
   const cmd = python.trim()
   if (cmd === '') return false
   if (path.isAbsolute(cmd) || cmd.includes('/') || cmd.includes('\\')) {
-    return existsSync(cmd)
+    return isSpawnableFile(cmd)
   }
   return onPath(cmd)
 }
@@ -58,17 +69,20 @@ function onPath(cmd: string): boolean {
   const separator = path.delimiter
   const pathVar = process.env.PATH ?? process.env.Path ?? ''
   const extensions = process.platform === 'win32'
-    ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';').map(e => e.trim().toLowerCase()).filter(Boolean)
+    ? (process.env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';').map(e => e.trim()).filter(Boolean)
     : ['']
+  const lower = cmd.toLowerCase()
+  const alreadyExtended = process.platform === 'win32'
+    && extensions.some(ext => lower.endsWith(ext.toLowerCase()))
+  const names = process.platform === 'win32'
+    ? alreadyExtended ? [cmd] : [cmd, ...extensions.map(ext => cmd + ext)]
+    : [cmd]
+
   for (const dir of pathVar.split(separator)) {
     if (dir === '') continue
-    for (const ext of extensions) {
-      const candidate = path.join(dir, cmd + (ext === '' ? '' : ext))
-      try {
-        if (existsSync(candidate)) return true
-      } catch {
-        // ignore a single unreadable entry
-      }
+    for (const name of names) {
+      const candidate = path.join(dir, name)
+      if (isSpawnableFile(candidate)) return true
     }
   }
   return false
