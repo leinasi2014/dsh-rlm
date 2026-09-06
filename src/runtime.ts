@@ -2,7 +2,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -368,7 +368,15 @@ export interface RlmEvalOutput {
   stdout: string
   result?: string
   truncated: boolean
-  recovery?: { restored: boolean; checkpointCommitted: boolean; checkpointBytes?: number; skipped?: string[]; reason?: string }
+  recovery?: {
+    restored: boolean
+    checkpointCommitted: boolean
+    checkpointBytes?: number
+    skipped?: string[]
+    reason?: string
+    /** M10 durable publication outcome (Issue #89): absent when published. */
+    durable?: { published: boolean; reason?: string }
+  }
 }
 
 export type RlmErrorKind =
@@ -1490,13 +1498,20 @@ class RlmRuntimeImpl implements RlmRuntime {
   private readonly ctx: Context | undefined
   private readonly durableRoot: string | undefined
   private readonly durableVersion = 2
+  private readonly durableAccounting = new Map<string, number>()
   private disposed = false
   private disposePromise: Promise<void> | undefined
   constructor(config: RlmRuntimeConfig, ctx?: Context) {
     this.config = config
     this.ctx = ctx
     this.durableRoot = typeof config.durableRoot === 'string' && config.durableRoot.trim() !== '' ? path.resolve(config.durableRoot) : undefined
-    if (this.durableRoot) mkdirSync(this.durableRoot, { recursive: true })
+    if (this.durableRoot) {
+      mkdirSync(this.durableRoot, { recursive: true })
+      // Issue #89: account the bytes already persisted in the durable root so
+      // the 64 MiB bound survives plugin/host restarts (in-memory reservation
+      // maps reset while durable files remain).
+      this.rescanDurableRoot()
+    }
     if (config.snapshotRecovery === true) {
       this.checkpointRoot = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m5-'))
     }
@@ -1507,7 +1522,11 @@ class RlmRuntimeImpl implements RlmRuntime {
   }
 
   private durablePath(sessionKey: string, suffix: string): string {
-    return path.join(this.durableRoot!, createHash('sha256').update(sessionKey).digest('hex') + suffix)
+    return path.join(this.durableRoot!, this.durableFileKey(sessionKey) + suffix)
+  }
+
+  private durableFileKey(sessionKey: string): string {
+    return createHash('sha256').update(sessionKey).digest('hex')
   }
 
   private durableError(message: string): RlmError {
@@ -1600,13 +1619,61 @@ class RlmRuntimeImpl implements RlmRuntime {
     return Buffer.from(payload)
   }
 
-  /** Publish one crash-consistent, host-private durable generation. */
-  private publishDurable(sessionKey: string, bytes: Buffer): void {
+  /**
+   * Scan the durable root for persisted generations (v2 envelopes, legacy v1
+   * pairs, and stale temp files) and rebuild the byte accounting (Issue #89).
+   * Accounting is size-based: validity is enforced at read time.
+   */
+  private rescanDurableRoot(): void {
+    this.durableAccounting.clear()
     if (!this.durableRoot) return
+    let entries: string[]
+    try {
+      entries = readdirSync(this.durableRoot)
+    } catch {
+      return
+    }
+    for (const name of entries) {
+      const full = path.join(this.durableRoot, name)
+      let info
+      try {
+        info = lstatSync(full)
+      } catch {
+        continue
+      }
+      if (!info.isFile()) continue
+      if (name.endsWith('.checkpoint.json.tmp-') || name.includes('.checkpoint.json.tmp-')) {
+        // Interrupted publication leftovers are ours (exclusive temp naming).
+        try { rmSync(full, { force: true }) } catch { /* best-effort */ }
+        continue
+      }
+      if (name.endsWith('.checkpoint.json') || name.endsWith('.meta.json')) {
+        const key = name.replace(/\.(checkpoint\.json|meta\.json)$/u, '')
+        this.durableAccounting.set(key, (this.durableAccounting.get(key) ?? 0) + info.size)
+      }
+    }
+  }
+
+  private durableTotalBytes(): number {
+    let total = 0
+    for (const bytes of this.durableAccounting.values()) total += bytes
+    return total
+  }
+
+  /** Publish one crash-consistent, host-private durable generation. */
+  private publishDurable(sessionKey: string, bytes: Buffer): { published: boolean; reason?: string } {
+    if (!this.durableRoot) return { published: false }
     const target = this.durablePath(sessionKey, '.checkpoint.json')
     const legacyMeta = this.durablePath(sessionKey, '.meta.json')
     const temp = target + '.tmp-' + randomBytes(16).toString('hex')
     const envelope = this.encodeDurableEnvelope(bytes)
+    // Issue #89: charge only the delta against the persisted aggregate. An
+    // over-quota candidate keeps the previous valid generation and never
+    // fails the already-successful user cell.
+    const oldTotal = this.durableAccounting.get(this.durableFileKey(sessionKey)) ?? 0
+    if (this.durableTotalBytes() + (envelope.length - oldTotal) > MAX_SNAPSHOT_ROOT_BYTES) {
+      return { published: false, reason: 'durable-root quota exceeded' }
+    }
     let fd: number | undefined
     try {
       fd = openSync(temp, 'wx', 0o600)
@@ -1619,6 +1686,8 @@ class RlmRuntimeImpl implements RlmRuntime {
       // A stale legacy sidecar is irrelevant once target is a v2 envelope.
       try { rmSync(legacyMeta, { force: true }) } catch { /* best-effort migration cleanup */ }
       this.syncDurableDirectory()
+      this.durableAccounting.set(this.durableFileKey(sessionKey), envelope.length)
+      return { published: true }
     } catch (error) {
       if (fd !== undefined) {
         try { closeSync(fd) } catch { /* best-effort close */ }
@@ -1698,6 +1767,8 @@ class RlmRuntimeImpl implements RlmRuntime {
     if (!this.durableRoot) return
     rmSync(this.durablePath(sessionKey, '.checkpoint.json'), { force: true })
     rmSync(this.durablePath(sessionKey, '.meta.json'), { force: true })
+    // Issue #89: reset releases the Session's persistent quota share.
+    this.durableAccounting.delete(this.durableFileKey(sessionKey))
   }
 
   private snapshotFor(sessionKey: string): { path: string; restore: boolean; maxBytes: number } | undefined {
@@ -1711,7 +1782,11 @@ class RlmRuntimeImpl implements RlmRuntime {
     }
     let reservation = this.checkpointReservations.get(sessionKey)
     if (reservation === undefined) {
-      const used = [...this.checkpointReservations.values()].reduce((total, bytes) => total + bytes, 0)
+      // A Session already persisted durably is counted by its actual file bytes;
+      // only sessions without a durable generation charge their reservation cap.
+      const liveUsed = [...this.checkpointReservations.entries()]
+        .reduce((total, [key, bytes]) => this.durableAccounting.has(this.durableFileKey(key)) ? total : total + bytes, 0)
+      const used = this.durableTotalBytes() + liveUsed
       reservation = Math.min(MAX_SNAPSHOT_BYTES, Math.max(0, MAX_SNAPSHOT_ROOT_BYTES - used))
       this.checkpointReservations.set(sessionKey, reservation)
     }
@@ -2003,7 +2078,12 @@ class RlmRuntimeImpl implements RlmRuntime {
         this.checkpoints.add(sessionKey)
         if (this.durableRoot && this.checkpointRoot) {
           const p = this.checkpointPath(sessionKey)
-          if (existsSync(p)) this.publishDurable(sessionKey, readFileSync(p))
+          if (existsSync(p)) {
+            const durable = this.publishDurable(sessionKey, readFileSync(p))
+            if (!durable.published && out.recovery) {
+              out.recovery.durable = durable
+            }
+          }
         }
       }
       this.settleEntry(entry, out)

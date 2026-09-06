@@ -1,5 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import os from 'node:os'
@@ -1495,6 +1496,81 @@ test('Issue#87: workspace identity stays stable when enforcement mode changes ac
   }
 })
 
+
+test('Issue#89: the durable-root quota is enforced across sessions and survives a new runtime', async () => {
+  const durable = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m89-'))
+  const sha = (key: string) => createHash('sha256').update(key).digest('hex')
+  const miB = String(7_864_320) // 7.5 MiB: 8 MiB is the whole-payload cap, so a filename-sized variable never fits
+  const miBResult = String(7_864_320)
+  const fill = (name: string) => "v = 'x' * " + miB + "\nlen(v)"
+  try {
+    const runtime = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 120_000 })
+    try {
+      // Eight 8 MiB session checkpoints fill the 64 MiB root exactly.
+      for (let i = 1; i <= 8; i++) {
+        const out = await runtime.eval('m89-s' + String(i), { code: fill('m89-s' + String(i)) })
+        assert.equal(out.recovery?.checkpointCommitted, true, 'session ' + i + ' must commit within the root')
+        assert.ok(!out.recovery?.durable, 'session ' + i + ' must publish')
+      }
+      // A further Session has no reservation left: bounded, non-fatal skip.
+      const ninth = await runtime.eval('m89-s9', { code: fill('m89-s9') })
+      assert.equal(ninth.result, miBResult, 'the user cell still succeeds')
+      assert.match(ninth.recovery?.reason ?? '', /maxSnapshotBytes|budget/, 'no reservation remains for the ninth session')
+      assert.ok(!existsSync(path.join(durable, sha('m89-s9') + '.checkpoint.json')), 'no over-quota durable file may appear')
+      // Same-Session replacement charges only the delta (0) so no quota blocks it.
+      const replace = await runtime.eval('m89-s1', { code: fill('m89-s1') })
+      assert.equal(replace.recovery?.checkpointCommitted, true)
+      assert.ok(!replace.recovery?.durable, 'a zero-delta replacement must still publish')
+    } finally {
+      await runtime.dispose()
+    }
+
+    // A NEW runtime must account the persisted bytes again: still no room.
+    const runtimeB = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 120_000 })
+    try {
+      const fresh = await runtimeB.eval('m89-fresh', { code: fill('m89-fresh') })
+      assert.equal(fresh.result, miBResult)
+      assert.match(fresh.recovery?.reason ?? '', /maxSnapshotBytes|budget/, 'restart must not reset the quota')
+    } finally {
+      await runtimeB.dispose()
+    }
+
+    // Releasing a Session via reset frees its share and admits a new one.
+    const runtimeC = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 120_000 })
+    try {
+      await runtimeC.eval('m89-s1', { reset: true })
+      assert.ok(!existsSync(path.join(durable, sha('m89-s1') + '.checkpoint.json')), 'reset removes the durable generation')
+      const after = await runtimeC.eval('m89-after', { code: fill('m89-after') })
+      assert.equal(after.recovery?.checkpointCommitted, true, 'released quota admits new publication: ' + JSON.stringify(after.recovery))
+    } finally {
+      await runtimeC.dispose()
+    }
+  } finally {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try { rmSync(durable, { recursive: true, force: true }); break } catch { await new Promise((res) => setTimeout(res, 100)) }
+    }
+  }
+})
+
+test('Issue#89: reset releases the Session durable quota share', async () => {
+  const durable = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m89r-'))
+  const sha = (key: string) => createHash('sha256').update(key).digest('hex')
+  try {
+    const runtime = createRlmRuntime(undefined, { durableRoot: durable, snapshotRecovery: true, timeout: 120_000 })
+    try {
+      await runtime.eval('m89-reset', { code: "v = 'y' * (1024 * 1024)\nlen(v)" })
+      assert.ok(existsSync(path.join(durable, sha('m89-reset') + '.checkpoint.json')))
+      await runtime.eval('m89-reset', { reset: true })
+      assert.ok(!existsSync(path.join(durable, sha('m89-reset') + '.checkpoint.json')), 'reset must remove the durable generation')
+    } finally {
+      await runtime.dispose()
+    }
+  } finally {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      try { rmSync(durable, { recursive: true, force: true }); break } catch { await new Promise((res) => setTimeout(res, 100)) }
+    }
+  }
+})
 
 test('M10 Issue#44 RED: a durableRoot is not consulted on the accepted M9 base', async () => {
   const durable = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m10-red-'))
