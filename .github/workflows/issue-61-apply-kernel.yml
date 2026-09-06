@@ -1,0 +1,51 @@
+name: issue-61-apply-kernel
+
+on:
+  push:
+    branches: [codex/issue-61-context-metadata-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-61-context-metadata-v2
+          fetch-depth: 0
+      - name: Apply exact kernel patch
+        shell: bash
+        run: |
+          cat > /tmp/issue61.patch <<'PATCH'
+          diff --git a/python-runtime/rlm_kernel.py b/python-runtime/rlm_kernel.py
+          --- a/python-runtime/rlm_kernel.py
+          +++ b/python-runtime/rlm_kernel.py
+          @@ -1005,11 +1005,17 @@ class RlmKernel:
+                       canonical_context_path = os.path.realpath(restored_meta["path"])
+                   except (UnicodeError, OSError, TypeError) as exc:
+                       raise RlmSnapshotError("checkpoint context metadata is invalid") from exc
+                   if (
+          -            restored_meta.get("read_bytes") != context_bytes
+          -            or restored_meta.get("canonical_path") != canonical_context_path
+          +            restored_meta.get("kind") != "file"
+          +            or type(restored_meta.get("path")) is not str
+          +            or not os.path.isabs(restored_meta["path"])
+          +            or type(restored_meta.get("bytes")) is not int
+          +            or restored_meta["bytes"] < 0
+          +            or restored_meta["bytes"] != context_bytes
+          +            or canonical_context_path != restored_meta["path"]
+                   ):
+                       raise RlmSnapshotError("checkpoint context metadata is invalid")
+               self.namespace.update(restored)
+          PATCH
+          git apply --check /tmp/issue61.patch
+          git apply /tmp/issue61.patch
+          rm .github/workflows/issue-61-apply-kernel.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add python-runtime/rlm_kernel.py .github/workflows/issue-61-apply-kernel.yml
+          git commit -m 'fix(issue-61): restore writer-owned context metadata schema'
+          git push origin HEAD:codex/issue-61-context-metadata-v2
