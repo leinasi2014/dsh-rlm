@@ -1471,6 +1471,12 @@ export interface RlmRuntime {
    * a plugin unload can await full quiescence.
    */
   dispose(): Promise<void>
+  /**
+   * The config the runtime was created with, when available. Used by the M12
+   * job producer to build the same query/spawn/followup bridge as foreground
+   * `rlm_eval` (Issue #78).
+   */
+  runtimeConfig?(): RlmRuntimeConfig | undefined
 }
 
 class RlmRuntimeImpl implements RlmRuntime {
@@ -1494,6 +1500,10 @@ class RlmRuntimeImpl implements RlmRuntime {
     if (config.snapshotRecovery === true) {
       this.checkpointRoot = mkdtempSync(path.join(os.tmpdir(), 'dsh-rlm-m5-'))
     }
+  }
+
+  runtimeConfig(): RlmRuntimeConfig | undefined {
+    return this.config
   }
 
   private durablePath(sessionKey: string, suffix: string): string {
@@ -2007,6 +2017,9 @@ class RlmRuntimeImpl implements RlmRuntime {
 
   dispose(): Promise<void> {
     if (this.disposePromise) return this.disposePromise
+    // Issue #86: disposal releases every per-Session job slot; later starts on
+    // a disposed runtime still fail closed through eval.
+    activeJobLocks.delete(this)
     // Terminal state synchronously: new evals reject immediately and drain
     // workers stop starting new work.
     this.disposed = true
@@ -2183,6 +2196,59 @@ function renderValue(value: RlmEvalValue): string {
 }
 
 /**
+ * Shared cell-input builder for foreground `rlm_eval` and M12 RLM jobs
+ * (Issue #78): query/spawn/followup bridges, the per-cell token guard, the
+ * Session identity for sandbox policy resolution, and M8 continuable tracking
+ * all come from one place so the two paths cannot drift.
+ */
+function buildRlmCodeEvalInput(
+  ctx: Context,
+  config: RlmPluginConfig,
+  parent: Agent,
+  signal: AbortSignal,
+  continuableParents: Set<Agent>,
+  code: string,
+  contextPath?: string,
+): RlmCodeEvalInput {
+  const provider = config.provider ?? 'spawn'
+  const maxDepth = config.maxDepth ?? DEFAULT_MAX_DEPTH
+  const tokenGuard = createCellTokenGuard(ctx, parent.session, config)
+  const input: RlmCodeEvalInput = {
+    code,
+    signal,
+    session: parent.session,
+    onQuery: async (prompt: string, cellSignal: AbortSignal) => {
+      tokenGuard?.admit()
+      return runQuery(ctx, provider, parent, prompt, cellSignal, maxDepth)
+    },
+    onSpawn: async (prompt: string, cellSignal: AbortSignal) => {
+      tokenGuard?.admit()
+      const childId = await runSpawn(ctx, provider, parent, prompt, cellSignal, maxDepth)
+      continuableParents.add(parent)
+      return childId
+    },
+    onFollowup: async (childId: string, prompt: string, cellSignal: AbortSignal) => {
+      tokenGuard?.admit()
+      return runFollowup(ctx, parent, childId, prompt, cellSignal)
+    },
+  }
+  if (contextPath !== undefined) input.contextPath = contextPath
+  return input
+}
+
+/** Shared per-context M8 continuable tracking (tool + M12 job paths). */
+const continuableParentsByContext = new WeakMap<Context, Set<Agent>>()
+
+function continuableParentsFor(ctx: Context): Set<Agent> {
+  let set = continuableParentsByContext.get(ctx)
+  if (set === undefined) {
+    set = new Set()
+    continuableParentsByContext.set(ctx, set)
+  }
+  return set
+}
+
+/**
  * Register the single `rlm_eval` tool and bridge `rlm_query` to a one-shot
  * DSH Subagent. The runtime is created here and torn down with the calling
  * Cordis fiber, so no plugin-owned Python process survives plugin unload.
@@ -2194,22 +2260,53 @@ interface TokenMeterLike {
   }
 }
 
-/** Read-only M11 guard: consult official tokenMeter; never invent unobserved tokens. */
-function enforceQueryTokenGuard(ctx: Context, parent: Agent, config: RlmPluginConfig): void {
-  if (!config.guardQueryTokens || config.maxQueryTokensPerCell === undefined || config.maxQueryTokensPerCell <= 0) return
+/**
+ * M11 cell-scoped admission guard over official observed token-meter data
+ * (Issue #66/#68). One instance lives for one `rlm_eval` cell: the baseline is
+ * captured at the first admission and only positive observed growth during the
+ * cell counts against the ceiling. A Session that is already above the ceiling
+ * before the cell starts can still admit that cell's first query, and the
+ * accounting resets at every new cell. Unobserved provider spend (e.g. child
+ * subagent sessions the parent meter does not aggregate) is never invented.
+ */
+class CellQueryTokenGuard {
+  private baseline: number | undefined
+  private peak = 0
+  private readonly meter: TokenMeterLike
+  private readonly session: unknown
+  private readonly ceiling: number
+
+  constructor(meter: TokenMeterLike, session: unknown, ceiling: number) {
+    this.meter = meter
+    this.session = session
+    this.ceiling = ceiling
+  }
+
+  /** Record one admission; throws a typed query error before any dispatch when the cell's observed growth exceeded the ceiling. */
+  admit(): void {
+    const observed = this.meter.measure(this.session)
+    const usage = observed?.baseline?.kind === 'usage' ? observed.baseline.usage : undefined
+    if (!usage || typeof usage.inputTokens !== 'number' || typeof usage.outputTokens !== 'number') return
+    const total = usage.inputTokens
+      + (usage.cacheReadTokens ?? 0)
+      + (usage.cacheWriteTokens ?? 0)
+      + usage.outputTokens
+    if (this.baseline === undefined) this.baseline = total
+    if (total > this.peak) this.peak = total
+    const cellUsage = this.peak - this.baseline
+    if (cellUsage > this.ceiling) {
+      throw new RlmError('query', 'per-cell observed token budget exceeded: cell consumed ' + cellUsage + ' > ' + this.ceiling, { phase: 'query' })
+    }
+  }
+}
+
+/** Build a cell-scoped guard, or undefined when the guard is off or no official meter is mounted. */
+function createCellTokenGuard(ctx: Context, session: unknown, config: RlmPluginConfig): CellQueryTokenGuard | undefined {
+  if (!config.guardQueryTokens || config.maxQueryTokensPerCell === undefined || config.maxQueryTokensPerCell <= 0) return undefined
   const accessor = ctx as unknown as { tokenMeter?: TokenMeterLike; get?: (key: string) => unknown }
   const meter = accessor.tokenMeter ?? accessor.get?.('tokenMeter') as TokenMeterLike | undefined
-  if (!meter || typeof meter.measure !== 'function') return
-  const observed = meter.measure(parent.session)
-  const usage = observed?.baseline?.kind === 'usage' ? observed.baseline.usage : undefined
-  if (!usage || typeof usage.inputTokens !== 'number' || typeof usage.outputTokens !== 'number') return
-  const total = usage.inputTokens
-    + (usage.cacheReadTokens ?? 0)
-    + (usage.cacheWriteTokens ?? 0)
-    + usage.outputTokens
-  if (total > config.maxQueryTokensPerCell) {
-    throw new RlmError('query', 'per-cell observed token budget exceeded: ' + total + ' > ' + config.maxQueryTokensPerCell, { phase: 'query' })
-  }
+  if (!meter || typeof meter.measure !== 'function') return undefined
+  return new CellQueryTokenGuard(meter, session, config.maxQueryTokensPerCell)
 }
 
 type RlmJobsLike = {
@@ -2229,11 +2326,44 @@ type RlmJobStartInput = {
   run(): RlmJobHooks
 }
 
+/** Issue #86: at most one active RLM job per Session on one runtime. */
+const activeJobLocks = new WeakMap<RlmRuntime, Map<string, number>>()
+
+function acquireJobSlot(runtime: RlmRuntime, sessionKey: string): void {
+  let locks = activeJobLocks.get(runtime)
+  if (locks === undefined) {
+    locks = new Map()
+    activeJobLocks.set(runtime, locks)
+  }
+  const active = locks.get(sessionKey) ?? 0
+  if (active > 0) {
+    throw new RlmError('busy', 'one RLM job is already active for this Session: ' + sessionKey)
+  }
+  locks.set(sessionKey, active + 1)
+}
+
+function releaseJobSlot(runtime: RlmRuntime, sessionKey: string): void {
+  const locks = activeJobLocks.get(runtime)
+  const active = locks?.get(sessionKey)
+  if (locks === undefined || active === undefined) return
+  if (active <= 1) locks.delete(sessionKey)
+  else locks.set(sessionKey, active - 1)
+}
+
+
 /** One official DSH background job running one RLM cell through the same runtime. */
+export interface RlmJobSpecOptions {
+  /** True when the caller already reserved this Session's job slot. */
+  preReserved?: boolean
+  /** Builds the full cell input sharing the foreground query/spawn bridge (Issue #78). */
+  buildInput?: (signal: AbortSignal) => RlmCodeEvalInput
+}
+
 export function createRlmJobSpec(
   parent: Agent,
   code: string,
   runtime: RlmRuntime,
+  options: RlmJobSpecOptions = {},
 ): RlmJobStartInput {
   const key = String(parent.id)
   let hooks: RlmJobHooks | undefined
@@ -2246,8 +2376,16 @@ export function createRlmJobSpec(
       if (hooks !== undefined) return hooks
       const controller = new AbortController()
       let captured = ''
+      let slotAcquired = options.preReserved === true
       const done: RlmJobHooks['done'] = Promise.resolve()
-        .then(() => runtime.eval(key, { code, signal: controller.signal }))
+        .then(() => {
+          if (!slotAcquired) {
+            acquireJobSlot(runtime, key)
+            slotAcquired = true
+          }
+          return runtime.eval(key,
+            options.buildInput ? options.buildInput(controller.signal) : { code, signal: controller.signal })
+        })
         .then(
           (out) => {
             captured = (out.stdout ?? '') + (out.result === undefined ? '' : '\n' + out.result)
@@ -2258,6 +2396,9 @@ export function createRlmJobSpec(
             detail: err instanceof Error ? err.message : String(err),
           }),
         )
+        .finally(() => {
+          if (slotAcquired) releaseJobSlot(runtime, key)
+        })
       hooks = {
         cancel(reason?: string) {
           if (!controller.signal.aborted) controller.abort(reason ?? 'job cancelled')
@@ -2285,7 +2426,32 @@ export function startRlmJob(
   if (!jobs || typeof jobs.start !== 'function') {
     throw new RlmError('eval', 'background jobs unavailable: no ctx.jobs service is mounted')
   }
-  return jobs.start(createRlmJobSpec(parent, code, runtime))
+  // Issue #86: reserve the per-Session slot before the official registry admits
+  // the job, so a second same-Session start is rejected before any misleading
+  // running record can persist. The slot is released when the job settles.
+  const sessionKey = String(parent.id)
+  acquireJobSlot(runtime, sessionKey)
+  try {
+    const config = (runtime.runtimeConfig?.() ?? {}) as RlmPluginConfig
+    const spec = createRlmJobSpec(parent, code, runtime, {
+      preReserved: true,
+      // Issue #78: a background RLM job gets the same query/spawn/followup
+      // bridge, per-cell token guard, and Session identity as foreground
+      // rlm_eval instead of a bare Python cell.
+      buildInput: (signal) => buildRlmCodeEvalInput(ctx, config, parent, signal, continuableParentsFor(ctx), code),
+    })
+    const wrapped: RlmJobStartInput = {
+      ...spec,
+      run() {
+        const hooks = spec.run()
+        return { ...hooks, done: hooks.done.finally(() => releaseJobSlot(runtime, sessionKey)) }
+      },
+    }
+    return jobs.start(wrapped)
+  } catch (err) {
+    releaseJobSlot(runtime, sessionKey)
+    throw err
+  }
 }
 
 /** Register the 'rlm' job controller when the DSH jobs surface is mounted (M12). */
@@ -2314,10 +2480,8 @@ export function registerRlmPlugin(
   config: RlmPluginConfig,
 ): void {
   if (config.enabled !== true) return
-  const provider = config.provider ?? 'spawn'
-  const maxDepth = config.maxDepth ?? DEFAULT_MAX_DEPTH
   const runtime = createRlmRuntime(ctx, config)
-  const continuableParents = new Set<Agent>()
+  const continuableParents = continuableParentsFor(ctx)
   const detachRlmJobs = attachRlmJobController(ctx)
 
   const disposeSection = ctx.systemPrompt.section({
@@ -2389,24 +2553,7 @@ export function registerRlmPlugin(
           if (args.reset !== undefined || typeof args.code !== 'string') {
             throw new RlmError('eval', 'rlm_eval requires either code or reset: true')
           }
-          input = {
-            code: args.code,
-            signal: exec.signal,
-            session: parent.session,
-            onQuery: async (prompt: string, cellSignal: AbortSignal) => {
-              enforceQueryTokenGuard(ctx, parent, { enabled: true, provider, maxDepth, guardQueryTokens: config.guardQueryTokens, maxQueryTokensPerCell: config.maxQueryTokensPerCell } as RlmPluginConfig)
-              return runQuery(ctx, provider, parent, prompt, cellSignal, maxDepth)
-            },
-            onSpawn: async (prompt: string, cellSignal: AbortSignal) => {
-              enforceQueryTokenGuard(ctx, parent, { enabled: true, provider, maxDepth, guardQueryTokens: config.guardQueryTokens, maxQueryTokensPerCell: config.maxQueryTokensPerCell } as RlmPluginConfig)
-              const childId = await runSpawn(ctx, provider, parent, prompt, cellSignal, maxDepth)
-              continuableParents.add(parent)
-              return childId
-            },
-            onFollowup: async (childId: string, prompt: string, cellSignal: AbortSignal) =>
-              runFollowup(ctx, parent, childId, prompt, cellSignal),
-          }
-          if (args.contextPath !== undefined) input.contextPath = args.contextPath
+          input = buildRlmCodeEvalInput(ctx, config, parent, exec.signal, continuableParents, args.code, args.contextPath)
         }
         output = await runtime.eval(sessionKey, input)
       } catch (error) {
@@ -2448,6 +2595,7 @@ export function registerRlmPlugin(
         if (continuableParents.size > 0) {
           await ctx.subagents.drainContinuableDescendants([...continuableParents])
         }
+        continuableParents.clear()
       } finally {
         await runtime.dispose()
       }

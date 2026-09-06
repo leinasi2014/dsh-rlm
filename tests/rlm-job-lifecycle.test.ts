@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createRlmJobSpec, RlmError, type RlmEvalInput, type RlmEvalOutput, type RlmRuntime } from '../src/runtime.ts'
+import { createRlmJobSpec, startRlmJob, RlmError, type RlmEvalInput, type RlmEvalOutput, type RlmRuntime } from '../src/runtime.ts'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 
 function parent(id: string): Agent {
@@ -70,4 +70,71 @@ test('Issue#59/#74: cancelling one job leaves a sibling job on the same runtime 
 
   runtime.calls[1]!.resolve({ stdout: 'b', result: '2', truncated: false })
   assert.deepEqual(await b.done, { status: 'completed', output: 'b\n2' })
+})
+
+
+test('Issue#86: a second same-Session RLM job is rejected before official admission', () => {
+  const runtime = new ControlledRuntime()
+  const startCalls: string[] = []
+  const jobCtx = {
+    get(name: string) {
+      return name === 'jobs' ? undefined : undefined
+    },
+    jobs: {
+      attachController() { return () => {} },
+      start(spec: any) { startCalls.push(spec.kind); return { started: true } },
+    },
+  }
+  const first = startRlmJob(jobCtx, parent('job-same'), '1', runtime)
+  assert.equal(startCalls.length, 1, 'first job is admitted exactly once')
+  assert.throws(
+    () => startRlmJob(jobCtx, parent('job-same'), '2', runtime),
+    (err: unknown) => err instanceof RlmError && err.kind === 'busy' && /already active/.test(err.message),
+    'a second start for the same Session must fail before admission',
+  )
+  assert.equal(startCalls.length, 1, 'the rejected start must never reach the official registry')
+  void first
+})
+
+test('Issue#86: different Sessions can run RLM jobs concurrently on one runtime', () => {
+  const runtime = new ControlledRuntime()
+  const startCalls: string[] = []
+  const jobCtx = {
+    get() { return undefined },
+    jobs: {
+      attachController() { return () => {} },
+      start(spec: any) { startCalls.push(spec.kind); return { started: true } },
+    },
+  }
+  const a = startRlmJob(jobCtx, parent('job-a2'), '1', runtime)
+  const b = startRlmJob(jobCtx, parent('job-b2'), '2', runtime)
+  assert.equal(startCalls.length, 2, 'sibling Sessions must not block each other')
+  void a; void b
+})
+
+test('Issue#86: the job slot is released when the job settles', async () => {
+  const runtime = new ControlledRuntime()
+  const startCalls: any[] = []
+  const jobCtx = {
+    get() { return undefined },
+    jobs: {
+      attachController() { return () => {} },
+      start(spec: any) { startCalls.push(spec); return spec.run() },
+    },
+  }
+  // A registry that runs the admitted spec right away.
+  const admitted = startRlmJob(jobCtx, parent('job-rel'), '1', runtime) as any
+  await Promise.resolve()
+  assert.equal(runtime.calls.length, 1, 'admission ran the cell')
+  assert.equal(startCalls.length, 1)
+  // While running, a second start is rejected.
+  assert.throws(() => startRlmJob(jobCtx, parent('job-rel'), '2', runtime), (e: unknown) => e instanceof RlmError && e.kind === 'busy')
+  // Settle, then the slot must free up.
+  runtime.calls[0]!.resolve({ stdout: '', result: '1', truncated: false })
+  await admitted.done
+  const again = startRlmJob(jobCtx, parent('job-rel'), '3', runtime) as any
+  await Promise.resolve()
+  assert.equal(startCalls.length, 2, 'slot must be reusable after the job settled')
+  runtime.calls[1]!.resolve({ stdout: '', result: '3', truncated: false })
+  await again.done
 })

@@ -877,7 +877,7 @@ test('M1A Issue#5: a hostile metaclass __name__ is a typed error and the kernel 
 
 // ---- M1B: TypeScript runtime process protocol ----
 
-import { createRlmRuntime, RlmError, type RlmEvalInput } from '../src/runtime.ts'
+import { createRlmRuntime, startRlmJob, RlmError, type RlmCodeEvalInput, type RlmEvalInput, type RlmRuntime } from '../src/runtime.ts'
 import type { Context } from '@deepseek-ai/cordis'
 
 function rt(config: Record<string, unknown> = {}) {
@@ -1653,6 +1653,50 @@ function makeMockCtx(options: {
 }
 
 
+test('Issue#78: a background RLM job runs the same query bridge and Session identity', async () => {
+  const m = makeMockCtx({ queryText: 'job-answer' })
+  m.ctx.jobs = {
+    attachController() { return () => {} },
+    start(spec: any) { return spec.run() },
+  }
+  const runtime = createRlmRuntime(m.ctx, { provider: 'spawn', maxDepth: 2, timeout: 30_000 })
+  try {
+    const hooks = startRlmJob(m.ctx, makeExec('job-query').agent, 'await rlm_query("ping")', runtime) as any
+    const outcome = await hooks.done
+    assert.equal(outcome.status, 'completed')
+    assert.match(outcome.output, /job-answer/, 'the cell result must carry the bridged subagent text')
+    assert.equal(m.starts.length, 1, 'the background cell must dispatch exactly one official subagent')
+    assert.equal(m.starts[0]!.request.parent.session.header.delegationDepth, 0, 'the job must pass the owning Session')
+  } finally {
+    await runtime.dispose()
+    await m.teardown?.()
+  }
+})
+
+test('Issue#78: a job input carries the foreground Session sandbox identity', async () => {
+  const inputs: RlmEvalInput[] = []
+  const capturing: RlmRuntime = {
+    eval(_key: string, input: RlmEvalInput) { inputs.push(input); return Promise.resolve({ stdout: '', result: '4', truncated: false }) },
+    dispose() { return Promise.resolve() },
+  }
+  const jobCtx = {
+    get() { return undefined },
+    jobs: {
+      attachController() { return () => {} },
+      start(spec: any) { return spec.run() },
+    },
+  }
+  const agent = makeExec('job-sess').agent
+  const hooks = startRlmJob(jobCtx, agent, '2 + 2', capturing) as any
+  await hooks.done
+  assert.equal(inputs.length, 1)
+  const input = inputs[0] as RlmCodeEvalInput
+  assert.equal(input.session, agent.session, 'the job must pass parent.session for sandbox policy')
+  assert.equal(typeof input.onQuery, 'function', 'the job must carry the query bridge')
+  assert.equal(typeof input.onSpawn, 'function', 'the job must carry the spawn bridge')
+  assert.equal(typeof input.onFollowup, 'function', 'the job must carry the followup bridge')
+})
+
 test('M11 Issue#46 RED: a token guard consults recorded measure on the accepted M10 base', async () => {
   const measureCalls: unknown[] = []
   const m = makeMockCtx({ queryText: 'ok' })
@@ -1669,19 +1713,54 @@ test('M11 Issue#46 RED: a token guard consults recorded measure on the accepted 
 })
 
 
-test('M11 Issue#46: over-budget observed tokens reject before child dispatch', async () => {
+test('Issue#68: an above-ceiling pre-cell baseline still admits the cell first query', async () => {
   const measureCalls: unknown[] = []
   const m = makeMockCtx({ queryText: 'ok' })
   m.ctx.tokenMeter = { measure(session: unknown) { measureCalls.push(session); return { baseline: { kind: 'usage', tokens: 501, usage: { inputTokens: 500, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } }, totalTokens: 501 } } }
   registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', guardQueryTokens: true, maxQueryTokensPerCell: 100 })
   const tool = m.registered[0]
   try {
+    const out = await tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-over'))
+    assert.ok(out, 'a fresh cell must admit its first query even when the Session is already above the ceiling')
+    assert.equal(measureCalls.length, 1, 'guard must read the meter exactly once per admission')
+    assert.equal(m.starts.length, 1, 'the first query dispatches a child')
+  } finally {
+    await m.teardown?.()
+  }
+})
+
+test('Issue#68: observed growth within one cell over the ceiling rejects the next admission', async () => {
+  // Each admit reads the meter once; totals climb 100 -> 200 -> 300 within one
+  // cell, so the third admission exceeds the 150 ceiling before dispatch.
+  let reads = 0
+  const m = makeMockCtx({ queryText: 'ok' })
+  m.ctx.tokenMeter = { measure() {
+    reads += 1
+    const total = reads === 1 ? 100 : reads === 2 ? 200 : 300
+    return { baseline: { kind: 'usage', tokens: total, usage: { inputTokens: total, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 } }, totalTokens: total }
+  } }
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', guardQueryTokens: true, maxQueryTokensPerCell: 150 })
+  const tool = m.registered[0]
+  try {
     await assert.rejects(
-      tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-over')),
+      tool.execute({ code: 'a = await rlm_query("x")\nb = await rlm_query("y")\nc = await rlm_query("z")\n[a, b, c]' }, makeExec('m11-growth')),
       (err: unknown) => err instanceof Error && /token budget exceeded/i.test(err.message),
     )
-    assert.equal(measureCalls.length, 1, 'guard must read the meter exactly once')
-    assert.equal(m.starts.length, 0, 'over-budget must not dispatch a child')
+    assert.equal(m.starts.length, 2, 'the over-ceiling admission must not dispatch a child')
+  } finally {
+    await m.teardown?.()
+  }
+})
+
+test('Issue#68: the guard accounting resets at every new cell', async () => {
+  const m = makeMockCtx({ queryText: 'ok' })
+  m.ctx.tokenMeter = { measure() { return { baseline: { kind: 'usage', tokens: 501, usage: { inputTokens: 500, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } }, totalTokens: 501 } } }
+  registerRlmPlugin(m.ctx, { enabled: true, provider: 'spawn', guardQueryTokens: true, maxQueryTokensPerCell: 100 })
+  const tool = m.registered[0]
+  try {
+    await tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-reset-a'))
+    await tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-reset-b'))
+    assert.equal(m.starts.length, 2, 'each fresh cell re-arms its own baseline')
   } finally {
     await m.teardown?.()
   }
@@ -1701,15 +1780,18 @@ test('M11 Issue#46: under-budget observed tokens allow admission and dispatch', 
   }
 })
 
-test('M11 Issue#46: the official TokenMeasurement shape must reject over budget (not a no-op)', async () => {
+test('Issue#68: the official TokenMeasurement shape drives per-cell rejection (not a no-op)', async () => {
   const m = makeMockCtx({ queryText: 'ok' })
+  let reads = 0
   m.ctx.tokenMeter = { measure() {
+    reads += 1
+    const total = reads === 1 ? 20 : 200
     return {
       logRevision: 1,
-      baseline: { kind: 'usage', tokens: 120, usage: { inputTokens: 100, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0 } },
+      baseline: { kind: 'usage', tokens: total, usage: { inputTokens: total - 20, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 0 } },
       surfaceDeltaTokens: 0,
-      totalTokens: 120,
-      surfaceTokens: 120,
+      totalTokens: total,
+      surfaceTokens: total,
       nodes: [],
     }
   } }
@@ -1717,10 +1799,10 @@ test('M11 Issue#46: the official TokenMeasurement shape must reject over budget 
   const tool = m.registered[0]
   try {
     await assert.rejects(
-      tool.execute({ code: 'await rlm_query("x")' }, makeExec('m11-authority')),
+      tool.execute({ code: 'a = await rlm_query("x")\nb = await rlm_query("y")\n[a, b]' }, makeExec('m11-authority')),
       (err: unknown) => err instanceof Error && /token budget exceeded/i.test(err.message),
     )
-    assert.equal(m.starts.length, 0, 'authoritative over-budget must not dispatch a child')
+    assert.equal(m.starts.length, 1, 'only the admitted query dispatches a child; the over-budget one is blocked')
   } finally {
     await m.teardown?.()
   }
