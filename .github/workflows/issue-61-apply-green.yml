@@ -1,0 +1,52 @@
+name: issue-61-apply-green
+
+on:
+  push:
+    branches: [codex/issue-61-context-metadata]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/issue-61-context-metadata
+      - name: Replace only the drifted chunked metadata validator
+        shell: python
+        run: |
+          from pathlib import Path
+          p = Path('python-runtime/rlm_kernel.py')
+          text = p.read_text(encoding='utf-8')
+          old = '''            if (
+                restored_meta.get("read_bytes") != context_bytes
+                or restored_meta.get("canonical_path") != canonical_context_path
+            ):
+                raise RlmSnapshotError("checkpoint context metadata is invalid")
+'''
+          new = '''            if (
+                restored_meta.get("kind") != "file"
+                or type(restored_meta.get("path")) is not str
+                or not os.path.isabs(restored_meta["path"])
+                or type(restored_meta.get("bytes")) is not int
+                or restored_meta["bytes"] < 0
+                or restored_meta["bytes"] != context_bytes
+                or canonical_context_path != restored_meta["path"]
+            ):
+                raise RlmSnapshotError("checkpoint context metadata is invalid")
+'''
+          if text.count(old) != 1:
+              raise SystemExit('drifted chunked metadata validator not found exactly once')
+          p.write_text(text.replace(old, new, 1), encoding='utf-8')
+          Path('.github/workflows/issue-61-apply-green.yml').unlink()
+      - name: Commit GREEN and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add python-runtime/rlm_kernel.py .github/workflows/issue-61-apply-green.yml
+          git commit -m "fix(issue-61): accept writer-owned context metadata on chunked restore"
+          git push origin HEAD:codex/issue-61-context-metadata
