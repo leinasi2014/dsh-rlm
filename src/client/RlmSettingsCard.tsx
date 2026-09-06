@@ -9,7 +9,7 @@
  * testable with `node --test`.
  */
 import { useCallback, useEffect, useMemo, useReducer, useState, useSyncExternalStore, type CSSProperties } from 'react'
-import type { SettingsScope } from '@deepseek-ai/dsh-client-runtime/client'
+import type { SettingsScope } from '@deepseek-ai/dsh-client-ui-settings/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings-plugins/client'
 import type { InjectFace, PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import {
@@ -20,6 +20,7 @@ import {
   isDraftValid,
   isFieldOverridden,
   buildWrites,
+  buildMutation,
   resetState,
   canStageReset,
   saveStateReducer,
@@ -102,14 +103,15 @@ export function RlmSettingsCard(props: RlmSettingsCardProps) {
     void (async () => {
       dispatch({ type: 'begin' })
       try {
-        for (const write of buildWrites(draft, dirty, stagedClear)) {
-          if (write.op === 'clear') await props.scope.unset(write.key)
-          else await props.scope.set(write.key, write.value)
-        }
+        // Issue #69: one atomic revision-fenced mutation for the whole staged
+        // save, so validation/persistence/revision fencing is all-or-nothing.
+        await props.scope.mutate(buildMutation(buildWrites(draft, dirty, stagedClear)), snapshot.revision)
+        // Only after the atomic mutation settles does the editor state release.
         setDirty(new Set())
         setStagedClear(new Set())
         dispatch({ type: 'succeed' })
       } catch {
+        // Keep the draft and staged state so the user can inspect and retry.
         dispatch({ type: 'fail' })
       }
     })()

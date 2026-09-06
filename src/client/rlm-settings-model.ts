@@ -207,6 +207,22 @@ export type RlmFieldWrite =
   | { readonly key: RlmFieldKey; readonly op: 'set'; readonly value: boolean | number | string }
   | { readonly key: RlmFieldKey; readonly op: 'clear' }
 
+/**
+ * One ordered operation of a single atomic SettingsScope.mutate call
+ * (Issue #69). The card commits all staged writes in one revision-fenced
+ * mutation instead of sequential set/unset calls, so a save is all-or-nothing.
+ */
+export type RlmScopeMutation =
+  | { readonly op: 'set'; readonly path: string[]; readonly value: boolean | number | string }
+  | { readonly op: 'unset'; readonly path: string[] }
+
+/** Convert staged writes to the ordered op list consumed by one mutate. */
+export function buildMutation(writes: readonly RlmFieldWrite[]): RlmScopeMutation[] {
+  return writes.map((write) => write.op === 'clear'
+    ? { op: 'unset' as const, path: [write.key] }
+    : { op: 'set' as const, path: [write.key], value: write.value })
+}
+
 /** Convert a staged draft value to the JSON-shaped value a `set` writes. */
 export function valueFromDraft(key: RlmFieldKey, draft: RlmDraft): boolean | number | string {
   const spec = fieldSpec(key)

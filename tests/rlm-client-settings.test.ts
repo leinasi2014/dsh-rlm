@@ -10,6 +10,7 @@ import {
   isDraftValid,
   isFieldOverridden,
   buildWrites,
+  buildMutation,
   resetState,
   canStageReset,
   saveStateReducer,
@@ -160,6 +161,24 @@ test('Issue#80: reset is available with a clean draft whenever overrides exist',
   assert.equal(canStageReset(new Set(), new Set(['maxDepth'])), true)
   // Nothing to reset and nothing staged: no-op.
   assert.equal(canStageReset(new Set(), new Set()), false)
+})
+
+test('Issue#69: buildMutation emits one ordered op list per atomic save', () => {
+  const base = { provider: 'spawn', maxDepth: 1, timeout: 30000 }
+  const user = { provider: 'custom', timeout: 12345 }
+  const reset = resetState(base, user)
+  const writes = buildWrites(reset.draft, reset.dirty, reset.stagedClear)
+  const ops = buildMutation(writes)
+  assert.deepEqual(ops, [
+    { op: 'unset', path: ['provider'] },
+    { op: 'unset', path: ['timeout'] },
+  ])
+  const edited = buildMutation(buildWrites(
+    { ...deriveDraft(base), maxDepth: 7 },
+    new Set(['maxDepth']),
+    new Set(),
+  ))
+  assert.deepEqual(edited, [{ op: 'set', path: ['maxDepth'], value: 7 }])
 })
 
 test('save state machine: idle -> saving -> saved | failed, and any edit/reset returns to idle', () => {
