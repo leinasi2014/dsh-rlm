@@ -1936,42 +1936,40 @@ export function createRlmJobSpec(
   runtime: RlmRuntime,
 ): RlmJobStartInput {
   const key = String(parent.id)
-  let settled = false
-  let captured = ''
-  let doCancel: (() => void) | undefined
-  // Lazily start the cell only when the official job registry calls run(); the
-  // returned spec is inert until then, so a never-started job leaks nothing.
-  const done = new Promise<{ status: 'completed' | 'killed' | 'failed'; detail?: string; output?: string }>((resolve) => {
-    doCancel = () => {
-      if (settled) return
-      settled = true
-      void runtime.dispose().then(() => resolve({ status: 'killed', detail: 'job cancelled' }), () => resolve({ status: 'killed', detail: 'job cancelled' }))
-    }
-    void runtime.eval(key, { code }).then((out) => {
-      if (settled) return
-      settled = true
-      captured = (out.stdout ?? '') + (out.result === undefined ? '' : '\n' + out.result)
-      resolve({ status: 'completed', output: captured })
-    }, (err: unknown) => {
-      if (settled) return
-      settled = true
-      resolve({
-        status: err instanceof RlmError && err.kind === 'cancel' ? 'killed' : 'failed',
-        detail: err instanceof Error ? err.message : String(err),
-      })
-    })
-  })
+  let hooks: RlmJobHooks | undefined
   return {
     kind: 'rlm',
     label: 'rlm_eval job: ' + code.slice(0, 80),
     outputLimitBytes: 64 * 1024,
     owner: parent,
     run() {
-      return {
-        cancel(_reason?: string) { doCancel?.() },
+      if (hooks !== undefined) return hooks
+      const controller = new AbortController()
+      let captured = ''
+      const done: RlmJobHooks['done'] = Promise.resolve()
+        .then(() => runtime.eval(key, { code, signal: controller.signal }))
+        .then(
+          (out) => {
+            captured = (out.stdout ?? '') + (out.result === undefined ? '' : '\n' + out.result)
+            return { status: 'completed' as const, output: captured }
+          },
+          (err: unknown) => ({
+            status: err instanceof RlmError && err.kind === 'cancel' ? 'killed' as const : 'failed' as const,
+            detail: err instanceof Error ? err.message : String(err),
+          }),
+        )
+      hooks = {
+        cancel(reason?: string) {
+          if (!controller.signal.aborted) controller.abort(reason ?? 'job cancelled')
+        },
         done,
-        readOutput() { const out = captured; captured = ''; return out },
+        readOutput() {
+          const out = captured
+          captured = ''
+          return out
+        },
       }
+      return hooks
     },
   }
 }
