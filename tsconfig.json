@@ -9,6 +9,7 @@
     "declaration": true,
     "declarationMap": true,
     "emitDeclarationOnly": true,
+    "allowImportingTsExtensions": true,
     "strict": true,
     "noImplicitAny": true,
     "noUncheckedIndexedAccess": true,
@@ -20,4 +21,3 @@
   },
   "include": ["src/**/*.ts", "src/**/*.tsx"]
 }
-
